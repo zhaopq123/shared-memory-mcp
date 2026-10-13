@@ -1,9 +1,27 @@
 # shared-memory-mcp
 
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
+![MCP](https://img.shields.io/badge/MCP-streamable--http-purple.svg)
+![Tests](https://img.shields.io/badge/tests-318%20passed-brightgreen.svg)
+
+> **国内镜像（Gitee，同步更新）**：https://gitee.com/zhaopq/shared-memory-mcp
+
 **多租户的 agent 共享长期记忆服务。** 一个常驻 MCP 服务，所有 AI agent 连同一个地址；公司/小组/个人三级库，身份由服务端从凭据解析，**调用方无法指定权限范围**。
 
 > 解决的是这件事：*「我在 Cursor 里让 AI 记住的东西，Claude Code 不知道；换台机器、换个工具就全忘光。」*
 > 以及它的团队版：*「全公司一个池子，谁的结论都能被找到，但谁也不能改别人的东西。」*
+
+### 📚 文档导航
+
+| 文档 | 看这个当你想…… |
+|---|---|
+| **[安装部署手册](docs/INSTALL.md)** | **把它跑起来** —— 各平台安装、常驻配置、公网暴露、升级、故障排查 |
+| **[使用教程](docs/USAGE.md)** | **学会怎么用** —— 从零建库、读写记忆、多客户端接入、面板管理、常见问题 |
+| [架构设计](ARCHITECTURE.md) | 理解它为什么这么设计、每层职责、关键技术选型 |
+| [贡献指南](CONTRIBUTING.md) | 改代码、加功能、提 PR |
+| [设计原理](docs/design-rationale.md) | 深入每个设计决策的取舍过程 |
+| [新用户走查](docs/product-walkthrough-20261013.md) | 看一个真实用户从安装到踩坑的全过程 |
 
 ---
 
@@ -312,18 +330,44 @@ WantedBy=multi-user.target
 </details>
 
 <details>
-<summary>没有 systemd（proot / 容器 / Termux）</summary>
+<summary><b>推荐：runit（runsv）</b> —— proot / 容器 / Termux / 任何没 systemd 的环境</summary>
 
-用 tmux 守护循环，配合开机自启脚本：
+不要在这类环境用 tmux 守护循环 —— 它有三个实测踩过的坑：
+
+1. **tmux 会话会连同 Termux 一起被系统回收**，守护随之蒸发，而没人察觉（典型现象："服务昨天还在，今天没了"）
+2. **日志增长无上限**：实测某客户端每分钟用失效 token 轮询，每次 401 打两条日志，4 小时 48KB，长期运行会吃满手机存储
+3. **与 runsv 并存会抢启动**：两个 supervisor 各拉一份进程，端口持有者反复易主，服务时通时断
+
+用仓库自带的生成器一键注册（自带日志裁剪与重启间隔控制）：
 
 ```bash
-tmux new-session -d -s shared-memory \
-  "while true; do <启动命令>; echo 'exited, retry in 10s'; sleep 10; done"
+# Termux 宿主层执行
+bash scripts/ops/install-runsv.sh              # 安装全部服务
+bash scripts/ops/install-runsv.sh shared-memory   # 只装本服务
+
+# 验证守护是否真的有效（会强杀一次进程再看自愈）
+bash scripts/ops/test-recovery.sh
 ```
 
-⚠️ 这类环境有两个坑：
-1. **tar 覆盖会丢可执行位** —— 重新部署后必须 `chmod +x` 启动脚本
-2. **proot 里必须在容器内 chmod** —— 从宿主层对 rootfs 路径 chmod 不生效
+查看状态与日志：
+
+```bash
+sv status /data/data/com.termux/files/usr/var/service/shared-memory
+tail -f ~/logs/shared-memory.log
+```
+
+⚠️ **非 git 部署（scp / rsync / 解压 tar）会丢可执行位** —— Windows 没有 `+x` 概念，
+容器内的 `start-mcp.sh` 被覆盖成 644 后，runsv 每 5 秒重拉全是 `Permission denied`，
+**服务静默死亡**（实测最长静默 13 小时，且很难察觉）。
+
+生成器已经免疫了这一类问题（run 脚本用 `bash <start.sh>` 而非直接 exec），
+但部署后仍建议看一眼：
+
+```bash
+ls -l start-mcp.sh    # 必须是 755
+```
+
+完整步骤见 **[安装部署手册](docs/INSTALL.md)**。
 </details>
 
 ---
