@@ -216,6 +216,29 @@ memory_workspace_share lib=<库名> share=仅自己   # 随时收回，立即生
 
 `memory_workspaces` 看列表 + 共享范围 + 你能不能管理。
 
+### 多台设备/多台电脑怎么用
+
+你自己的多台设备（台式机、笔记本、服务器、手机）**不需要多个账号**——
+所有设备用同一个 token，互相天然可读；**工作空间就是区分单位**，
+A 空间的记忆 A 归、B 空间 B 归，不会混：
+
+```
+# 每台设备/每个项目建自己的工作空间库（share 留空 = 仅自己）
+memory_workspace_create workspace=家里台式机
+memory_workspace_create workspace=公司笔记本
+
+# 各设备写入自己的库
+memory_write title=部署笔记 lib=ws-家里台式机 workspace=家里台式机
+memory_write title=客户备忘 lib=ws-公司笔记本 workspace=公司笔记本
+
+# 跨设备查看：默认搜你有权限的全部库；也可以只看某一个
+memory_search query=部署
+memory_search query=部署 lib=ws-公司笔记本
+```
+
+要分享给**别人**时，才需要动 `share`（仅自己 → 小组 → 公司），
+或者给对方发一把只读 scope 的 token。
+
 **隔离模型记住三条**：
 
 1. 一 token = 一 user = 一库面。同 token 就是同一个身份，没有第二重校验
