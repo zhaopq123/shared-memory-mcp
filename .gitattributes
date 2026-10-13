@@ -1,0 +1,23 @@
+# 换行规范：仓库统一存 LF，检出时按平台转换。
+#
+# 为什么必须显式写：默认 core.autocrlf=true 时，Windows 提交会把
+# LF 写成 CRLF 进仓库。而这个项目**在 Linux（Android/proot）上运行**，
+# shell 脚本带 CRLF 会直接报 `bad interpreter: /bin/bash^M`。
+#
+# 实测踩过：vivo 上部署的脚本因换行问题无法执行，而仓库里看不出来
+#（本机看着完全正常）。
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.mp4 binary
+*.pdf binary
+
+# Windows 批处理必须 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,0 +1,1822 @@
+/* ══════════════════════════════════════════════════════════════
+   共享记忆面板 · 前端逻辑
+
+   三个标签页：
+     · 记忆库 —— 工作区树/时间脊柱 + 阅读器（主界面）
+     · 体系   —— 视图入口（决策/踩坑/待办/时效告警…）
+     · 设置   —— 给 agent 的指令 + 写入规则 + 运行参数 + 凭据管理
+
+   ━━━ 与后端的关系 ━━━
+   面板**只读记忆、可写配置**。记忆的写入只能走 MCP 工具 ——
+   那条路径有队列串行 + git 提交 + 软删除保护，在面板开写入口等于绕过它们。
+
+   配置可以写，但**走同一套 service/队列**（后端保证），所以并发安全。
+
+   ━━━ 安全要点（两条，都很关键）━━━
+
+   ① **本文件里没有 token 变量。**
+
+      旧做法是从地址栏读 `?token=` —— 那等于把钥匙贴在门牌上
+      （浏览器历史、书签、Referer、截图、代理日志里全都有）。
+      实测中真的因此泄露过一次。
+
+      新做法：凭据只存在 **httpOnly cookie** 里 ——
+        · JS 读不到（所以 XSS 也偷不走）
+        · URL 里没有（所以链接可以安全地分享/收藏）
+      同源 fetch 会自动带上它，前端不需要知道凭据长什么样。
+      无 cookie 时显示登录框，用长期 token 换一次性票据。
+
+   ② **所有来自后端的文本在插入 DOM 前都过 esc()。**
+      Markdown 渲染的顺序是「先整体转义，再套标记」—— 反了就是 XSS。
+   ══════════════════════════════════════════════════════════════ */
+
+/* ─────────────── 基础工具 ─────────────── */
+
+/** HTML 转义。**所有**服务端文本进 DOM 前都必须过它。 */
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/** 作者色：确定性哈希。
+ *  同一个 agent 永远同一个颜色 —— 多 agent 场景下，
+ *  "这条是谁写的"是最重要的线索之一，但又不该占版面。 */
+function authorColor(name){
+  let h = 0; const s = String(name || '?');
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  const palette = ['#d9a441','#7fa88a','#c96a5c','#8f9ec9','#c58fb0','#8fb8c9','#b9a06a'];
+  return palette[h % palette.length];
+}
+function avatar(name){
+  const c = authorColor(name);
+  const ch = (String(name||'?').trim()[0] || '?').toUpperCase();
+  return `<span class="who"><span class="av" style="background:${c}">${esc(ch)}</span>${esc(name)}</span>`;
+}
+
+/** 查询串构造。
+ *  ⚠️ 注意里面**没有 token** —— 凭据走 cookie，URL 保持干净。 */
+const qs = (o) => Object.entries(o).filter(([,v]) => v !== '' && v != null)
+      .map(([k,v]) => k + '=' + encodeURIComponent(v)).join('&');
+
+/** 统一的 GET。凭据靠同源 cookie 自动携带。
+ *
+ *  401 时自动弹登录框（而不是静默失败）—— 否则用户看到的是
+ *  一个空面板，不知道发生了什么。
+ *
+ *  ⚠️ 登录前的那次探测**不打 error 日志**：面板加载时会立刻调
+ *  `/api/state`，而此时还没有 cookie（用户还没登录）—— 那是
+ *  正常流程，不是故障。但如果它进了 console.error，
+ *  收尾验收脚本就会看到"有错误"，把正常状态误判成有问题
+ *  （实测踩过：为此白查了一轮）。
+ */
+const api = (p, o = {}) => {
+  const q = qs(o);
+  return fetch(p + (q ? '?' + q : ''), { credentials: 'same-origin' })
+    .then(async r => {
+      if (r.status === 401) { showLogin(); return {ok:false, needLogin:true}; }
+      return r.json();
+    })
+    .catch(e => ({ok:false, message:String(e)}));
+};
+
+/** 统一的 POST。同样不带凭据参数。 */
+const apiPost = (p, body) => fetch(p, {
+  method: 'POST',
+  credentials: 'same-origin',
+  headers: {'Content-Type':'application/json'},
+  body: JSON.stringify(body),
+}).then(async r => {
+  if (r.status === 401) { showLogin(); return {ok:false, needLogin:true}; }
+  return r.json();
+}).catch(e => ({ok:false, message:String(e)}));
+
+/* ─────────────── 登录 ─────────────── */
+
+/** 显示登录遮罩。
+ *
+ *  为什么需要它：服务端现在**强制鉴权**（绑非 loopback 时），
+ *  没有凭据就什么都拿不到。与其显示一堆空列表（用户不知道是坏了
+ *  还是没登录），不如明确要求登录。
+ *
+ *  输入的是**长期 token**，但只在 POST body 里出现一次 ——
+ *  换来一次性票据，再由服务端换成 httpOnly cookie。
+ *  所以 token **不会进入地址栏/历史**。
+ */
+/** 登录遮罩 —— 账号密码（给**人**用的正经登录）。
+ *
+ *  ━━━ 为什么不是 token 输入框（用户明确的反馈）━━━
+ *
+ *  第一版是"贴一长串 token"。技术上能跑，但**产品上是错的**：
+ *
+ *  · token 是给 **agent** 用的（它不会记密码，只能存配置文件）
+ *  · 人用的是**账号密码** —— 好记、能改、能认出是谁
+ *  · 让人类贴 64 位 hex 字符串，等于让用户替架构的缺陷买单
+ *
+ *  账号密码的后端一直都有（scrypt 哈希 + `/api/auth/login` 收
+ *  username/password），只是面板 UI 抄了近路。现在补上。
+ *
+ *  ━━━ 保留的降级入口 ━━━
+ *  底部留了一行"用 token 登录"的小字链接 —— 给"刚拿到账号还没设密码"
+ *  或"密码忘了"的场景兜底，不作为主路径。
+ */
+function showLogin(msg){
+  if (document.getElementById('login-mask')) return;
+  const mask = document.createElement('div');
+  mask.id = 'login-mask';
+  mask.innerHTML = `
+    <div class="loginbox">
+      <div class="seal" style="margin:0 auto 14px">记</div>
+      <h2>${t('login.title')}</h2>
+      <p class="sectip" style="text-align:center;margin-bottom:20px">
+        ${t('login.hint')}
+      </p>
+      <div id="login-err" class="errbox" style="display:none"></div>
+      <div class="field" style="margin-bottom:14px">
+        <label for="login-user">${t('login.username')}</label>
+        <input type="text" id="login-user" placeholder="${t('login.usernamePh')}"
+               autocomplete="username" spellcheck="false" style="width:100%">
+      </div>
+      <div class="field" style="margin-bottom:6px">
+        <label for="login-pw">${t('login.password')}</label>
+        <input type="password" id="login-pw" placeholder="${t('login.passwordPh')}"
+               autocomplete="current-password" style="width:100%">
+      </div>
+      <button class="btn primary" id="login-btn" style="width:100%;margin-top:14px">
+        ${t('login.button')}
+      </button>
+      <p class="sectip" style="text-align:center;margin:14px 0 0;font-size:12px">
+        <a href="javascript:void 0" id="login-token-link">用 token 登录</a>
+        <span style="color:var(--muted)"> · 仅用于账号还没设密码时</span>
+      </p>
+    </div>`;
+  document.body.appendChild(mask);
+
+  const userEl = document.getElementById('login-user');
+  const pwEl = document.getElementById('login-pw');
+  const btn = document.getElementById('login-btn');
+  const errBox = document.getElementById('login-err');
+  if (msg) { errBox.style.display = ''; errBox.textContent = msg; }
+  userEl.focus();
+
+  /** 提交登录。username/password 任一为空就不发（省一次无谓请求）。 */
+  const doLogin = async () => {
+    const username = userEl.value.trim();
+    const pw = pwEl.value;
+    if (!username || !pw) {
+      errBox.style.display = '';
+      errBox.textContent = LANG === 'zh' ? '用户名和密码都要填' : 'Both fields are required';
+      return;
+    }
+    btn.disabled = true; btn.textContent = t('login.submitting');
+    const r = await apiPost('/api/auth/login', {username, password: pw});
+    btn.disabled = false; btn.textContent = t('login.button');
+    if (!r.ok){
+      errBox.style.display = '';
+      errBox.textContent = r.message || t('login.invalid');
+      pwEl.select();
+      return;
+    }
+    /* 用拿到的票据走一次「URL 换 cookie」流程：
+       服务端会 set-cookie 并 302 到干净 URL。
+       票据是一次性 + 2 分钟过期，即使泄露也几乎无价值。 */
+    location.replace(r.login_url);
+  };
+  btn.onclick = doLogin;
+  // 回车在用户名框里 → 跳到密码框（不是提交，因为密码还空着）
+  userEl.onkeydown = (e) => {
+    if (e.key === 'Enter'){ e.preventDefault(); pwEl.focus(); }
+  };
+  pwEl.onkeydown = (e) => { if (e.key === 'Enter') doLogin(); };
+
+  // 降级入口：切成 token 输入框（密码忘了/账号未设密码时用）
+  document.getElementById('login-token-link').onclick = () => {
+    mask.innerHTML = `
+      <div class="loginbox">
+        <div class="seal" style="margin:0 auto 14px">记</div>
+        <h2>${t('login.title')}</h2>
+        <p class="sectip" style="text-align:center;margin-bottom:18px">
+          ${LANG === 'zh'
+            ? '贴入 token 登录（它只用于换取会话，不会出现在地址栏）：'
+            : 'Paste a token to sign in (it only exchanges for a session and never appears in the URL):'}
+        </p>
+        <div id="login-err" class="errbox" style="display:none"></div>
+        <input type="password" id="login-token" placeholder="token"
+               autocomplete="off" spellcheck="false">
+        <button class="btn primary" id="login-btn" style="width:100%;margin-top:12px">
+          ${t('login.button')}
+        </button>
+        <p class="sectip" style="text-align:center;margin:14px 0 0;font-size:12px">
+          <a href="javascript:void 0" id="login-back-link">← 用账号密码登录</a>
+        </p>
+      </div>`;
+    const input = document.getElementById('login-token');
+    const btn2 = document.getElementById('login-btn');
+    const err2 = document.getElementById('login-err');
+    input.focus();
+    const go = async () => {
+      const tok = input.value.trim();
+      if (!tok) return;
+      btn2.disabled = true; btn2.textContent = t('login.submitting');
+      const r = await apiPost('/api/auth/login', {token: tok});
+      btn2.disabled = false; btn2.textContent = t('login.button');
+      if (!r.ok){
+        err2.style.display = '';
+        err2.textContent = r.message || t('login.invalid');
+        return;
+      }
+      location.replace(r.login_url);
+    };
+    btn2.onclick = go;
+    input.onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    document.getElementById('login-back-link').onclick = () => {
+      const m = document.getElementById('login-mask');
+      if (m){ m.remove(); }
+      showLogin();
+    };
+  };
+}
+
+/** 退出登录：清 cookie 后回到登录态。 */
+async function logout(){
+  if (!confirm(t('account.logoutConfirm'))) return;
+  const r = await apiPost('/api/auth/logout', {});
+  // 无论后端结果如何，本地都回到登录态（cookie 可能已失效）
+  location.href = location.pathname;
+}
+
+/** 相对时间。超过 30 天就显示日期 —— "93 天前"没人能换算。 */
+function when(s){
+  if (!s) return '–';
+  const d = new Date(s); if (isNaN(d)) return s;
+  const m = Math.floor((Date.now() - d) / 60000);
+  if (m < 1) return '刚刚';
+  if (m < 60) return m + ' 分钟前';
+  const h = Math.floor(m / 60); if (h < 24) return h + ' 小时前';
+  const dd = Math.floor(h / 24); if (dd < 30) return dd + ' 天前';
+  return s.slice(0, 10);
+}
+const dayKey = (s) => (s || '').slice(0, 10);
+function dayLabel(k){
+  const today = new Date().toISOString().slice(0, 10);
+  const y = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
+  if (k === today) return '今天 · ' + k;
+  if (k === y) return '昨天 · ' + k;
+  return k;
+}
+
+/* ─────────────── Markdown 渲染 ───────────────
+   顺序关键：**先整体转义，再套标记**。反了就是 XSS。
+   代码块先切出来占位，避免内部的 # * | 被后续规则误伤。 */
+function md(src){
+  const raw = String(src || '');
+  const fences = [];
+  let h = esc(raw).replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    fences.push('<pre><code>' + code.replace(/\n$/, '') + '</code></pre>');
+    return '\x00F' + (fences.length - 1) + '\x00';
+  });
+  h = h
+    .replace(/(?:^\|.*\|[ \t]*\n?)+/gm, (tbl) => {
+      const rows = tbl.trim().split('\n').map(r =>
+        r.replace(/^\||\|$/g, '').split('|').map(c => c.trim()));
+      if (rows.length < 2) return tbl;
+      const isSep = (r) => r.every(c => /^:?-{2,}:?$/.test(c));
+      const head = rows[0];
+      const body = rows.slice(isSep(rows[1]) ? 2 : 1);
+      /* 外层 .tablewrap 负责横向滚动；表格 width:max-content 由内容决定列宽。
+         这样中文长表头不会把列压塌（实测踩过，见 panel.css 注释）。 */
+      return '<div class="tablewrap"><table><thead><tr>' +
+             head.map(c => '<th>' + c + '</th>').join('') +
+             '</tr></thead><tbody>' + body.map(r =>
+             '<tr>' + r.map(c => '<td>' + c + '</td>').join('') + '</tr>').join('') +
+             '</tbody></table></div>';
+    })
+    .replace(/^#### (.*)$/gm, '<h4>$1</h4>')
+    .replace(/^### (.*)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.*)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.*)$/gm, '<h1>$1</h1>')
+    .replace(/^&gt; (.*)$/gm, '<blockquote>$1</blockquote>')
+    .replace(/^(?:---|\*\*\*|___)[ \t]*$/gm, '<hr>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*(?=[^*]|$)/g, '$1<em>$2</em>')
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\[\[([^\[\]]+?)\]\]/g, '<code title="记忆引用">$1</code>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+             '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/^[ \t]*[-*] (.*)$/gm, '<li>$1</li>')
+    .replace(/(?:<li>[\s\S]*?<\/li>\n?)+/g, m => '<ul>' + m + '</ul>')
+    .replace(/(?:<blockquote>[\s\S]*?<\/blockquote>\n?)+/g,
+             m => m.replace(/<\/blockquote>\s*<blockquote>/g, '<br>'));
+  h = h.split(/\n{2,}/).map(p =>
+      /^\s*<(h\d|ul|ol|pre|table|blockquote|hr)/.test(p) ? p : '<p>' + p + '</p>')
+    .join('');
+  return h.replace(/\x00F(\d+)\x00/g, (m, i) => fences[i]);
+}
+
+/** 从正文抽标题目录 */
+function tocOf(src){
+  const out = [];
+  String(src || '').replace(/^(#{1,3}) (.+)$/gm, (m, hashes, t) => {
+    if (hashes.length <= 3) out.push({lvl: hashes.length, text: t.trim()});
+    return m;
+  });
+  return out;
+}
+/** 标题 → 锚点 id */
+function slugify(s){
+  return String(s).trim().toLowerCase()
+    .replace(/[^\w\u4e00-\u9fa5]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+}
+/** 阅读时长估算（中日韩字符按字计，其它按词计） */
+function readingTime(src){
+  const s = String(src || '');
+  const cjk = (s.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const words = s.replace(/[\u4e00-\u9fa5]/g, ' ').split(/\s+/).filter(Boolean).length;
+  return {mins: Math.max(1, Math.round((cjk + words * 1.3) / 400)), chars: s.length};
+}
+
+/** 关键词高亮（搜索时用）。先转义再插入 mark，防 XSS。 */
+function highlight(text, q){
+  const t = esc(text);
+  if (!q) return t;
+  let out = t;
+  for (const p of q.trim().split(/\s+/).filter(Boolean)){
+    out = out.replace(new RegExp('(' + p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi'),
+                      '<span class="mk">$1</span>');
+  }
+  return out;
+}
+
+/* ─────────────── 全局状态 ─────────────── */
+const STATE = {
+  tab: 'library',              // library | knowledge | settings
+  groupBy: 'workspace',        // workspace（默认）| time
+  notes: [], tags: [], workspaces: [], commits: [],
+  activeTag: '', activeWs: '', q: '', cur: null,
+  view: 'overview', viewData: null,
+  config: null, cfgDirty: false,
+  backlinks: null,
+  /* ── 多租户状态 ──
+     me    当前身份（用户名/角色/组）—— 顶栏显示"我是谁"
+     libs  可读库列表（含 writable 标记）—— 左栏顶部做库筛选
+     activeLib 当前选中的库（'' = 全部库）
+     这三个由 /api/state 返回，后端已就绪（见 dashboard.py 的 state 路由）。 */
+  me: null, libs: [], activeLib: '',
+};
+
+/** 当前身份是否管理员（决定是否显示用户/token 管理入口）。 */
+const isAdmin = () => !!(STATE.me && STATE.me.user && STATE.me.user.is_admin);
+
+/* ═══════════════ 标签页 1：记忆库 ═══════════════ */
+
+/* ═══════════════ 左栏分组：工作区树 / 时间脊柱 ═══════════════
+
+   ━━━ 为什么默认按工作区分组 ━━━
+
+   这是**多项目共用的库**。第一眼该回答的问题是「这个项目记了什么」，
+   而不是「今天记了什么」——后者是时间视图要回答的第二个问题。
+
+   所以两个视图可切换，默认工作区。
+
+   ━━━ 层级从哪来 ━━━
+
+   工作区名里的 ``-`` 是分层分隔符：``乱七八糟-前端`` 属于 ``乱七八糟``
+   之下。用户给的两个例子（``乱七八糟-xxx`` / ``个人工作中枢-xxxx``）
+   都是这个形态，所以直接支持，不做额外配置。
+
+   没有 ``-`` 的名字就是顶层（如 ``乱七八糟`` 本身）。
+*/
+
+/** 把工作区名拆成层级路径。
+ *  ``"乱七八糟-前端-web"`` → ``["乱七八糟", "前端", "web"]``
+ *  ``"乱七八糟"`` → ``["乱七八糟"]``
+ */
+function wsPath(name){
+  return String(name || '').split('-').map(s => s.trim()).filter(Boolean);
+}
+
+/** 把扁平的记忆列表构造成工作区树。
+ *
+ *  返回形如：
+ *    { name, full, count, items: [...], children: [ ... ] }
+ *
+ *  count 是**子树总数**（点击父节点筛选时应包含所有子项）——
+ *  这个数字比只算直接子项有用得多。
+ */
+function buildWsTree(notes){
+  const root = {name: '', full: '', count: 0, items: [], children: new Map()};
+
+  for (const n of notes){
+    const ws = n.workspace || '';
+    const node = ws ? ensurePath(root, wsPath(ws)) : root;
+    if (!ws) (root.unassigned = root.unassigned || []).push(n);
+    else node.items.push(n);
+    node.count += 1;
+    // 沿路径累加计数（祖先也 +1）
+    if (ws){
+      let cur = root;
+      for (const seg of wsPath(ws)){
+        cur = cur.children.get(seg);
+        cur.count += 1;
+      }
+    }
+  }
+
+  const finalize = (node) => {
+    node.childList = [...node.children.values()].map(finalize)
+      .sort((a, b) => b.count - a.count);   // 条目多的排前面
+    return node;
+  };
+  finalize(root);
+  return root;
+}
+
+function ensurePath(root, segments){
+  let cur = root;
+  for (const seg of segments){
+    if (!cur.children.has(seg)){
+      cur.children.set(seg, {
+        name: seg,
+        full: (cur.full ? cur.full + '-' : '') + seg,
+        count: 0, items: [], children: new Map(),
+      });
+    }
+    cur = cur.children.get(seg);
+  }
+  return cur;
+}
+
+/** 记忆条目 HTML。
+ *  带**时效与可信度标记** —— 读取端要能一眼看出"这条已过期/这是推断"，
+ *  不必点进去读了才知道。这是"不幻觉"落到 UI 上的那一步。 */
+function itemHtml(n, indent){
+  const badges = [];
+  const ex = n.expiry || {};
+  if (ex.state === 'expired') badges.push('<span class="badge expired" title="' + esc(ex.detail||'') + '">已过期</span>');
+  else if (ex.state === 'review') badges.push('<span class="badge review" title="' + esc(ex.detail||'') + '">待复查</span>');
+  else if (ex.state === 'superseded') badges.push('<span class="badge superseded" title="' + esc(ex.detail||'') + '">已取代</span>');
+  if (n.claim === 'inference') badges.push('<span class="badge claim-inference" title="未核实的推断，引用前当心">推断</span>');
+  else if (n.claim === 'proposal') badges.push('<span class="badge claim-proposal">建议</span>');
+  else if (n.claim === 'fact') badges.push('<span class="badge claim-fact">事实</span>');
+  if (n.type && n.type !== 'note') badges.push('<span class="badge">' + esc(n.type) + '</span>');
+
+  /* 按工作区分组时不重复显示工作区标签（组名已经说明了）；
+     按时间分组时要显示，否则看不出这条属于哪个项目。 */
+  const showWs = STATE.groupBy === 'time' && n.workspace;
+
+  /* ── 来源库标记（多租户关键）──
+     跨库搜索时结果来自多个库，而**来源决定可信度**：
+     公司库的结论比某个人的个人笔记更权威。
+     只在"全部库"视图下显示（选了具体库时已经知道来源了，不必重复）。
+     后端在每个结果里带了 _lib_label（见 tenancy.search_all）。 */
+  const showLib = !STATE.activeLib && n._lib_label;
+
+  /* ── 搜索命中说明（可读性关键）──
+     搜索是**全文匹配**：正文命中也会返回。但用户只看到标题时
+     会困惑"这条跟我的搜索词有什么关系？"—— 所以标出命中位置。
+     这不是装饰：它让"为什么这条在结果里"变得自明。 */
+  let hitNote = '';
+  if (STATE.q && n.title && !n.title.toLowerCase().includes(STATE.q.toLowerCase().trim())){
+    const where = [];
+    if ((n.tags||[]).some(t => t.toLowerCase().includes(STATE.q.toLowerCase().trim())))
+      where.push('标签');
+    if ((n.workspace||'').toLowerCase().includes(STATE.q.toLowerCase().trim()))
+      where.push('工作区');
+    if (where.length === 0) where.push('正文');
+    hitNote = `<div class="hitnote">命中：${where.join('/')}</div>`;
+  }
+
+  return `
+    <div class="item${STATE.cur === n.title ? ' on' : ''}${indent ? ' indented' : ''}"
+         data-id="${esc(n.title)}"${n._lib ? ` data-lib="${esc(n._lib)}"` : ''}>
+      <div class="t">${highlight(n.title, STATE.q)}</div>
+      <div class="sub">
+        <span>${when(n.updated || n.created)}</span>
+        ${showLib ? `<span class="libtag">${esc(n._lib_label)}</span>` : ''}
+        ${showWs ? `<span class="wstag">${esc(n.workspace)}</span>` : ''}
+        ${n.author ? avatar(n.author) : ''}
+        ${badges.join('')}
+      </div>
+      ${hitNote}
+      ${(n.tags||[]).filter(t => !String(t).startsWith('ws/')).length
+        ? '<div class="tags-inline">' + n.tags
+            .filter(t => !String(t).startsWith('ws/'))
+            .map(t => `<span class="tag" data-tag="${esc(t)}">${esc(t)}</span>`).join('') + '</div>'
+        : ''}
+    </div>`;
+}
+
+/** 左栏的「空」提示 —— 分情况说清是**哪种**空。
+ *
+ *  ━━━ 为什么值得单独一个函数 ━━━
+ *  原来只有一句「没有匹配的记忆」，但实测发现两种完全不同的场景
+ *  被混成一句：
+ *
+ *    · 筛选用光了（搜索词/标签/库）→ 用户该改条件
+ *    · 库本来就是空的（如公司库刚建、测试数据已清）→ 用户该往里写
+ *
+ *  第二种尤其重要：切到公司库看到**一片空白**，用户会以为面板坏了，
+ *  而不是"这个库还没内容"。说清楚能省掉一次误报。
+ */
+function emptyListHtml(){
+  const reasons = [];
+  if (STATE.q) reasons.push('搜索「' + STATE.q + '」');
+  if (STATE.activeTag) reasons.push('标签「' + STATE.activeTag + '」');
+  if (STATE.activeWs) reasons.push('工作区「' + STATE.activeWs + '」');
+  if (STATE.activeLib){
+    const lib = (STATE.libs || []).find(l => l.id === STATE.activeLib);
+    reasons.push('库「' + (lib ? (lib.label || lib.id) : STATE.activeLib) + '」');
+  }
+
+  if (reasons.length){
+    return `<div class="empty"><span class="big">◌</span>
+      ${reasons.join(' + ')} 下没有记忆<br>
+      <span style="font-size:12px">清掉筛选条件（点库 chip 的「全部」或 Esc）看看</span>
+    </div>`;
+  }
+  return `<div class="empty"><span class="big">◌</span>
+    ${t('list.emptyLib')}<br>
+    <span style="font-size:12px">写一条进来吧 —— 落到这个库就会显示在这里</span>
+  </div>`;
+}
+
+/* ── 折叠状态持久化 ──
+   用户在哪个组上折过，刷新/切页后应该记住 —— 否则每次回来都要重折一遍。 */
+function collapsedSet(){
+  try {
+    return new Set(JSON.parse(localStorage.getItem('shm-collapsed') || '[]'));
+  } catch { return new Set(); }
+}
+function toggleCollapsed(key){
+  const s = collapsedSet();
+  if (s.has(key)) s.delete(key); else s.add(key);
+  try { localStorage.setItem('shm-collapsed', JSON.stringify([...s])); } catch {}
+}
+
+function renderList(){
+  const box = document.getElementById('list');
+  if (!STATE.notes.length){
+    /* 用 emptyListHtml() 而不是原来的一句「没有匹配的记忆」——
+       它分得清「筛选用光了」和「库本来是空的」，用户才知道下一步
+       该改条件还是该写内容。实测发现两种场景被混成一句时，
+       切到空库的用户会以为面板坏了。 */
+    box.innerHTML = emptyListHtml();
+    return;
+  }
+  box.innerHTML = (STATE.groupBy === 'time')
+    ? renderByTime()
+    : renderByWorkspace();
+  wireListEvents(box);
+}
+
+/** 按工作区分组（默认）：可折叠的树 */
+function renderByWorkspace(){
+  const tree = buildWsTree(STATE.notes);
+  const collapsed = collapsedSet();
+
+  // 递归渲染一个节点
+  const nodeHtml = (node, depth) => {
+    const key = 'ws:' + (node.full || '(未分类)');
+    const isCollapsed = collapsed.has(key);
+    const hasKids = node.childList.length > 0;
+    const own = node.items.length;
+
+    // 组头：折叠三角 + 名字 + 计数
+    const head = `
+      <div class="wshead" data-key="${esc(key)}" data-ws="${esc(node.full)}"
+           style="--depth:${depth}">
+        <span class="caret">${hasKids ? (isCollapsed ? '▶' : '▼') : '<span class="dot-s"></span>'}</span>
+        <span class="wsname">${esc(node.name)}</span>
+        <span class="wscount">${node.count}</span>
+      </div>`;
+
+    if (isCollapsed) return `<div class="wsgroup">${head}</div>`;
+
+    // 先渲染直接的条目，再渲染子组
+    const items = node.items.map(n => itemHtml(n, depth > 0)).join('');
+    const kids = node.childList.map(c => nodeHtml(c, depth + 1)).join('');
+    return `<div class="wsgroup">${head}${items}${kids}</div>`;
+  };
+
+  let html = '';
+
+  // 有工作区的树
+  html += tree.childList.map(c => nodeHtml(c, 0)).join('');
+
+  // 未分类（无工作区）单独放最后 —— 它是"待归类"的信号，不该混在项目里
+  if (tree.unassigned && tree.unassigned.length){
+    const key = 'ws:(未分类)';
+    const isCollapsed = collapsed.has(key);
+    html += `<div class="wsgroup">
+      <div class="wshead unassigned" data-key="${esc(key)}" data-ws="" style="--depth:0">
+        <span class="caret">${isCollapsed ? '▶' : '▼'}</span>
+        <span class="wsname">未分类</span>
+        <span class="wscount">${tree.unassigned.length}</span>
+      </div>
+      ${isCollapsed ? '' : tree.unassigned.map(n => itemHtml(n, false)).join('')}
+    </div>`;
+  }
+
+  return html;
+}
+
+/** 按时间分组：原来的时间脊柱 */
+function renderByTime(){
+  const groups = new Map();
+  for (const n of STATE.notes){
+    const k = dayKey(n.updated || n.created);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(n);
+  }
+  const keys = [...groups.keys()].sort().reverse();
+  const collapsed = collapsedSet();
+  return keys.map(k => {
+    const ckey = 'day:' + k;
+    const isCollapsed = collapsed.has(ckey);
+    return `
+    <div class="day">
+      <div class="daylabel" data-key="${esc(ckey)}" style="cursor:pointer">
+        <span class="caret">${isCollapsed ? '▶' : '▼'}</span>${esc(dayLabel(k))}
+        <span class="wscount">${groups.get(k).length}</span>
+      </div>
+      ${isCollapsed ? '' : groups.get(k).map(n => itemHtml(n, false)).join('')}
+    </div>`;
+  }).join('');
+}
+
+/** 列表里的事件接线（条目点击、标签点击、组头折叠） */
+function wireListEvents(box){
+  box.querySelectorAll('.item').forEach(el => el.onclick = (e) => {
+    if (e.target.classList.contains('tag')) return;   // 标签自己处理
+    select(el.dataset.id);
+  });
+  box.querySelectorAll('.tag').forEach(el => el.onclick = (e) => {
+    e.stopPropagation(); toggleTag(el.dataset.tag);
+  });
+  // 折叠：点组头
+  box.querySelectorAll('.wshead, .daylabel').forEach(el => el.onclick = (e) => {
+    // 点组内的"筛选"按钮时不折叠
+    if (e.target.classList.contains('wsfilter')) return;
+    toggleCollapsed(el.dataset.key);
+    renderList();
+  });
+}
+
+function renderChips(){
+  /* 分组方式切换（工作区 / 时间）。
+     为什么不放在顶栏：它只影响左栏，放在左栏顶部离作用对象最近。
+     选择记进 localStorage —— 用户的偏好该跨刷新保留。 */
+  const gb = document.getElementById('groupby');
+  gb.innerHTML = `
+    <span class="rowlabel" style="margin:0 8px 0 0">分组</span>
+    <div class="seg">
+      <button class="segbtn${STATE.groupBy === 'workspace' ? ' on' : ''}" data-g="workspace">工作区</button>
+      <button class="segbtn${STATE.groupBy === 'time' ? ' on' : ''}" data-g="time">时间</button>
+    </div>`;
+  gb.querySelectorAll('.segbtn').forEach(el => el.onclick = () => {
+    STATE.groupBy = el.dataset.g;
+    try { localStorage.setItem('shm-groupby', STATE.groupBy); } catch {}
+    renderChips(); renderList();
+  });
+
+  // 标签（二级分类）
+  const c = document.getElementById('chips');
+  c.innerHTML = STATE.tags.length
+    ? '<div class="chips">' +
+      STATE.tags.slice(0, 14).map(([t, n]) =>
+        `<button class="chip${STATE.activeTag === t ? ' on' : ''}" data-tag="${esc(t)}">
+           ${esc(t)} <span style="opacity:.6">${n}</span></button>`).join('') + '</div>'
+    : '';
+  c.querySelectorAll('.chip').forEach(el => el.onclick = () => toggleTag(el.dataset.tag));
+}
+
+function toggleTag(t){
+  STATE.activeTag = STATE.activeTag === t ? '' : t;
+  load();
+}
+
+async function load(){
+  const r = await api('/api/state',
+    {q: STATE.q, tag: STATE.activeTag, workspace: STATE.activeWs,
+     lib: STATE.activeLib});
+  const dot = document.getElementById('dot');
+  if (!r.ok){ dot.classList.add('bad'); return; }
+  dot.classList.remove('bad');
+
+  STATE.notes = r.notes || [];
+  STATE.tags = r.tags || [];
+  STATE.workspaces = r.workspaces || [];
+  STATE.commits = r.commits || [];
+  STATE.stats = r.stats || {};
+  /* 身份与库列表：后端已返回，前端用来做库筛选与权限提示。
+     注意 me/libs 是**服务端按你的权限算出来的**，前端只负责显示。 */
+  STATE.me = r.me || null;
+  STATE.libs = r.libs || [];
+
+  document.getElementById('s-notes').textContent = r.stats.notes;
+  document.getElementById('s-libs').textContent = r.stats.libs;
+  /* 「个工作区」统计**真实的项目数**（排除"(无工作区)"这个分类桶）。
+     注意显示 0 是合法且有意义的：说明库里还没有按项目归类的记忆 ——
+     这正是"该给记忆标工作区了"的信号，不该被藏起来。 */
+  const named = (STATE.workspaces || []).filter(([n]) => n !== '(无工作区)');
+  document.getElementById('s-ws').textContent = named.length;
+  document.getElementById('s-tags').textContent = r.stats.tags;
+  const pend = (r.stats.write_queue && r.stats.write_queue.pending) || 0;
+  document.getElementById('s-queue').textContent = pend;
+  document.getElementById('st-q').classList.toggle('warn', pend > 0);
+
+  /* 判故障要看是否**用过**：写者循环惰性创建，新服务里 worker_alive
+     本来就是 false —— 那不是故障。判定逻辑必须与服务端 /health 一致，
+     否则会出现"面板说坏了但 /health 说健康"的矛盾。 */
+  const q = r.stats.write_queue || {};
+  const used = (q.processed > 0) || (q.pending > 0) || (q.outstanding > 0);
+  if (q.worker_alive === false && used) dot.classList.add('bad');
+
+  const bad = r.stats.unreadable || 0;
+  const sb = document.getElementById('s-bad');
+  if (sb){
+    sb.parentElement.style.display = bad ? '' : 'none';
+    sb.textContent = bad;
+  }
+
+  /* 顶栏显示"我是谁" —— 多租户下这是最基本的信息：
+     不知道自己的身份与权限，就无法判断"为什么看不到某个库"。 */
+  const who = document.getElementById('s-who');
+  const role = document.getElementById('s-role');
+  if (STATE.me && STATE.me.user){
+    const u = STATE.me.user;
+    const displayName = u.display || u.name;
+    const roleText = u.is_admin ? t('role.admin') : t('role.member');
+    const g = (u.groups || []).join('/');
+    /* ⚠️ 显示名与角色**相同时不重复显示**（实测踩过）：
+     *
+     * 用户名 admin 的显示名被设成「管理员」，而角色也是 admin →
+     * 顶栏出现「管理员 管理员」，看起来像渲染 bug。
+     *
+     * 判据：显示名已经等于角色名时，第二段就不再显示角色
+     * （信息重复，而且会让人以为界面坏了）。 */
+    who.textContent = displayName;
+    role.textContent = (displayName === roleText)
+      ? (g || '')
+      : roleText + (g ? ' · ' + g : '');
+  } else {
+    who.textContent = '–'; role.textContent = '';
+  }
+
+  const rootEl = document.getElementById('root');
+  if (rootEl) rootEl.textContent = (STATE.me && STATE.me.user)
+    ? (STATE.me.user.name + ' @ ' + STATE.libs.length + ' ' + t('stat.libs'))
+    : '';
+
+  renderLibChips();
+  renderChips(); renderList();
+
+  // 首次/筛选后自动选中：否则右栏永远是空的等待提示，看着像坏了
+  if (STATE.notes.length && !STATE.notes.some(n => n.title === STATE.cur)){
+    select(STATE.notes[0].title);
+  } else if (STATE.cur){
+    // 保持选中项高亮同步（重新渲染后 class 会丢）
+    const el = document.querySelector(`.item[data-id="${CSS.escape(STATE.cur)}"]`);
+    if (el) el.classList.add('on');
+  }
+}
+
+/** 渲染库筛选条（左栏顶部）。
+ *
+ *  ━━━ 为什么这是多租户下最重要的一块 UI ━━━
+ *
+ * 记忆分散在多个库里（公司 / 小组 / 个人），而**默认是跨库搜索**。
+ * 用户看到的每条记忆都带 `_lib_label` 来源标注，但如果没有"按库筛选"，
+ * 就无法回答"这个库里到底有什么"。
+ *
+ * 只读库（如公司库对 member）会带一个"只读"标记 —— 让用户**提前知道**
+ * 写不进去，而不是写完了才拿到 403。
+ */
+function renderLibChips(){
+  const box = document.getElementById('libchips');
+  if (!box) return;
+  const libs = STATE.libs || [];
+  if (!libs.length){ box.innerHTML = ''; return; }
+
+  const chip = (label, count, id, extra) => `
+    <button class="chip lib${STATE.activeLib === id ? ' on' : ''}"
+            data-lib="${esc(id)}" title="${esc(extra || '')}">
+      ${esc(label)}${count != null ? ` <span style="opacity:.6">${count}</span>` : ''}
+      ${extra && extra.includes('只读') ? '<span class="ro">只读</span>' : ''}
+    </button>`;
+
+  box.innerHTML = `
+    <div class="rowlabel">库（${libs.length}）</div>
+    <div class="chips">
+      ${chip('全部', null, '')}
+      ${libs.map(l => {
+        // 归属 → 人类可读的说明（放在 title 里，不占版面）
+        // 归属说明（放 title，不占版面）
+        let note = l.owner;
+        if (l.owner === 'company') {
+          note = t('share.company') + ' / ' + t('share.companyDesc');
+        } else if (String(l.owner).startsWith('group:')) {
+          const g = l.owner.slice(6);
+          note = t('share.group', {g}) + ' / ' + t('share.groupDesc', {g});
+        } else if (String(l.owner).startsWith('user:')) {
+          note = t('share.self') + ' / ' + t('share.selfDesc');
+        }
+        if (!l.writable) note += ' · ' + t('badge.readonly');
+        return chip(l.label || l.id, null, l.id, note);
+      }).join('')}
+    </div>`;
+
+  box.querySelectorAll('.chip[data-lib]').forEach(el => el.onclick = () => {
+    STATE.activeLib = el.dataset.lib || '';
+    load();
+  });
+}
+
+async function select(title){
+  STATE.cur = title;
+  /* 记住这条来自哪个库 —— 同名条目可能存在于多个库，
+     不传 lib 时后端会按可读库顺序返回第一个，未必是用户点的那条。
+     所以从列表项上取 data-lib 传回去，保证"点哪条开哪条"。 */
+  const el = document.querySelector(`.item[data-id="${CSS.escape(title)}"]`);
+  const lib = (el && el.dataset.lib) || STATE.activeLib || '';
+
+  const reader = document.getElementById('reader');
+  reader.innerHTML = `<div class="doc"><div class="empty">${t('common.loading')}</div></div>`;
+  renderList();
+  const r = await api('/api/note', {ident: title, lib});
+  if (!r.ok){
+    reader.innerHTML = `<div class="doc"><div class="empty">${
+      esc(r.message || t('doc.readFail'))}</div></div>`;
+    return;
+  }
+  /* ⚠️ `_lib` / `_lib_label` 可能在**响应外层**，也可能在 `note` 里。
+   *
+   * 实测踩过：后端把这两个字段提到外层（为了和 list/search 的条目
+   * 结构一致），但前端还在读 `note._lib_label` —— 结果详情页的
+   * 「来源库」标记一直是空的（列表里有、详情没有）。
+   *
+   * 教训：**改字段位置时两端都要改**，或者像这样两边都兼容。
+   * 只改一端就是静默失效。 */
+  const note = r.note || {};
+  if (note._lib === undefined && r._lib) note._lib = r._lib;
+  if (note._lib_label === undefined && r._lib_label) note._lib_label = r._lib_label;
+
+  // 反向引用单独拉（不阻塞正文渲染）。同样带上库 ——
+  // 引用是**库内**概念，跨库统计会泄露"另一库存在某个标题"。
+  STATE.backlinks = null;
+  api('/api/backlinks', {title, lib}).then(b => {
+    STATE.backlinks = b;
+    const holder = document.getElementById('relwrap');
+    if (holder && b.ok) holder.innerHTML = backlinksHtml(b);
+    wireRelItems();
+  });
+  render(note);
+  reader.scrollTop = 0;
+}
+
+function backlinksHtml(b){
+  const parts = [];
+  if ((b.backlinks||[]).length){
+    parts.push('<h3>谁引用了它</h3><div class="rel">' + b.backlinks.map(t =>
+      `<div class="relitem" data-id="${esc(t)}"><span style="color:${authorColor('')}">↩</span>
+       <span>${esc(t)}</span></div>`).join('') + '</div>');
+  }
+  if ((b.outgoing||[]).length){
+    parts.push('<h3>它引用了谁</h3><div class="rel">' + b.outgoing.map(t =>
+      `<div class="relitem" data-id="${esc(t)}"><span style="color:${authorColor('')}">↪</span>
+       <span>${esc(t)}</span></div>`).join('') + '</div>');
+  }
+  return parts.join('');
+}
+
+function wireRelItems(){
+  document.querySelectorAll('.relitem').forEach(el => el.onclick = () => select(el.dataset.id));
+}
+
+function render(n){
+  const reader = document.getElementById('reader');
+  const rt = readingTime(n.body);
+  const toc = tocOf(n.body);
+  const related = STATE.notes
+    .filter(x => x.title !== n.title &&
+                 (x.tags || []).some(t => (n.tags || []).includes(t)))
+    .slice(0, 5);
+  /* 分享链接：**不带任何凭据**。
+   *
+   * 旧版是 `?token=<长期凭据>` —— 那等于把钥匙贴在门牌上：
+   * 复制给谁、发到哪里，都等于把访问权一起给出去了（而且会进
+   * 浏览器历史/书签/截图）。实测正是这样泄露过一次。
+   *
+   * 现在链接只有 id，**对方必须自己有凭据**才能打开 ——
+   * 这既保住了"能分享位置"，又不泄漏访问权。 */
+  const shareUrl = location.origin + location.pathname +
+                   '?id=' + encodeURIComponent(n.title);
+
+  /* 正文里如果第一行就是与标题同名的 H1，去掉它 ——
+     否则页面标题、目录、正文各出现一次，同一句话读三遍（实测发现）。 */
+  let bodySrc = String(n.body || '');
+  const firstLine = (bodySrc.trim().split('\n')[0] || '');
+  const stripTitle = /^\s*#\s/.test(firstLine) &&
+        firstLine.replace(/^\s*#\s+/, '').trim() === String(n.title).trim();
+  if (stripTitle) bodySrc = bodySrc.replace(/^\s*#\s+.+?\s*$/m, '').replace(/^\s+/, '');
+
+  /* 给标题加锚点 id，让目录能跳 */
+  let bodyHtml = md(bodySrc);
+  const seen = new Map();
+  bodyHtml = bodyHtml.replace(/<(h[1-3])>(.*?)<\/\1>/g, (m, tag, inner) => {
+    let id = slugify(inner.replace(/<[^>]+>/g, ''));
+    if (seen.has(id)) { seen.set(id, seen.get(id) + 1); id += '-' + seen.get(id); }
+    else seen.set(id, 0);
+    return `<${tag} id="${id}">${inner}</${tag}>`;
+  });
+  // 正文里的 H1 与页面标题重复 → 从目录剔除
+  const tocItems = stripTitle ? toc.filter(t => t.lvl > 1) : toc;
+
+  // 体系信息条：类型/可信度/时效/工作区
+  const metaBadges = [];
+  if (n.type && n.type !== 'note') metaBadges.push(`<span class="badge">${esc(n.type)}</span>`);
+  if (n.claim) metaBadges.push(`<span class="badge claim-${esc(n.claim)}">${
+      esc({fact:'✓ 事实', inference:'? 推断', proposal:'◇ 建议'}[n.claim] || n.claim)}</span>`);
+  if (n['superseded-by']) metaBadges.push(
+    `<span class="badge superseded">已被「${esc(n['superseded-by'])}」取代</span>`);
+  if (n['valid-until']) metaBadges.push(`<span class="badge">有效期至 ${esc(n['valid-until'])}</span>`);
+  if (n['review-after']) metaBadges.push(`<span class="badge review">复查：${esc(n['review-after'])}</span>`);
+  if (n.workspace) metaBadges.push(`<span class="wstag">${esc(n.workspace)}</span>`);
+  /* 来源库：读单条时也要显示 —— 用户需要知道"这条属于哪个库"，
+     因为它决定了这条能被谁看到、以及是否权威（见 dashboard 的来源标注设计）。 */
+  if (n._lib_label) metaBadges.push(`<span class="libtag">${esc(n._lib_label)}</span>`);
+
+  reader.innerHTML = `
+  <div class="doc">
+    <h1 class="dtitle">${esc(n.title)}</h1>
+    <div class="dmeta">
+      <span>${esc((n.updated || n.created || '').replace('T', ' ').slice(0, 16))}</span>
+      ${n.author ? avatar(n.author) : ''}
+      <span>${rt.chars} 字 · 约 ${rt.mins} 分钟</span>
+      <div class="actions">
+        <button class="abtn" id="cp-link">🔗 复制链接</button>
+        <button class="abtn" id="cp-md">⧉ 复制原文</button>
+      </div>
+    </div>
+    ${metaBadges.length ? '<div class="dtags">' + metaBadges.join('') + '</div>' : ''}
+    ${(n.tags||[]).length ? '<div class="dtags">' + n.tags.map(t =>
+      `<span class="tag" data-tag="${esc(t)}">${esc(t)}</span>`).join('') + '</div>' : ''}
+    ${tocItems.length > 1 ? '<div class="tocwrap"><h3>目录</h3><div class="toc">' +
+      tocItems.map(t =>
+        `<a data-goto="${esc(slugify(t.text))}" class="${t.lvl > 1 ? 'l2' : ''}">${esc(t.text)}</a>`
+      ).join('') + '</div></div>' : ''}
+    <div class="body">${bodyHtml}</div>
+    <div id="relwrap"></div>
+    ${related.length ? '<div class="sect"><h3>共享标签的相关记忆</h3><div class="rel">' +
+      related.map(x => `<div class="relitem" data-id="${esc(x.title)}">
+        <span style="color:${authorColor(x.author)}">•</span>
+        <span>${esc(x.title)}</span>
+        <span class="n">${(x.tags||[]).filter(t => (n.tags||[]).includes(t)).join(' · ')}</span>
+      </div>`).join('') + '</div></div>' : ''}
+    ${STATE.commits.length ? `
+    <div class="sect"><h3>${t('doc.history', {n: STATE.commits.length})}</h3>
+      <div class="hist">${STATE.commits.map(c =>
+        `<div class="c"><span class="h">${esc(c.commit)}</span>
+         <span class="d">${esc((c.date||'').slice(5,16))}</span>
+         <span class="s">${esc(c.subject)}${c.author
+            ? ' <span style="color:var(--muted)">— ' + esc(c.author) + '</span>' : ''}</span></div>`
+      ).join('')}</div>
+    </div>` : ''}
+  </div>`;
+
+  reader.querySelectorAll('.tag').forEach(el => el.onclick = () => toggleTag(el.dataset.tag));
+  reader.querySelectorAll('a[data-goto]').forEach(el => el.onclick = () => {
+    const t = document.getElementById(el.dataset.goto);
+    if (t) t.scrollIntoView({behavior:'smooth', block:'start'});
+  });
+  wireRelItems();
+
+  const linkBtn = reader.querySelector('#cp-link');
+  linkBtn.onclick = () => copyText(shareUrl, linkBtn, '🔗 复制链接');
+  const mdBtn = reader.querySelector('#cp-md');
+  mdBtn.onclick = () => copyText(n.body || '', mdBtn, '⧉ 复制原文');
+}
+
+async function copyText(text, btn, label){
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  }
+  btn.textContent = '✓ 已复制'; btn.classList.add('done');
+  setTimeout(() => { btn.textContent = label; btn.classList.remove('done'); }, 1600);
+}
+
+/* ═══════════════ 标签页 2：体系（视图） ═══════════════ */
+
+const VIEW_META = {
+  overview:  {icon:'◫', hint:'库的整体状况'},
+  decisions: {icon:'⚖', hint:'定过的口径与取舍'},
+  lessons:   {icon:'⚠', hint:'踩过的坑，避免重复'},
+  todos:     {icon:'☐', hint:'未完成的事'},
+  expiring:  {icon:'⏳', hint:'已过期 / 该复查 / 已被取代'},
+  inferences:{icon:'?', hint:'未核实的推断 —— 引用前当心'},
+  projects:  {icon:'▤', hint:'按工作区分组'},
+  recent:    {icon:'◷', hint:'按时间倒序'},
+};
+
+async function loadKnowledge(){
+  const kind = STATE.view || 'overview';
+  const holder = document.getElementById('kbody');
+  holder.innerHTML = `<div class="empty">${t('common.loading')}</div>`;
+  const r = await api('/api/view', {kind, limit: 200});
+  if (!r.ok){
+    holder.innerHTML = `<div class="empty">${
+      esc(r.message || t('view.loadFail'))}</div>`;
+    return;
+  }
+  STATE.viewData = r;
+
+  // 视图切换条
+  const bar = document.getElementById('viewbar');
+  if (!bar.dataset.done){
+    const list = await api('/api/views');
+    bar.innerHTML = (list.views || []).map(v =>
+      `<button class="chip${v.kind === kind ? ' on' : ''}" data-view="${esc(v.kind)}"
+               title="${esc(v.desc)}">${VIEW_META[v.kind]?.icon || '·'} ${t('view.' + v.kind, {})}</button>
+      `).join('');
+    bar.querySelectorAll('.chip').forEach(el => el.onclick = () => {
+      STATE.view = el.dataset.view;
+      bar.querySelectorAll('.chip').forEach(x => x.classList.remove('on'));
+      el.classList.add('on');
+      loadKnowledge();
+    });
+    bar.dataset.done = '1';
+  }
+
+  /* 视图标题与说明：优先用语言包（i18n），后端 label 作兜底。
+   *
+   * ⚠️ 为什么不直接用后端的 r.label：
+   * 后端返回的是**中文**（knowledge.VIEWS 里的硬编码），
+   * 而用户切到英文时这里就必须变。所以视图名走 t('view.<kind>')。 */
+  const _lbl = t('view.' + kind, {});
+  const _desc = t('view.' + kind + '.desc', {});
+  let html = `<h2 class="sechead">${esc(_lbl || r.label || '')}</h2>
+              <p class="sectip">${esc(_desc || r.desc || '')}</p>`;
+
+  // 总览：先给统计卡片（"库里什么状况"一眼看完）
+  if (kind === 'overview' && r.stats){
+    const st = r.stats;
+    html += '<div class="statgrid">';
+    html += `<div class="statbox"><div class="k">${t('view.total')}</div><div class="v">${r.total}</div></div>`;
+    for (const [tp, n] of (st.types||[])){
+      html += `<div class="statbox"><div class="k">${esc(tp)}</div><div class="v">${n}</div></div>`;
+    }
+    const ex = st.expiry || {};
+    if (ex.expired) html += `<div class="statbox"><div class="k">${t('badge.expired')}</div><div class="v" style="color:var(--rust)">${ex.expired}</div></div>`;
+    if (ex.review) html += `<div class="statbox"><div class="k">${t('badge.review')}</div><div class="v" style="color:var(--brass)">${ex.review}</div></div>`;
+    if (ex.superseded) html += `<div class="statbox"><div class="k">${t('badge.superseded')}</div><div class="v">${ex.superseded}</div></div>`;
+    for (const [cp, n] of (st.claims||[])){
+      html += `<div class="statbox"><div class="k">${esc(cp)}</div><div class="v">${n}</div></div>`;
+    }
+    html += '</div>';
+    if ((st.workspaces||[]).length > 1){
+      html += '<h3 class="sectip" style="font-weight:650;color:var(--ink)">按工作区</h3><div class="statgrid">';
+      for (const [w, n] of st.workspaces){
+        html += `<div class="statbox"><div class="k">${esc(w)}</div><div class="v">${n}</div></div>`;
+      }
+      html += '</div>';
+    }
+  }
+
+  // 条目列表
+  if ((r.items||[]).length){
+    html += '<div class="rel" style="margin-top:18px">' + r.items.map(n => {
+      const badges = [];
+      const ex = n.expiry || {};
+      if (ex.state === 'expired') badges.push('<span class="badge expired">已过期</span>');
+      else if (ex.state === 'review') badges.push('<span class="badge review">待复查</span>');
+      else if (ex.state === 'superseded') badges.push('<span class="badge superseded">已取代</span>');
+      if (n.claim === 'inference') badges.push('<span class="badge claim-inference">推断</span>');
+      return `<div class="relitem" data-id="${esc(n.title)}">
+        <span>${esc(n.title)}</span>
+        ${n.workspace ? `<span class="wstag">${esc(n.workspace)}</span>` : ''}
+        ${badges.join('')}
+        <span class="n">${when(n.updated || n.created)}</span>
+      </div>`;
+    }).join('') + '</div>';
+  } else if (kind !== 'overview'){
+    html += '<div class="empty"><span class="big">◌</span>' +
+      '这个视图是空的。<br>写入相应类型的记忆后，它们会自动出现在这里 —— ' +
+      '视图是按规则实时算的，不需要维护。</div>';
+  }
+
+  holder.innerHTML = html;
+  holder.querySelectorAll('.relitem').forEach(el => el.onclick = () => {
+    switchTab('library');
+    select(el.dataset.id);
+  });
+}
+
+/* ═══════════════ 标签页 3：设置 ═══════════════ */
+
+async function loadSettings(){
+  const holder = document.getElementById('sbody');
+  holder.innerHTML = `<div class="empty">${t('common.loading')}</div>`;
+  const r = await api('/api/config');
+  if (!r.ok){
+    holder.innerHTML = `<div class="empty">${
+    esc(r.message || t('cfg.saveFail'))}</div>`;
+    return;
+  }
+  STATE.config = r;
+  const rules = r.rules || {}, settings = r.settings || {};
+
+  holder.innerHTML = `
+  <div class="form">
+    ${r.instructions_is_default ? `
+      <div class="warnbox">${t('cfg.defaultInstructions')}</div>` : ''}
+    ${r.instructions_disabled ? `
+      <div class="errbox">${t('cfg.disabledInstructions')}</div>` : ''}
+
+    <h3 class="sechead">${t('cfg.instructions')}</h3>
+    <p class="sectip">${t('cfg.instructionsHint')}</p>
+    <div class="field">
+      <textarea id="cfg-instructions" spellcheck="false">${esc(r.instructions || '')}</textarea>
+    </div>
+
+    <h3 class="sechead">${t('cfg.writeRules')}</h3>
+    <p class="sectip">${t('cfg.writeRulesHint')}</p>
+    <div class="field">
+      <label>${t('cfg.policy')}</label>
+      <div class="hint">${t('cfg.policyHint')}</div>
+      <input type="text" id="cfg-policy" value="${esc(rules.missing_field_policy || 'fill')}">
+    </div>
+    <div class="field">
+      <label>${t('cfg.maxTitle')}</label>
+      <div class="hint">${t('cfg.maxTitleHint')}</div>
+      <input type="number" id="cfg-maxtitle" value="${esc(rules.max_title_chars ?? 120)}">
+    </div>
+    <div class="field">
+      <label>${t('cfg.requireWs')}</label>
+      <div class="hint">${t('cfg.requireWsHint')}</div>
+      <input type="text" id="cfg-reqws" value="${rules.require_workspace ? 'true' : 'false'}">
+    </div>
+    <div class="field">
+      <label>${t('cfg.inferType')}</label>
+      <div class="hint">${t('cfg.inferTypeHint')}</div>
+      <textarea id="cfg-infertype" spellcheck="false" style="min-height:150px">${
+        esc(JSON.stringify(rules.infer_type || {}, null, 2))}</textarea>
+    </div>
+
+    <h3 class="sechead">${t('cfg.runParams')}</h3>
+    <p class="sectip">${t('cfg.runParamsHint')}</p>
+    <div class="field">
+      <label>${t('cfg.debounce')}</label>
+      <div class="hint">${t('cfg.debounceHint')}</div>
+      <input type="number" id="cfg-debounce" value="${esc(settings.commit_debounce_seconds ?? 8)}">
+    </div>
+    <div class="field">
+      <label>${t('cfg.searchLimit')}</label>
+      <input type="number" id="cfg-limit" value="${esc(settings.search_default_limit ?? 20)}">
+    </div>
+    <div class="field">
+      <label>${t('cfg.refresh')}</label>
+      <div class="hint">${t('cfg.refreshHint')}</div>
+      <input type="number" id="cfg-refresh" value="${esc(settings.panel_refresh_seconds ?? 15)}">
+    </div>
+
+    <div class="saverow">
+      <button class="btn primary" id="cfg-save">${t('cfg.save')}</button>
+      <button class="btn ghost" id="cfg-reload">${t('cfg.reload')}</button>
+      <span id="cfg-msg" style="font-size:13px;color:var(--muted)"></span>
+    </div>
+
+    <h3 class="sechead">${t('cfg.source')}</h3>
+    <p class="sectip">
+      ${t('cfg.sourceHint')}
+      <code>${esc(r.dir || '')}</code><br>
+      ${t('cfg.isDefault')} / ${t('cfg.changed')}：
+      ${r.rules_is_default ? t('cfg.isDefault') : t('cfg.changed')} ·
+      ${r.settings_is_default ? t('cfg.isDefault') : t('cfg.changed')}
+    </p>
+
+    ${isAdmin() ? `
+      <h3 class="sechead">${t('admin.users')}</h3>
+      <p class="sectip">${t('admin.usersHint')}</p>
+      <div id="admin-users"><div class="empty">${t('common.loading')}</div></div>
+
+      <h3 class="sechead">${t('admin.tokens')}</h3>
+      <p class="sectip">${t('admin.tokensHint')}</p>
+      <div id="admin-tokens"><div class="empty">${t('common.loading')}</div></div>
+    ` : `
+      <!-- 成员身份：不显示管理区，但要说清「为什么看不到」——
+           直接隐藏会让成员以为功能坏了（这类困惑实测反馈过）。 -->
+      <h3 class="sechead">${t('admin.users')}</h3>
+      <p class="sectip">${t('admin.onlyAdmin')}</p>
+    `}
+
+    <h3 class="sechead">${t('ws.title')}</h3>
+    <p class="sectip">${t('ws.hint')}</p>
+    <div id="ws-body"><div class="empty">${t('common.loading')}</div></div>
+
+    <h3 class="sechead">${t('account.title')}</h3>
+    <p class="sectip">${t('account.hint')}</p>
+    <div class="field">
+      <label>${t('account.curPw')}</label>
+      <input type="password" id="ac-cur" placeholder="${t('account.curPwPh')}"
+             autocomplete="current-password">
+    </div>
+    <div class="saverow" style="margin-top:0;padding-top:0;border-top:none">
+      <input type="password" id="ac-new" placeholder="${t('account.newPwPh')}"
+             autocomplete="new-password" style="flex:1;min-width:150px">
+      <input type="password" id="ac-new2" placeholder="${t('account.newPw2Ph')}"
+             autocomplete="new-password" style="flex:1;min-width:150px">
+      <button class="btn" id="ac-change">${t('account.change')}</button>
+      <button class="btn ghost" id="ac-logout">${t('account.logout')}</button>
+    </div>
+    <div id="ac-msg" style="font-size:13px;margin-top:8px"></div>
+  </div>`;
+
+  document.getElementById('cfg-save').onclick = saveSettings;
+  document.getElementById('cfg-reload').onclick = () => { loadSettings(); };
+  if (isAdmin()) { loadAdminUsers(); loadAdminTokens(); }
+  loadWorkspaces();
+  bindAccount();
+}
+
+/** 「我的账号」：改密码 + 退出登录。
+ *
+ *  ━━━ 产品视角 ━━━
+ *  改密码是**每个人**都会用到的功能（不是管理员专属），所以放在
+ *  设置页末尾且不需要管理员权限。
+ *
+ *  退出登录也放这里 —— 而不是藏在某个角落菜单里。
+ *  面板是个单页应用，没有导航栏空间，放设置页最直观。
+ */
+function bindAccount(){
+  const change = document.getElementById('ac-change');
+  const out = document.getElementById('ac-logout');
+  const msg = document.getElementById('ac-msg');
+  if (!change || !out) return;
+
+  change.onclick = async () => {
+    const cur = document.getElementById('ac-cur').value;
+    const nw = document.getElementById('ac-new').value;
+    const nw2 = document.getElementById('ac-new2').value;
+    msg.textContent = '';
+    // 前端先做 cheapest 的校验（省一次请求），但**真正的校验在后端**
+    if (!cur){ msg.innerHTML = `<span style="color:var(--rust)">${t('account.needCur')}</span>`; return; }
+    if (nw.length < 8){ msg.innerHTML = `<span style="color:var(--rust)">${t('account.tooShort')}</span>`; return; }
+    if (nw !== nw2){ msg.innerHTML = `<span style="color:var(--rust)">${t('account.mismatch')}</span>`; return; }
+    change.disabled = true; change.textContent = t('account.changing');
+    const r = await apiPost('/api/auth/password', {current: cur, password: nw, confirm: nw2});
+    change.disabled = false; change.textContent = t('account.change');
+    if (!r.ok){
+      msg.innerHTML = `<span style="color:var(--rust)">${esc(r.message || '')}</span>`;
+      return;
+    }
+    msg.innerHTML = `<span style="color:var(--verdigris)">${t('account.changed')}</span>`;
+    document.getElementById('ac-cur').value = '';
+    document.getElementById('ac-new').value = '';
+    document.getElementById('ac-new2').value = '';
+  };
+
+  out.onclick = async () => {
+    if (!confirm(t('account.logoutConfirm'))) return;
+    await apiPost('/api/auth/logout', {});
+    location.href = location.pathname;   // 清掉 query，回到登录态
+  };
+}
+
+/** 工作空间与共享范围（核心 UI）。
+ *
+ *  ━━━ 设计要点 ━━━
+ *
+ * 1. **能管的排前面** —— 用户最关心"我能改哪些"
+ * 2. **共享范围用下拉直接改**（不用进详情页）—— 这是高频操作
+ * 3. **改之前显示当前状态**，改完显示"现在谁能读"
+ * 4. 不可管理的库**明确说明原因**（"不是你的"），而不是把按钮藏起来
+ *    —— 藏起来会让人以为功能坏了
+ */
+async function loadWorkspaces(){
+  const box = document.getElementById('ws-body');
+  if (!box) return;
+  const r = await api('/api/workspaces');
+  if (!r.ok){
+    box.innerHTML = `<div class="errbox">${esc(r.message || '读取失败')}</div>`;
+    return;
+  }
+  const libs = r.libraries || [];
+  const targets = r.share_targets || [];
+  const mine = libs.filter(l => l.can_manage);
+  const others = libs.filter(l => !l.can_manage);
+
+  /* 共享范围的选项文字：直接用后端返回的 label/desc。
+   *
+   * ⚠️ 为什么不在这里翻译：这些 label 是**后端按当前用户算出来的**
+   * （比如"小组：研发"只对研发组的人出现），而且带业务语义。
+   * 前端再翻译一遍会出现"两处文案不一致"的问题。
+   * 后端已经支持按语言返回（见 workspace.share_targets）。 */
+  const shareOptions = (cur) => targets.map(t =>
+    `<option value="${esc(t.owner)}"${t.owner === cur ? ' selected' : ''}>
+       ${esc(t.label)}
+     </option>`).join('');
+
+  const row = (l, manageable) => `
+    <tr>
+      <td>
+        <strong>${esc(l.label)}</strong>
+        ${l.is_workspace
+            ? `<span class="badge">${t('badge.workspace')}</span>` : ''}
+        <br><code style="font-size:10.5px">${esc(l.lib)}</code>
+      </td>
+      <td>
+        ${manageable
+          ? `<select class="ws-share" data-lib="${esc(l.lib)}"
+                     style="padding:5px 8px;border-radius:7px;font-size:12.5px;
+                            background:var(--panel2);border:1px solid var(--line);
+                            color:var(--ink)">
+               ${shareOptions(l.owner)}
+             </select>`
+          : `<span class="badge">${esc(l.share_label)}</span>`}
+      </td>
+      <td>${l.readable
+            ? `<span class="badge claim-fact">${t('badge.readable')}</span>`
+            : `<span class="badge superseded">${t('badge.unreadable')}</span>`}</td>
+      <td>${l.writable
+            ? `<span class="badge claim-fact">${t('badge.writable')}</span>`
+            : `<span class="badge superseded">${t('badge.readonly')}</span>`}</td>
+      <td style="font-size:11.5px;color:var(--muted)">
+        ${manageable ? t('ws.ownerYou') : '—'}
+      </td>
+    </tr>`;
+
+  box.innerHTML = `
+    ${mine.length ? `
+      <h4 style="font-size:13px;margin:0 0 8px;color:var(--muted)">
+        ${t('ws.mine', {n: mine.length})}
+      </h4>
+      <div class="tablewrap"><table>
+        <thead><tr>
+          <th>${t('ws.col.space')}</th><th>${t('ws.col.share')}</th>
+          <th>${t('ws.col.read')}</th><th>${t('ws.col.write')}</th><th></th>
+        </tr></thead>
+        <tbody>${mine.map(l => row(l, true)).join('')}</tbody>
+      </table></div>` : ''}
+
+    ${others.length ? `
+      <h4 style="font-size:13px;margin:18px 0 8px;color:var(--muted)">
+        ${t('ws.others', {n: others.length})}
+      </h4>
+      <div class="tablewrap"><table>
+        <thead><tr>
+          <th>${t('ws.col.space')}</th><th>${t('ws.col.share')}</th>
+          <th>${t('ws.col.read')}</th><th>${t('ws.col.write')}</th><th></th>
+        </tr></thead>
+        <tbody>${others.map(l => row(l, false)).join('')}</tbody>
+      </table></div>` : ''}
+
+    <h4 style="font-size:13px;margin:20px 0 8px;color:var(--muted)">${t('ws.new')}</h4>
+    <div class="saverow" style="margin-top:0;padding-top:0;border-top:none">
+      <input type="text" id="ws-name" placeholder="${t('ws.namePlaceholder')}"
+             style="flex:1;min-width:200px">
+      <select id="ws-share-new" style="padding:8px;border-radius:8px;
+              background:var(--panel2);border:1px solid var(--line);color:var(--ink)">
+        ${targets.map(t => `<option value="${esc(t.owner)}">${esc(t.label)}</option>`).join('')}
+      </select>
+      <button class="btn primary" id="ws-add">建库</button>
+    </div>
+    <div id="ws-msg" style="font-size:13px;margin-top:8px"></div>
+    <p class="sectip" style="margin-top:14px;font-size:12.5px">${t('ws.footHint')}</p>`;
+
+  // 改共享范围
+  box.querySelectorAll('.ws-share').forEach(sel => sel.onchange = async () => {
+    const lib = sel.dataset.lib;
+    const share = sel.value;
+    const newLabel = sel.options[sel.selectedIndex].text.trim();
+    if (!confirm(t('ws.shareConfirm', {lib, to: newLabel}))) {
+      loadWorkspaces();   // 撤销选择
+      return;
+    }
+    sel.disabled = true;
+    const res = await apiPost('/api/workspace/share', {lib, share});
+    sel.disabled = false;
+    if (!res.ok){
+      alert(res.message || t('ws.shareFail'));
+      loadWorkspaces();
+      return;
+    }
+    /* ⚠️ 顺序很重要：先重渲染表格，**再**写提示。
+     *
+     * 反过来的话提示会被重渲染冲掉 —— 用户改完什么都看不到，
+     * 不知道成没成功（实测踩过：脚本抓提示抓不到，因为被冲了）。
+     *
+     * 这类"操作成功但没反馈"的问题在 UI 上很致命：
+     * 用户会重复点、或者以为没生效。 */
+    await loadWorkspaces();
+    const msg = document.getElementById('ws-msg');
+    if (msg){
+      msg.innerHTML = `<div class="okbox" style="margin-top:10px">
+        <strong>${t('ws.shareChanged', {from: esc(res.before), to: esc(res.after)})}</strong><br>
+        <span style="font-size:12.5px">${esc(res.note || '')}</span></div>`;
+      // 滚到提示处，确保用户看到（表格可能很长）
+      msg.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+    }
+  });
+
+  // 建库
+  const add = document.getElementById('ws-add');
+  add.onclick = async () => {
+    const name = document.getElementById('ws-name').value.trim();
+    if (!name){
+      const m = document.getElementById('ws-msg');
+      m.innerHTML = `<span style="color:var(--rust)">${t('ws.nameRequired')}</span>`;
+      return;
+    }
+    add.disabled = true; add.textContent = t('ws.creating');
+    const res = await apiPost('/api/workspace/create', {
+      workspace: name,
+      share: document.getElementById('ws-share-new').value,
+    });
+    add.disabled = false; add.textContent = t('ws.create');
+    if (!res.ok){
+      const m = document.getElementById('ws-msg');
+      m.innerHTML = `<span style="color:var(--rust)">${
+        esc(res.message || t('ws.shareFail'))}</span>`;
+      return;
+    }
+    document.getElementById('ws-name').value = '';
+    // 同上：先重渲染，再写提示
+    await loadWorkspaces();
+    const msg = document.getElementById('ws-msg');
+    if (msg){
+      msg.innerHTML = `<div class="okbox" style="margin-top:10px">
+        <strong>${t('ws.created', {l: esc(res.label)})}</strong>（${esc(res.share_label)}）<br>
+        <span style="font-size:12.5px">${
+          t('ws.writeHint', {lib: esc(res.lib)})}</span>
+      </div>`;
+      msg.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+    }
+    load();
+  };
+}
+
+/** 加载用户与库列表（管理员）。
+ *
+ *  ━━━ 为什么把"库"和"用户"放一起 ━━━
+ *
+ * 因为它们是**同一条链**：加人 → 自动给他个人库 → 发 token → 他接入。
+ * 分成两个页面会让管理员在两处来回跳。
+ */
+async function loadAdminUsers(){
+  const box = document.getElementById('admin-users');
+  if (!box) return;
+  const r = await api('/api/admin/users');
+  if (!r.ok){
+    box.innerHTML = `<div class="errbox">${esc(r.message || t('admin.readFail'))}</div>`;
+    return;
+  }
+
+  const kindLabel = (o) => o === 'company' ? t('share.company') :
+    String(o).startsWith('group:') ? t('share.group', {g: o.slice(6)}) :
+    String(o).startsWith('user:') ? t('share.self') + '：' + o.slice(5) : o;
+
+  box.innerHTML = `
+    <div class="tablewrap"><table>
+      <thead><tr>
+        <th>${t('admin.col.user')}</th>
+        <th>${t('admin.col.role')}</th>
+        <th>${t('admin.col.groups')}</th>
+        <th>${t('admin.col.status')}</th>
+      </tr></thead>
+      <tbody>
+        ${(r.users || []).map(u => `
+          <tr>
+            <td><strong>${esc(u.display || u.name)}</strong>
+                <code style="font-size:11px">${esc(u.name)}</code></td>
+            <td>${u.role === 'admin' ? t('role.admin') : t('role.member')}</td>
+            <td>${esc((u.groups || []).join('、') || '—')}</td>
+            <td>${u.disabled
+                  ? `<span class="badge expired">${t('badge.disabled')}</span>`
+                  : `<span class="badge claim-fact">${t('badge.normal')}</span>`}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table></div>
+
+    <h3 class="sechead" style="font-size:15px">${t('admin.libs', {n: (r.libs || []).length})}</h3>
+    <div class="tablewrap"><table>
+      <thead><tr>
+        <th>${t('admin.col.lib')}</th>
+        <th>${t('admin.col.owner')}</th>
+        <th>${t('admin.col.memberWrite')}</th>
+      </tr></thead>
+      <tbody>
+        ${(r.libs || []).map(l => `
+          <tr>
+            <td><strong>${esc(l.label || l.id)}</strong>
+                <code style="font-size:11px">${esc(l.id)}</code></td>
+            <td>${esc(kindLabel(l.owner))}</td>
+            <td>${l.writable_by_members
+                  ? `<span class="badge claim-fact">${t('badge.writable')}</span>`
+                  : `<span class="badge superseded">${t('badge.readonly')}</span>`}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table></div>
+
+    <div class="saverow">
+      <input type="text" id="nu-name" placeholder="${t('admin.userName')}"
+             style="flex:1;min-width:150px">
+      <input type="text" id="nu-display" placeholder="${t('admin.displayName')}"
+             style="flex:1;min-width:120px">
+      <input type="text" id="nu-groups" placeholder="${t('admin.groups')}"
+             style="flex:1;min-width:130px">
+      <select id="nu-role" title="${t('admin.role')}"
+              style="padding:8px;border-radius:8px;
+              background:var(--panel2);border:1px solid var(--line);color:var(--ink)">
+        <option value="member">${t('role.member')}</option>
+        <option value="admin">${t('role.admin')}</option>
+      </select>
+      <button class="btn primary" id="nu-add">${t('admin.addUser')}</button>
+    </div>
+    <div id="nu-msg" style="font-size:13px;margin-top:8px"></div>`;
+
+  const btn = document.getElementById('nu-add');
+  btn.onclick = async () => {
+    const msg = document.getElementById('nu-msg');
+    const name = document.getElementById('nu-name').value.trim();
+    if (!name){
+      msg.innerHTML = `<span style="color:var(--rust)">${t('admin.nameRequired')}</span>`;
+      return;
+    }
+    const groups = document.getElementById('nu-groups').value.split(',')
+      .map(s => s.trim()).filter(Boolean);
+    btn.disabled = true; btn.textContent = t('admin.creating');
+    const res = await apiPost('/api/admin/user/add', {
+      name,
+      display: document.getElementById('nu-display').value.trim(),
+      groups,
+      role: document.getElementById('nu-role').value,
+    });
+    btn.disabled = false; btn.textContent = t('admin.addUser');
+    if (!res.ok){
+      msg.innerHTML = `<span style="color:var(--rust)">${
+        esc(res.message || t('admin.createFail'))}</span>`;
+      return;
+    }
+    /* ⚠️ 密码只返回一次 —— 必须显眼提示用户立刻复制，
+       否则关掉页面就再也拿不到了（只能重置）。 */
+    msg.innerHTML = `
+      <div class="okbox" style="margin-top:10px">
+        <strong>${t('admin.userCreated', {u: esc(res.user)})}</strong><br>
+        ${t('admin.pwOnce')}
+        <code style="font-size:15px;user-select:all">${esc(res.password)}</code>
+      </div>`;
+    loadAdminUsers(); loadAdminTokens();
+  };
+}
+
+/** 加载 token 列表（管理员）。**永不显示明文** —— 只显示指纹。 */
+async function loadAdminTokens(){
+  const box = document.getElementById('admin-tokens');
+  if (!box) return;
+  const r = await api('/api/auth/tokens');
+  if (!r.ok){ box.innerHTML = `<div class="errbox">${esc(r.message || '读取失败')}</div>`; return; }
+
+  const fmt = (ts) => ts ? new Date(ts * 1000).toISOString().slice(0, 16).replace('T', ' ') : '—';
+
+  box.innerHTML = `
+    <div class="tablewrap"><table>
+      <thead><tr>
+        <th>${t('admin.col.fingerprint')}</th>
+        <th>${t('admin.col.tokenUser')}</th>
+        <th>${t('admin.col.label')}</th>
+        <th>${t('admin.col.scope')}</th>
+        <th>${t('admin.col.lastUsed')}</th>
+        <th>${t('admin.col.status')}</th>
+        <th>${t('admin.col.actions')}</th>
+      </tr></thead>
+      <tbody>
+        ${(r.tokens || []).map(tk => `
+          <tr>
+            <td><code>${esc(tk.fingerprint)}</code></td>
+            <td>${esc(tk.user)}</td>
+            <td>${esc(tk.label || '—')}</td>
+            <td>${tk.scope === 'read'
+                  ? `<span class="badge review">${t('badge.readonly')}</span>`
+                  : `<span class="badge claim-fact">${t('admin.scopeRW')}</span>`}</td>
+            <td>${esc(fmt(tk.last_used))}</td>
+            <td>${tk.active
+                  ? t('badge.active')
+                  : `<span class="badge superseded">${t('badge.revoked')}</span>`}</td>
+            <td>${tk.active
+                  ? `<button class="abtn rvk" data-t="${esc(tk.fingerprint)}">${t('admin.revoke')}</button>`
+                  : ''}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table></div>
+
+    <div class="saverow">
+      <input type="text" id="nt-user" placeholder="${t('admin.tokenUser')}"
+             style="flex:1;min-width:150px">
+      <input type="text" id="nt-label" placeholder="${t('admin.tokenLabel')}"
+             style="flex:1;min-width:160px">
+      <select id="nt-scope" style="padding:8px;border-radius:8px;
+              background:var(--panel2);border:1px solid var(--line);color:var(--ink)">
+        <option value="readwrite">${t('admin.scopeRW')}</option>
+        <option value="read">${t('admin.scopeRO')}</option>
+      </select>
+      <button class="btn primary" id="nt-add">${t('admin.issueToken')}</button>
+    </div>
+    <div id="nt-msg" style="font-size:13px;margin-top:8px"></div>`;
+
+  box.querySelectorAll('.rvk').forEach(el => el.onclick = async () => {
+    if (!confirm(t('admin.revokeConfirm', {t: el.dataset.t}))) return;
+    const res = await apiPost('/api/auth/token/revoke', {target: el.dataset.t});
+    if (res.ok) loadAdminTokens();
+    else alert(res.message || t('admin.revokeFail'));
+  });
+
+  const add = document.getElementById('nt-add');
+  add.onclick = async () => {
+    const msg = document.getElementById('nt-msg');
+    const user = document.getElementById('nt-user').value.trim();
+    if (!user){
+      msg.innerHTML = `<span style="color:var(--rust)">${t('admin.needUser')}</span>`;
+      return;
+    }
+    add.disabled = true; add.textContent = t('admin.issuing');
+    const res = await apiPost('/api/auth/token/create', {
+      user,
+      label: document.getElementById('nt-label').value.trim(),
+      scope: document.getElementById('nt-scope').value,
+    });
+    add.disabled = false; add.textContent = t('admin.issueToken');
+    if (!res.ok){
+      msg.innerHTML = `<span style="color:var(--rust)">${
+        esc(res.message || t('admin.createFail'))}</span>`;
+      return;
+    }
+    /* token 明文**只返回这一次**（后端刻意不再提供读取接口）。 */
+    msg.innerHTML = `
+      <div class="okbox" style="margin-top:10px">
+        <strong>${t('admin.tokenIssued', {u: esc(res.user), s: esc(res.scope)})}</strong><br>
+        ${t('admin.tokenOnce')}
+        <div style="margin-top:6px">
+          <code style="font-size:12px;user-select:all;word-break:break-all">${esc(res.token)}</code>
+        </div>
+      </div>`;
+    loadAdminTokens();
+  };
+}
+
+async function saveSettings(){
+  const msg = document.getElementById('cfg-msg');
+  const btn = document.getElementById('cfg-save');
+  msg.textContent = '';
+
+  // 先在前端把 JSON 解析好 —— 让用户看到"哪一行写错了"，
+  // 而不是等后端返回一个笼统的 400
+  let inferType;
+  try {
+    const raw = document.getElementById('cfg-infertype').value.trim();
+    inferType = raw ? JSON.parse(raw) : {};
+    if (typeof inferType !== 'object' || Array.isArray(inferType))
+      throw new Error('必须是对象：{"类型": ["关键词"]}');
+  } catch (e){
+    msg.innerHTML = `<span style="color:var(--rust)">${
+      t('cfg.inferJsonErr')}${esc(e.message)}</span>`;
+    return;
+  }
+
+  const payload = {
+    instructions: document.getElementById('cfg-instructions').value,
+    rules: {
+      ...(STATE.config.rules || {}),
+      missing_field_policy: document.getElementById('cfg-policy').value.trim(),
+      max_title_chars: Number(document.getElementById('cfg-maxtitle').value) || 0,
+      require_workspace: document.getElementById('cfg-reqws').value.trim() === 'true',
+      infer_type: inferType,
+    },
+    settings: {
+      ...(STATE.config.settings || {}),
+      commit_debounce_seconds: Number(document.getElementById('cfg-debounce').value) || 0,
+      search_default_limit: Number(document.getElementById('cfg-limit').value) || 20,
+      panel_refresh_seconds: Number(document.getElementById('cfg-refresh').value) || 0,
+    },
+  };
+
+  btn.disabled = true; btn.textContent = t('cfg.saving');
+  const r = await apiPost('/api/config', payload);
+  btn.disabled = false; btn.textContent = t('cfg.save');
+
+  if (!r.ok){
+    // 后端会指明是哪一项不合法 —— 直接展示，不要吞掉
+    msg.innerHTML = `<span style="color:var(--rust)">${
+      t('cfg.saveFail')}${esc(r.message || '')}</span>`;
+    return;
+  }
+  msg.innerHTML = `<span style="color:var(--verdigris)">${t('cfg.saved')}</span>`;
+  loadSettings();
+  load();
+}
+
+/* ═══════════════ 标签页切换 ═══════════════ */
+
+function switchTab(tab){
+  STATE.tab = tab;
+  document.querySelectorAll('.navtab').forEach(el =>
+    el.classList.toggle('on', el.dataset.tab === tab));
+  for (const t of ['library','knowledge','settings']){
+    document.getElementById('page-' + t).style.display = (t === tab) ? '' : 'none';
+  }
+  if (tab === 'knowledge') loadKnowledge();
+  if (tab === 'settings') loadSettings();
+}
+
+/* ═══════════════ 键盘操作 ═══════════════ */
+
+function move(delta){
+  if (STATE.tab !== 'library') return;
+  const idx = STATE.notes.findIndex(n => n.title === STATE.cur);
+  const next = STATE.notes[Math.max(0, Math.min(STATE.notes.length - 1,
+               (idx === -1 ? 0 : idx) + delta))];
+  if (next) select(next.title);
+}
+
+document.addEventListener('keydown', (e) => {
+  const tag = (document.activeElement.tagName || '');
+  const typing = /^(INPUT|TEXTAREA)$/.test(tag);
+  // 在设置页打字时不要触发全局快捷键
+  if (typing) return;
+
+  if (e.key === '/'){
+    e.preventDefault();
+    switchTab('library');
+    document.getElementById('q').focus();
+    return;
+  }
+  if (e.key === 'Escape'){
+    const q = document.getElementById('q');
+    q.value = ''; STATE.q = ''; q.blur(); load();
+    return;
+  }
+  if (e.key === 'j' || e.key === 'ArrowDown'){ e.preventDefault(); move(1); }
+  if (e.key === 'k' || e.key === 'ArrowUp'){ e.preventDefault(); move(-1); }
+  if (e.key === '1') switchTab('library');
+  if (e.key === '2') switchTab('knowledge');
+  if (e.key === '3') switchTab('settings');
+});
+
+/* ═══════════════ 启动 ═══════════════ */
+
+/* ─────────────── 语言初始化 ───────────────
+ *
+ * 顺序很重要：
+ *   ① detectLang()      决定用哪个语言（存过 > URL > 浏览器 > 默认中文）
+ *   ② applyStaticText() 把 HTML 里的 data-i18n 文案换掉
+ *   ③ 绑定下拉框        之后用户手动切换
+ *
+ * 必须在 load() **之前**做：否则首屏先用中文渲染一遍再被替换，
+ * 用户会看到一闪而过的语言跳变。 */
+LANG = detectLang();
+document.documentElement.lang = (LANG === 'zh' ? 'zh-CN' : LANG);
+applyStaticText();
+
+const langSel = document.getElementById('lang-select');
+if (langSel) {
+  langSel.value = LANG;
+  langSel.onchange = () => {
+    setLang(langSel.value);
+    document.documentElement.lang = (LANG === 'zh' ? 'zh-CN' : LANG);
+  };
+}
+
+let searchTimer;
+const qi = document.getElementById('q');
+qi.addEventListener('input', (e) => {
+  STATE.q = e.target.value;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(load, 200);   // 防抖：别每个字符都打一次请求
+});
+document.querySelectorAll('.navtab').forEach(el =>
+  el.onclick = () => switchTab(el.dataset.tab));
+
+/* 深链接支持：?tab=knowledge / ?id=某标题
+   用途：把"这个视图"或"这条记忆"直接分享出去 ——
+   面板是给人看的，能分享的链接比"你去点第二个标签"有用得多。 */
+const bootParams = new URLSearchParams(location.search);
+const bootId = bootParams.get('id');
+const bootTab = bootParams.get('tab');
+
+if (bootId) STATE.cur = bootId;
+switchTab(['knowledge', 'settings', 'library'].includes(bootTab) ? bootTab : 'library');
+
+load().then(() => { if (bootId) select(bootId); });
+
+/** 启动时恢复用户偏好（分组方式） */
+try {
+  const saved = localStorage.getItem('shm-groupby');
+  if (saved === 'time' || saved === 'workspace') STATE.groupBy = saved;
+} catch {}
+
+/* 自动刷新：只在记忆库页且没在搜索时刷新。
+   两个"不刷"的理由：
+     · 用户在搜索框里打字时刷新会打断输入
+     · 设置页有未保存的改动，被刷新冲掉会很恼人 */
+setInterval(() => {
+  if (!STATE.q && STATE.tab === 'library') load();
+}, 15000);

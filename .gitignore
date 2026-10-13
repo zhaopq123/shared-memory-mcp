@@ -1,0 +1,72 @@
+# 依赖 / 虚拟环境
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Pytest temporary data (must not become a Git repository)
+.pytest-runtime/
+
+# 运行时数据 —— 绝不进仓库
+vault/
+demo-vault/
+.trash/
+*.db
+*.sqlite3
+*.log
+token
+.token
+.tokens
+tenant-home/
+
+# 部署备份（src.bak-YYYYMMDD-HHMMSS）与临时产物
+*.bak-*
+*.tmp
+*-out.txt
+
+# 部署专用（各人环境不同，不该共享）
+start-demo.sh
+deploy/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 截图：本地调试产物一律不入库（界面里可能带着真实数据）。
+# 若确需给 README 配图，请用 demo 假数据重新生成后 `git add -f` 显式添加。
+*.png
+
+# ── 开发期一次性脚本 ──
+# 排查某个具体 bug / 做某次数据迁移时写的，用完即弃，不属于项目发布物。
+# 文件仍保留在本机磁盘可直接运行，只是不进 git。
+#
+# Chrome DevTools 协议：界面截图与验证
+scripts/cdp-*.mjs
+# 临时调试
+scripts/debug*.sh
+scripts/debug*.py
+# i18n 批量迁移的中间版本
+scripts/i18n_*.py
+scripts/i18n-*.mjs
+scripts/apply_i18n.py
+# 一次性诊断
+scripts/diag/
+scripts/diag_start.py
+# 数据迁移 / 清理
+scripts/find_old_vault.py
+scripts/list_notes.py
+scripts/migrate_cleanup.py
+scripts/cleanup_users.py
+scripts/fix_misclassified.py
+# 单次复现
+scripts/repro_pw.py
+scripts/accept.py
+# 旧 tmux 时代守护，已被 scripts/ops/ 下的 runsv 方案取代
+scripts/guard.sh
+# i18n 扫描临时产物
+i18nmap.json
