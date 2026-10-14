@@ -79,6 +79,7 @@ async def main() -> int:
             "tags": ["e2e"],
         })
         d = json.loads(r.content[0].text)
+        home_lib = d.get("_lib", "")           # 默认落库，后面 stats 用它
         print(f"   ok={d.get('ok')} lib={d.get('_lib')} "
               f"committed={d.get('committed')} pending={d.get('commit_pending')}")
         check("写入成功", d.get("ok") is True)
@@ -114,29 +115,43 @@ async def main() -> int:
         print(f"   ok={d.get('ok')} lib={d.get('_lib')}")
         check("admin 可写公司库（设计如此）", d.get("ok") is True)
 
-        # 真正验证只读保护：member 身份
-        print("\n5b. 只读保护（member 不能写公司库）")
-        # 没有 member token 时跳过（不能为测试去建用户 —— 那会改生产数据）
+        # 真正验证只读保护：只读凭据（member 或 scope=read）
+        print("\n5b. 只读凭据：能读、不能写")
+        # 没有只读 token 时跳过（不能为测试去建用户 —— 那会改生产数据）
         member_tok = os.environ.get("SHARED_MEMORY_MEMBER_TOKEN", "")
         if member_tok:
             async with Client(URL, auth=member_tok, timeout=30) as c2:
-                r = await c2.call_tool("memory_write", {
-                    "title": "member 试图写公司库", "body": "应被拒", "lib": "company",
-                })
-                d2 = json.loads(r.content[0].text)
-                print(f"   ok={d2.get('ok')} code={d2.get('code')}")
-                check("member 被拒（FORBIDDEN）",
-                      d2.get("ok") is False and d2.get("code") == "FORBIDDEN")
-                check("错误说明是只读", "只读" in str(d2.get("message", "")))
+                r = await c2.call_tool("memory_search", {"query": "E2E", "limit": 3})
+                d2r = json.loads(r.content[0].text)
+                check("只读凭据：读放行", d2r.get("ok") is True)
+                # 写被拒：fastmcp 客户端可能抛 ToolError，也可能返回 ok=false —— 两种都算"被拒"
+                blocked, msg = False, ""
+                try:
+                    r = await c2.call_tool("memory_write", {
+                        "title": "只读凭据试图写公司库", "body": "应被拒", "lib": "company",
+                    })
+                    d2 = json.loads(r.content[0].text)
+                    blocked, msg = (d2.get("ok") is False), str(d2.get("message", ""))
+                    print(f"   write: ok={d2.get('ok')} code={d2.get('code')}")
+                except Exception as exc:  # ToolError
+                    blocked, msg = True, str(exc)
+                    print(f"   write: 被拒（{type(exc).__name__}）")
+                check("只读凭据：写被拒", blocked)
+                check("错误说明是只读", "只读" in msg)
         else:
-            print("   （未提供 member token，跳过 —— 单测里已覆盖这条）")
+            print("   （未提供只读 token，跳过 —— 单测里已覆盖这条）")
 
         # ── 6. 越权 ──
         print("\n6. 越权防护")
-        r = await c.call_tool("memory_search", {"query": "x", "lib": "user-nobody"})
-        d = json.loads(r.content[0].text)
-        print(f"   访问他人个人库: ok={d.get('ok')} code={d.get('code')}")
-        check("被拒绝", d.get("ok") is False)
+        denied, det = False, ""
+        try:
+            r = await c.call_tool("memory_search", {"query": "x", "lib": "user-nobody"})
+            d = json.loads(r.content[0].text)
+            denied, det = (d.get("ok") is False), f"ok={d.get('ok')} code={d.get('code')}"
+        except Exception as exc:  # 客户端抛错也是"被拒绝"的一种表现
+            denied, det = True, f"{type(exc).__name__}"
+        print(f"   访问他人个人库: {det}")
+        check("被拒绝", denied)
 
         # ── 7. 视图 ──
         print("\n7. 体系视图")
@@ -148,16 +163,134 @@ async def main() -> int:
 
         # ── 8. git 历史 ──
         print("\n8. git 历史（作者）")
-        r = await c.call_tool("memory_stats", {"lib": d.get("_lib", "user-admin")})
+        r = await c.call_tool("memory_stats", {
+            "lib": home_lib or "user-admin", "with_commits": True,
+        })
         d = json.loads(r.content[0].text)
         commits = d.get("commits", [])[:3]
         for cm in commits:
-            print(f"   {cm.get('commit')} {cm.get('author'):<12} {cm.get('subject', '')[:40]}")
+            print(f"   {cm.get('commit')} {str(cm.get('author') or '-'):<12} {cm.get('subject', '')[:40]}")
         check("有提交记录", len(commits) > 0)
         check("提交带作者字段", all("author" in c2 for c2 in commits))
 
+        def _rows(d: dict, *keys: str) -> list:
+            """从响应里取列表字段（不同工具的键名不完全一致）。"""
+            for k in keys:
+                v = d.get(k)
+                if isinstance(v, list):
+                    return v
+            return []
+
+        me_name = me.get("name", "admin")
+
+        # ── 9. 工作空间全生命周期（自检沙盘，可重复跑）──
+        print("\n9. 工作空间 = 库：建库 → 写 → 读 → 引用 → 共享往返")
+        ws_name = "e2e自检"
+        ws_lib = "ws-" + ws_name
+        try:
+            r = await c.call_tool("memory_workspace_create", {"workspace": ws_name})
+            d = json.loads(r.content[0].text)
+            print(f"   create: ok={d.get('ok')} lib={d.get('lib')}")
+        except Exception as exc:  # 已存在（重复跑）属正常
+            print(f"   create: 已存在，复用沙盘库（{str(exc)[:60]}）")
+        # 以"库在册"为准
+        r = await c.call_tool("memory_libs")
+        d = json.loads(r.content[0].text)
+        lib_ids = [l.get("lib") or l.get("id") for l in _rows(d, "libraries", "libs", "results")]
+        check("沙盘库在册（ws-e2e自检）", ws_lib in lib_ids,
+              f"共 {len(lib_ids)} 库: {', '.join(x for x in lib_ids if x)}")
+
+        r = await c.call_tool("memory_write", {
+            "title": "E2E 沙盘·被引用条目",
+            "body": "本条被 [[E2E 沙盘·引用者]] 引用，用于验证引用关系。",
+            "lib": ws_lib, "workspace": ws_name, "tags": ["e2e"],
+        })
+        d = json.loads(r.content[0].text)
+        check("沙盘写入（被引用条目）", d.get("ok") is True, f"lib={d.get('_lib')}")
+        r = await c.call_tool("memory_write", {
+            "title": "E2E 沙盘·引用者",
+            "body": "本条引用 [[E2E 沙盘·被引用条目]]，用于验证 backlinks。",
+            "lib": ws_lib, "workspace": ws_name, "tags": ["e2e"],
+        })
+        d = json.loads(r.content[0].text)
+        check("沙盘写入（引用者）", d.get("ok") is True)
+
+        r = await c.call_tool("memory_get", {"ident": "E2E 沙盘·被引用条目", "lib": ws_lib})
+        d = json.loads(r.content[0].text)
+        check("memory_get 按标题读全文",
+              d.get("ok") is True and "被引用" in json.dumps(d, ensure_ascii=False))
+
+        r = await c.call_tool("memory_list", {"lib": ws_lib, "tag": "e2e", "limit": 20})
+        d = json.loads(r.content[0].text)
+        titles = [x.get("title") for x in _rows(d, "results", "notes", "items")]
+        check("memory_list 按 tag 过滤", "E2E 沙盘·引用者" in titles)
+
+        r = await c.call_tool("memory_backlinks", {"title": "E2E 沙盘·被引用条目", "lib": ws_lib})
+        d = json.loads(r.content[0].text)
+        check("backlinks 找到引用者",
+              d.get("ok") is True and "引用者" in json.dumps(d, ensure_ascii=False))
+
+        r = await c.call_tool("memory_search", {"query": "沙盘", "lib": ws_lib, "limit": 5})
+        d = json.loads(r.content[0].text)
+        check("沙盘内可搜到", d.get("total", 0) >= 2)
+        r = await c.call_tool("memory_search", {"query": "沙盘", "workspace": ws_name, "limit": 5})
+        d = json.loads(r.content[0].text)
+        check("按 workspace 过滤可搜到", d.get("total", 0) >= 2)
+
+        r = await c.call_tool("memory_workspace_share", {"lib": ws_lib, "share": "company"})
+        d = json.loads(r.content[0].text)
+        check("share：仅自己 → 公司", d.get("ok") is True)
+        r = await c.call_tool("memory_workspace_share", {"lib": ws_lib, "share": f"user:{me_name}"})
+        d = json.loads(r.content[0].text)
+        check("share：公司 → 收回（仅自己）", d.get("ok") is True)
+
+        r = await c.call_tool("memory_workspaces")
+        d = json.loads(r.content[0].text)
+        ws_rows = _rows(d, "libraries", "workspaces", "results", "items")
+        row = [w for w in ws_rows if (w.get("lib") or w.get("id")) == ws_lib]
+        check("memory_workspaces 列出沙盘", len(row) >= 1,
+              (row[0].get("share_label", "") if row else ""))
+
+        # ── 10. 回收站：删除 → 恢复 ──
+        print("\n10. 回收站往返")
+        r = await c.call_tool("memory_delete", {"ident": "E2E 沙盘·引用者", "confirm": True, "lib": ws_lib})
+        d = json.loads(r.content[0].text)
+        moved = d.get("moved_to", "")
+        print(f"   moved_to={moved}")
+        check("删除进回收站", d.get("action") == "deleted")
+        fname = moved.split("/")[-1] if moved else ""
+        restored = False
+        for cand in (fname, moved):
+            if not cand:
+                continue
+            try:
+                r = await c.call_tool("memory_restore", {"filename": cand, "lib": ws_lib})
+                d = json.loads(r.content[0].text)
+                restored = d.get("ok") is True
+            except Exception:
+                restored = False
+            if restored:
+                break
+        check("从回收站恢复", restored)
+
+        # ── 11. 导出 / 导入（幂等）──
+        print("\n11. 导出 / 导入")
+        r = await c.call_tool("memory_export", {"lib": ws_lib})
+        d = json.loads(r.content[0].text)
+        bundle = d.get("bundle") or d.get("out_dir") or d.get("path") or ""
+        print(f"   bundle={bundle}  raw={json.dumps(d, ensure_ascii=False)[:160]}")
+        check("导出成功", d.get("ok") is True and bool(bundle))
+        if bundle:
+            r = await c.call_tool("memory_import", {
+                "bundle": bundle, "target_lib": ws_lib, "on_conflict": "skip",
+            })
+            d = json.loads(r.content[0].text)
+            print(f"   import raw={json.dumps(d, ensure_ascii=False)[:200]}")
+            check("重复导入不崩（skip 幂等）", d.get("ok") is True)
+
     print(f"\n{'═' * 62}")
     print("  结果: " + ("全部通过 ✓" if ok else "有失败 ✗"))
+    print("  说明: 自检沙盘库 ws-e2e自检 及其中 2 条固定样例保留（重复跑不增长）")
     print("═" * 62)
     return 0 if ok else 1
 

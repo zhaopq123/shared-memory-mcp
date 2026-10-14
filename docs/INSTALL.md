@@ -63,6 +63,14 @@ Windows 用 `venv\Scripts\pip install -e .`。
 ./venv/bin/python -c "import shared_memory, fastmcp; print('OK')"
 ```
 
+装好后建议跑一遍**全量自检**（17 个工具 + 全部用户旅程：工作空间生命周期 / 回收站 / 导出导入 / 只读凭据 / 越权防护）：
+
+```bash
+./venv/bin/python scripts/e2e.py
+```
+
+自检会写入少量标记记录（个人库与公司库各 1 条、沙盘库 `ws-e2e自检` 2 条固定样例），可重复跑、不增长。
+
 ---
 
 ## 3. 配置
