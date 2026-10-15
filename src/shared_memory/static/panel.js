@@ -71,7 +71,7 @@ const api = (p, o = {}) => {
   const q = qs(o);
   return fetch(p + (q ? '?' + q : ''), { credentials: 'same-origin' })
     .then(async r => {
-      if (r.status === 401) { showLogin(); return {ok:false, needLogin:true}; }
+      if (r.status === 401) return handle401();
       return r.json();
     })
     .catch(e => ({ok:false, message:String(e)}));
@@ -84,8 +84,14 @@ const apiPost = (p, body) => fetch(p, {
   headers: {'Content-Type':'application/json'},
   body: JSON.stringify(body),
 }).then(async r => {
-  if (r.status === 401) { showLogin(); return {ok:false, needLogin:true}; }
-  return r.json();
+  /* ⚠️ 登录接口的失败原因必须原样透出。
+     实测踩过：401 一律吞成 needLogin
+     → 服务端明明回了“凭据无效”，
+     界面却只能显示笼统的“用户名或密码不正确”：
+     用户看不出到底是密码错还是账号未设密码。
+     其他接口的 401 仍走 showLogin（会话过期＝要重新登录）。 */
+  if (r.status === 401 && p !== '/api/auth/login') return handle401();
+  return r.json().catch(() => ({ok:false, message:'HTTP ' + r.status}));
 }).catch(e => ({ok:false, message:String(e)}));
 
 /* ─────────────── 登录 ─────────────── */
@@ -117,6 +123,80 @@ const apiPost = (p, body) => fetch(p, {
  *  底部留了一行"用 token 登录"的小字链接 —— 给"刚拿到账号还没设密码"
  *  或"密码忘了"的场景兜底，不作为主路径。
  */
+let refreshTimer = null;
+
+/** 合并连续相同的提交 + 去掉重复的作者。
+ *
+ *  ━━━ 为什么（用户实测原话："这个历史提交是个什么几把东西"）━━━
+ *
+ *  原来的实现对 git 的原始 subject 直接铺 20 行：
+ *      memory: 自动提交 — admin     ← 重复 20 次，看不出任何信息
+ *      memory: 手动提交: admin — admin  ← subject 里已含作者，模板又补一次
+ *
+ *  这里只改**呈现**（不动数据）：
+ *    · 连续相同 subject 合并成一条，尾巴标 ×N
+ *    · subject 结尾已经带作者名时不再重复追加
+ */
+function groupCommits(commits){
+  const stripAuthor = (c) => {
+    let s = String(c.subject || '').trim();
+    const a = String(c.author || '').trim();
+    if (!a || !s.includes(a)) return s;
+    const escA = a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    s = s.replace(new RegExp('\\s*[\u2014\u2013-]\\s*' + escA + '\\s*$'), '').trim();
+    if (s.endsWith(': ' + a)) s = s.slice(0, -(': ' + a).length).trim();
+    return s;
+  };
+  const out = [];
+  for (const c of commits){
+    const s = stripAuthor(c);
+    const last = out[out.length - 1];
+    if (last && last.subject === s){ last.n++; continue; }
+    out.push({commit: c.commit, date: c.date, subject: s, n: 1});
+  }
+  return out;
+}
+
+/** 401 的统一处理 —— **不要**无条件糊上全屏登录遮罩。
+ *
+ *  ━━━ 为什么（2026-10-15 用户实测暴案）━━━
+ *
+ *  服务端重启 → 会话（只存内存，刻意不落盘）全失效 → 面板的 15s 轮询
+ *  拿到 401 → `showLogin()` 把遮罩**追加到 body 末尾** →
+ *  用户明明已经登录、页面上数据都还在，却看到底部挂着一个"需要登录"。
+ *  用户的原话是"我他妈都登上了这还有个需要登录在最底下"。
+ *
+ *  判据很简单：**页面上已经有数据** → 那只是会话过期，用非阻断横幅
+ *  （数据留着、能继续看、点一下重新登录）；真的什么都没有 → 才需要遮罩。
+ *
+ *  ⚠️ 顺带停掉轮询：不停的话每 15s 都会再 401 一次，横幅反复弹。
+ */
+function handle401(){
+  if (STATE.notes && STATE.notes.length){
+    if (refreshTimer){ clearInterval(refreshTimer); refreshTimer = null; }
+    showSessionBanner();
+    return {ok:false, needLogin:true, expired:true};
+  }
+  showLogin();
+  return {ok:false, needLogin:true};
+}
+
+/** 会话过期横幅（替代"全屏遮罩盖住已有内容"）。 */
+function showSessionBanner(){
+  if (document.getElementById('sess-banner')) return;
+  const b = document.createElement('div');
+  b.id = 'sess-banner';
+  b.innerHTML = `
+    <span>${LANG === 'zh'
+      ? '会话已过期（服务端重启或登录超时）—— 下面是最后一次取到的数据。'
+      : 'Session expired (server restarted or timed out). Below is the last snapshot.'}</span>
+    <button class="btn primary" id="sess-relogin">${
+      LANG === 'zh' ? '重新登录' : 'Sign in again'}</button>`;
+  document.body.appendChild(b);
+  document.getElementById('sess-relogin').onclick =
+    () => location.replace(location.pathname);
+}
+
 function showLogin(msg){
   if (document.getElementById('login-mask')) return;
   const mask = document.createElement('div');
@@ -676,15 +756,53 @@ function renderChips(){
     renderChips(); renderList();
   });
 
-  // 标签（二级分类）
+  /* 这里原来是"14 个标签 chips" —— 用户实测反馈左栏太乱（13 个标签
+     + 7 个库 chips 挤在顶部），要求"只按工作空间分类"。所以标签不再
+     铺一排，改成**只在有筛选时**显示一条状态条（见 filterBarHtml）。 */
   const c = document.getElementById('chips');
-  c.innerHTML = STATE.tags.length
-    ? '<div class="chips">' +
-      STATE.tags.slice(0, 14).map(([t, n]) =>
-        `<button class="chip${STATE.activeTag === t ? ' on' : ''}" data-tag="${esc(t)}">
-           ${esc(t)} <span style="opacity:.6">${n}</span></button>`).join('') + '</div>'
-    : '';
-  c.querySelectorAll('.chip').forEach(el => el.onclick = () => toggleTag(el.dataset.tag));
+  c.innerHTML = filterBarHtml();
+  c.querySelectorAll('[data-clear]').forEach(el => el.onclick = () => {
+    const k = el.dataset.clear;
+    const qi = document.getElementById('q');
+    if (k === 'all'){
+      STATE.q = ''; STATE.activeTag = ''; STATE.activeWs = ''; STATE.activeLib = '';
+      if (qi) qi.value = '';
+    } else if (k === 'q'){ STATE.q = ''; if (qi) qi.value = ''; }
+    else if (k === 'tag') STATE.activeTag = '';
+    else if (k === 'ws') STATE.activeWs = '';
+    else if (k === 'lib') STATE.activeLib = '';
+    load();
+  });
+}
+
+/** 当前筛选条件的可见提示 —— 有筛选就**必须**显示。
+ *
+ *  ━━━ 为什么必须（2026-10-15 用户实测暴案）━━━
+ *
+ *  用户点了一个标签（小红书）→ 列表只剩 4 条 → 顶栏"4 条记忆"、
+ *  左栏工作区树只剩两个组 → 用户的结论是"我的数据全没了，有 bug"。
+ *  实际库里 70 条、乱七八糟 31 条，一条没丢。
+ *
+ *  原来的实现只在**列表为空**时才解释筛选条件（见 emptyListHtml）——
+ *  有 4 条命中时界面上一个字的提示都没有。这是纯可用性缺陷。
+ */
+function filterBarHtml(){
+  const parts = [];
+  if (STATE.q) parts.push(['q', '搜索「' + STATE.q + '」']);
+  if (STATE.activeTag) parts.push(['tag', '标签「' + STATE.activeTag + '」']);
+  if (STATE.activeWs) parts.push(['ws', '工作区「' + STATE.activeWs + '」']);
+  if (STATE.activeLib){
+    const l = (STATE.libs || []).find(x => x.id === STATE.activeLib);
+    parts.push(['lib', '库「' + (l ? (l.label || l.id) : STATE.activeLib) + '」']);
+  }
+  if (!parts.length) return '';
+  return `
+    <div class="filterbar">
+      <span class="rowlabel" style="margin:0">筛选中</span>
+      ${parts.map(([k, txt]) =>
+        `<button class="fchip" data-clear="${k}">${esc(txt)}<span class="x">×</span></button>`).join('')}
+      ${parts.length > 1 ? '<button class="fclear" data-clear="all">全部清除</button>' : ''}
+    </div>`;
 }
 
 function toggleTag(t){
@@ -710,7 +828,14 @@ async function load(){
   STATE.me = r.me || null;
   STATE.libs = r.libs || [];
 
-  document.getElementById('s-notes').textContent = r.stats.notes;
+  /* ⚠️ 数字必须说清是"筛后"还是"全部"。
+     实测暴案：用户点了一个标签 → 顶栏显示"4 条记忆" → 结论是
+     "我这两天做的全没了，是不是有 bug"。库里其实 70 条一条没丢。
+     有筛选时显示 "4 / 70"。 */
+  const nAll = r.stats.notes_all;
+  document.getElementById('s-notes').textContent =
+    (nAll != null && nAll !== r.stats.notes)
+      ? (r.stats.notes + ' / ' + nAll) : r.stats.notes;
   document.getElementById('s-libs').textContent = r.stats.libs;
   /* 「个工作区」统计**真实的项目数**（排除"(无工作区)"这个分类桶）。
      注意显示 0 是合法且有意义的：说明库里还没有按项目归类的记忆 ——
@@ -795,38 +920,36 @@ function renderLibChips(){
   const libs = STATE.libs || [];
   if (!libs.length){ box.innerHTML = ''; return; }
 
-  const chip = (label, count, id, extra) => `
-    <button class="chip lib${STATE.activeLib === id ? ' on' : ''}"
-            data-lib="${esc(id)}" title="${esc(extra || '')}">
-      ${esc(label)}${count != null ? ` <span style="opacity:.6">${count}</span>` : ''}
-      ${extra && extra.includes('只读') ? '<span class="ro">只读</span>' : ''}
-    </button>`;
+  /* 库 = **权限边界**（谁能读、谁能写），必须能一眼看到自己在哪 ——
+     但 7 个 chip 横铺在左栏顶部，加上标签 chips 一共 20 个按钮，
+     视觉噪音太大（用户实测反馈"这一块太乱了"）。收成一个下拉：
+     信息一个不少，版面只剩一行；只读库直接在下拉项里标出来，
+     省得用户写进去才吃到 403。 */
+  const note = (l) => {
+    let n = l.owner;
+    if (l.owner === 'company') {
+      n = t('share.company') + ' / ' + t('share.companyDesc');
+    } else if (String(l.owner).startsWith('group:')) {
+      const g = l.owner.slice(6);
+      n = t('share.group', {g}) + ' / ' + t('share.groupDesc', {g});
+    } else if (String(l.owner).startsWith('user:')) {
+      n = t('share.self') + ' / ' + t('share.selfDesc');
+    }
+    if (!l.writable) n += ' · ' + t('badge.readonly');
+    return n;
+  };
 
   box.innerHTML = `
     <div class="rowlabel">库（${libs.length}）</div>
-    <div class="chips">
-      ${chip('全部', null, '')}
-      ${libs.map(l => {
-        // 归属 → 人类可读的说明（放在 title 里，不占版面）
-        // 归属说明（放 title，不占版面）
-        let note = l.owner;
-        if (l.owner === 'company') {
-          note = t('share.company') + ' / ' + t('share.companyDesc');
-        } else if (String(l.owner).startsWith('group:')) {
-          const g = l.owner.slice(6);
-          note = t('share.group', {g}) + ' / ' + t('share.groupDesc', {g});
-        } else if (String(l.owner).startsWith('user:')) {
-          note = t('share.self') + ' / ' + t('share.selfDesc');
-        }
-        if (!l.writable) note += ' · ' + t('badge.readonly');
-        return chip(l.label || l.id, null, l.id, note);
-      }).join('')}
-    </div>`;
+    <select id="lib-select">
+      <option value="">全部库</option>
+      ${libs.map(l => `<option value="${esc(l.id)}" title="${esc(note(l))}"${
+        STATE.activeLib === l.id ? ' selected' : ''}>${esc(l.label || l.id)}${
+        l.writable ? '' : '（只读）'}</option>`).join('')}
+    </select>`;
 
-  box.querySelectorAll('.chip[data-lib]').forEach(el => el.onclick = () => {
-    STATE.activeLib = el.dataset.lib || '';
-    load();
-  });
+  const sel = document.getElementById('lib-select');
+  sel.onchange = () => { STATE.activeLib = sel.value || ''; load(); };
 }
 
 async function select(title){
@@ -972,11 +1095,14 @@ function render(n){
       </div>`).join('') + '</div></div>' : ''}
     ${STATE.commits.length ? `
     <div class="sect"><h3>${t('doc.history', {n: STATE.commits.length})}</h3>
-      <div class="hist">${STATE.commits.map(c =>
+      <p class="sectip" style="margin:0 0 12px">${LANG === 'zh'
+        ? '这是<strong>整个库</strong>的 git 历史，不是这一条记忆的改动。'
+        : 'This is the git log of the whole library, not this note.'}</p>
+      <div class="hist">${groupCommits(STATE.commits).map(c =>
         `<div class="c"><span class="h">${esc(c.commit)}</span>
          <span class="d">${esc((c.date||'').slice(5,16))}</span>
-         <span class="s">${esc(c.subject)}${c.author
-            ? ' <span style="color:var(--muted)">— ' + esc(c.author) + '</span>' : ''}</span></div>`
+         <span class="s">${esc(c.subject)}${c.n > 1
+            ? ` <span style="color:var(--muted)">×${c.n}</span>` : ''}</span></div>`
       ).join('')}</div>
     </div>` : ''}
   </div>`;
@@ -1113,6 +1239,65 @@ async function loadKnowledge(){
 
 /* ═══════════════ 标签页 3：设置 ═══════════════ */
 
+/** 新机器要粘进 mcp.json 的那段配置。
+ *
+ *  ━━━ 地址为什么不能"一把梭 location.origin"━━━
+ *
+ *  用户实测反馈："每个电脑上的地址他不一样啊"。分两种情况：
+ *
+ *    · 从**别的机器**打开面板（http://192.168.3.35:8200）→
+ *      origin 就是那台机器能用的地址，直接用它生成的配置是对的。
+ *    · 在**服务器本机**打开面板（http://127.0.0.1:8200）→
+ *      origin 是回环地址，复制给别的机器等于给了它一个指向它自己的地址
+ *      （那个 agent 会连自己的 8200，然后一脸懵）。这种情况必须留占位符。
+ *
+ *  所以：回环地址 → 占位符；否则 → 用你当前访问用的那个地址。
+ */
+function accessSnippet(){
+  const h = location.hostname;
+  const loopback = (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '');
+  const url = loopback
+    ? 'http://<这台服务器的局域网地址>:8200/mcp'
+    : location.origin + '/mcp';
+  return JSON.stringify({
+    mcpServers: {
+      'shared-memory': {
+        type: 'streamableHttp',
+        url,
+        headers: {Authorization: 'Bearer <在这里粘 token>'},
+        timeout: 240000,
+      },
+    },
+  }, null, 2);
+}
+
+/** 复制到剪贴板。
+ *
+ *  ⚠️ 面板是 http://192.168.x.x:8200（不是安全上下文），
+ *  navigator.clipboard **取不到**（实测），必须留 execCommand 兜底。
+ */
+function copyText(s, btn){
+  const done = () => {
+    if (!btn) return;
+    const old = btn.textContent;
+    btn.textContent = '已复制';
+    setTimeout(() => { btn.textContent = old; }, 1400);
+  };
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    ta.remove();
+  };
+  if (navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(s).then(done).catch(fallback);
+  } else fallback();
+}
+
 async function loadSettings(){
   const holder = document.getElementById('sbody');
   holder.innerHTML = `<div class="empty">${t('common.loading')}</div>`;
@@ -1127,6 +1312,21 @@ async function loadSettings(){
 
   holder.innerHTML = `
   <div class="form">
+    <h3 class="sechead">接入新机器 / 新 agent</h3>
+    <p class="sectip">${LANG === 'zh'
+      ? '任何机器上的任何 agent 都只认两行：<strong>服务地址 + token</strong>。不用搬数据、不用同步 —— 全平台只有服务端这一份数据。'
+      : 'Any agent on any machine needs just two lines: service URL + token. Nothing to sync.'}</p>
+    <div class="tocwrap">
+      <pre style="margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap">${
+        esc(accessSnippet())}</pre>
+      <div class="saverow" style="margin-top:12px;padding-top:0;border-top:none">
+        <button class="btn" id="access-copy">复制配置</button>
+        <span class="sectip" style="margin:0;font-size:12px">${LANG === 'zh'
+          ? '把 <占位> 换成下面「凭据」里给这台机器新建的 token（label 写清是哪台机器，换机/离职就吊销那一条）。'
+          : 'Replace the placeholder with a token created for that machine below.'}</span>
+      </div>
+    </div>
+
     ${r.instructions_is_default ? `
       <div class="warnbox">${t('cfg.defaultInstructions')}</div>` : ''}
     ${r.instructions_disabled ? `
@@ -1229,10 +1429,17 @@ async function loadSettings(){
       <button class="btn ghost" id="ac-logout">${t('account.logout')}</button>
     </div>
     <div id="ac-msg" style="font-size:13px;margin-top:8px"></div>
+    <p class="sectip" style="margin-top:14px;font-size:12px">${LANG === 'zh'
+      ? '忘了密码没法自助重置（服务端不会把哈希还原成明文）—— 在服务器上跑 '
+        + '<code>./venv/bin/python scripts/set_password.py admin</code> 重设一个。'
+      : 'Password reset must be done on the server: '
+        + '<code>./venv/bin/python scripts/set_password.py admin</code>'}</p>
   </div>`;
 
   document.getElementById('cfg-save').onclick = saveSettings;
   document.getElementById('cfg-reload').onclick = () => { loadSettings(); };
+  const accCopy = document.getElementById('access-copy');
+  if (accCopy) accCopy.onclick = () => copyText(accessSnippet(), accCopy);
   if (isAdmin()) { loadAdminUsers(); loadAdminTokens(); }
   loadWorkspaces();
   bindAccount();
@@ -1817,6 +2024,6 @@ try {
    两个"不刷"的理由：
      · 用户在搜索框里打字时刷新会打断输入
      · 设置页有未保存的改动，被刷新冲掉会很恼人 */
-setInterval(() => {
+refreshTimer = setInterval(() => {
   if (!STATE.q && STATE.tab === 'library') load();
 }, 15000);

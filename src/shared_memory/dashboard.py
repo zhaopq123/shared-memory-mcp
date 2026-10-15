@@ -261,6 +261,20 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             else:
                 total = len(notes)
 
+            # ── 未筛选总量（"4 / 70" 里的 70）──
+            #
+            # ⚠️ 为什么必须给（2026-10-15 用户实测暴案）：用户点了一个标签，
+            # 顶栏显示"4 条记忆"，于是认定"我这两天的记忆全没了，有 bug"。
+            # 实际 70 条一条没丢 —— 界面把**筛后数字当总数**显示，
+            # 还没告诉用户筛了什么。前端拿这个值显示 "4 / 70"。
+            #
+            # 只在真有筛选时多算一次（否则白付一次全库列举的成本）。
+            notes_all = total
+            if q or tag or ws:
+                notes_all = len(
+                    hub.list_notes(user, limit=300).get("notes") or []
+                )
+
             # ── git 提交历史（版本历史区块用）──
             #
             # ⚠️ 必须显式 with_commits=True：另一个 agent 做过性能优化，
@@ -290,6 +304,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                 "commits": commits,
                 "stats": {
                     "notes": total,
+                    "notes_all": notes_all,
                     "libs": len(libs),
                     "tags": len(tag_counts),
                     "workspaces": len(ws_counts),

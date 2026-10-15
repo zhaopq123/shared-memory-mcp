@@ -123,6 +123,47 @@ input#q:focus{border-color:var(--brass-dim);
 .chip:hover{border-color:var(--brass-dim);color:var(--ink2)}
 .chip.on{border-color:var(--brass);color:var(--brass);
          background:color-mix(in srgb,var(--brass) 10%,transparent)}
+/* ─────────────── 筛选状态条（替代那排标签 chips）───────────────
+   有筛选时**一定**要显示：用户曾因为"筛选后只剩 4 条、顶栏显示 4"
+   而以为数据全丢了（库里其实 70 条）。 */
+.filterbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.fchip{
+  display:inline-flex;align-items:center;gap:6px;
+  font-size:12px;padding:3px 8px;border-radius:999px;
+  border:1px solid color-mix(in srgb,var(--brass) 45%,transparent);
+  background:color-mix(in srgb,var(--brass) 12%,transparent);
+  color:var(--brass);cursor:pointer;transition:all .13s;
+}
+.fchip:hover{background:color-mix(in srgb,var(--brass) 22%,transparent)}
+.fchip .x{font-size:13px;line-height:1;opacity:.75}
+.fclear{
+  font-size:11.5px;padding:3px 9px;border-radius:999px;cursor:pointer;
+  border:1px dashed var(--line);background:transparent;color:var(--muted);
+}
+.fclear:hover{border-color:var(--brass-dim);color:var(--ink2)}
+/* 库下拉：库是权限边界，必须一眼可见，但不该占一整排 chip */
+#lib-select{
+  width:100%;font:inherit;font-size:13px;color:var(--ink);
+  background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:7px 10px;outline:none;cursor:pointer;
+}
+#lib-select:focus{border-color:var(--brass-dim);
+                  box-shadow:0 0 0 3px color-mix(in srgb,var(--brass) 14%,transparent)}
+
+/* ─────────────── 会话过期横幅 ───────────────
+   ⚠️ 刻意**不用**登录遮罩：服务端重启会把内存里的会话清掉，而面板上
+   可能正显示着数据 —— 那时候糊一层全屏登录框，用户的感受就是"我明明
+   登上了，底下还挂着一个需要登录"。数据留着，只提示 + 给一个重新登录。 */
+#sess-banner{
+  position:fixed;top:0;left:0;right:0;z-index:150;
+  display:flex;gap:12px;align-items:center;justify-content:center;
+  padding:7px 14px;font-size:13px;
+  background:color-mix(in srgb,var(--rust) 16%,var(--bg));
+  border-bottom:1px solid color-mix(in srgb,var(--rust) 45%,transparent);
+  color:var(--ink);
+}
+#sess-banner .btn.primary{font-size:12px;padding:3px 12px}
+
 /* 工作区 chip 用虚线边框与标签区分：它是更粗的一级分类 */
 .chip.ws{border-style:dashed;font-weight:600}
 .chip.ws.on{border-style:solid}
@@ -461,6 +502,61 @@ input#q:focus{border-color:var(--brass-dim);
          letter-spacing:-.015em}
 .sechead:first-child{margin-top:0}
 .sectip{font-size:13px;color:var(--muted);margin:0 0 18px;line-height:1.6}
+
+/* ─────────────── 登录遮罩 ───────────────
+   ⚠️ 这段样式是**必须的**，不是装饰。
+
+   `#login-mask` / `.loginbox` 只存在于 panel.js 的 innerHTML 里
+   （HTML 骨架里没有它们），所以「JS 写了、CSS 忘了」不会有任何报错：
+
+     · 接口全通、单测全绿、curl 探活正常
+     · 真打开页面 → 遮罩以**普通块级流**追加在 body 末尾 →
+       顶栏/左栏照旧露在外面，登录框被拉成整屏宽、挤在页面底部
+
+   2026-10-15 用户截图反馈的实际形态就是这个（"这页面也太傻逼了"）。
+   契约由 tests/test_panel_contract.py::test_login_overlay_has_styles 钉住。
+
+   实现要点：
+     · `position:fixed` 是核心 —— 登录态下它必须**盖住整个应用**，
+       而不是参与文档流（这一条错了整页就是坏的）
+     · 遮罩用 92% 底 + 模糊：下面的骨架隐约可见，但不可读、不可交互
+     · z-index 必须高于 header 的 30
+*/
+#login-mask{
+  position:fixed;inset:0;z-index:200;
+  display:flex;align-items:center;justify-content:center;
+  padding:22px;overflow:auto;
+  background:color-mix(in srgb,var(--bg) 92%,transparent);
+  backdrop-filter:blur(10px) saturate(1.2);
+}
+#login-mask .loginbox{
+  width:100%;max-width:372px;
+  padding:26px 26px 22px;border-radius:14px;
+  background:var(--panel);border:1px solid var(--line);
+  box-shadow:var(--shadow);
+  animation:rise .24s cubic-bezier(.2,.7,.3,1) both;
+}
+#login-mask h2{
+  font-family:var(--serif);font-size:20px;font-weight:600;
+  margin:0 0 8px;text-align:center;letter-spacing:-.015em;
+}
+/* ⚠️ 遮罩内的输入框要单独给样式：JS 里 #login-pw / #login-token 是
+   `type=password`，**不在** `.field input[type=text]` 的覆盖范围内。
+   漏掉这条的形态：用户名框是设计好的样式，密码框是浏览器原生白框，
+   同一张表单里两个框长相不一致。 */
+#login-mask input{
+  width:100%;font:inherit;font-size:13.5px;color:var(--ink);
+  background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:10px 12px;outline:none;
+  transition:border-color .15s,box-shadow .15s;
+}
+#login-mask input::placeholder{color:var(--muted)}
+#login-mask input:focus{
+  border-color:var(--brass-dim);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--brass) 14%,transparent);
+}
+#login-mask .field label{font-size:13px}
+#login-mask .errbox{margin:0 0 16px;padding:10px 12px;font-size:13px}
 
 /* 进场动效（克制：只做位移+淡入） */
 @keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}

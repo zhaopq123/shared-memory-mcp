@@ -326,6 +326,8 @@ def test_js_uses_only_existing_element_ids() -> None:
         # 我的账号（改密码 + 退出登录）
         "ac-cur", "ac-new", "ac-new2", "ac-change", "ac-logout", "ac-msg",
         "cp-link", "cp-md", "relwrap", "dot", "root", "q",
+        # P1/P2/P4（2026-10-15）：会话过期横幅、库下拉、接入卡复制按钮
+        "sess-banner", "sess-relogin", "lib-select", "access-copy",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -333,6 +335,41 @@ def test_js_uses_only_existing_element_ids() -> None:
         assert f'id="{eid}"' in PANEL_HTML, (
             f"panel.js 引用了 #{eid}，但 HTML 里没有 —— JS 会静默失效"
         )
+
+
+def test_login_overlay_has_styles() -> None:
+    """⚠️ panel.js 动态创建的登录遮罩，必须在 panel.css 里有样式。
+
+    ━━━ 为什么单独测这一条 ━━━
+
+    `#login-mask` / `.loginbox` **只存在于 JS 的 innerHTML 里**（HTML 骨架
+    里没有），所以「写 JS 时漏掉配套 CSS」不报任何错：接口全通、curl 探活
+    正常、单测全绿 —— 只有真打开页面才暴露，形态是：
+
+        遮罩以普通块级流追加在 body 末尾
+        → 顶栏/左栏照旧露在外面，登录框被拉成整屏宽、挤在页面底部
+
+    这是 2026-10-15 用户截图反馈的实际形态。`position:fixed` 是核心约束：
+    登录态下遮罩必须**盖住整个应用**，而不是参与文档流。
+    """
+    import re
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    css = (root / "static" / "panel.css").read_text(encoding="utf-8")
+
+    m = re.search(r"#login-mask\s*\{([^}]*)\}", css)
+    assert m, "panel.css 里没有 #login-mask 规则 —— 登录遮罩会以普通块级流渲染"
+    assert "position:fixed" in m.group(1).replace(" ", ""), (
+        "#login-mask 必须 position:fixed（否则遮罩进文档流，整页排版崩）"
+    )
+
+    assert re.search(r"#login-mask\s+\.loginbox\s*\{", css), "panel.css 里没有 .loginbox 规则"
+
+    # 遮罩内的输入框：JS 里 #login-pw / #login-token 是 type=password，
+    # **不在** `.field input[type=text]` 的覆盖范围内 —— 必须单独兜住，
+    # 否则同表单里用户名框是定制样式、密码框是浏览器原生白框。
+    assert re.search(r"#login-mask\s+input\s*\{", css), (
+        "panel.css 缺少 #login-mask input 规则 —— 密码/令牌框会退回浏览器原生样式"
+    )
 
 
 def test_js_has_no_removed_credential_variable() -> None:
