@@ -35,6 +35,30 @@ logger = logging.getLogger(__name__)
 #: 静态资源目录（panel.css / panel.js）
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+
+def _static_ver() -> str:
+    """静态资源版本指纹（内容/时间变了指纹就变）。
+
+    用途只有一个：让 `panel.css?v=xxx` 这种 URL 在**文件变了以后必然变**，
+    从而绕开浏览器缓存。
+
+    ⚠️ 为什么不用内容哈希：面板资源 ~200KB，每个请求都读一遍算 sha
+    是浪费。mtime_ns + size 对"文件被改过"这件事已经足够灵敏
+    （真改了内容，mtime 必变）。
+    """
+    import hashlib
+
+    h = hashlib.sha1()
+    for name in ("panel.css", "panel.js", "i18n.js"):
+        f = STATIC_DIR / name
+        try:
+            st = f.stat()
+            h.update(f"{name}:{st.st_mtime_ns}:{st.st_size}".encode())
+        except OSError:
+            h.update(f"{name}:missing".encode())
+    return h.hexdigest()[:8]
+
+
 #: 配置接口的请求体上限（字节）。
 #: 配置只有几百字节，1MB 已经宽松得离谱。
 #: 为什么必须有：没有上限时反复发大 body 就能把内存吃光，
@@ -49,11 +73,11 @@ PANEL_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>共享记忆 · 档案库</title>
-<link rel="stylesheet" href="panel.css" id="panel-css">
+<link rel="stylesheet" href="panel.css?v=__PANEL_VER__" id="panel-css">
 <!-- i18n 必须在 panel.js **之前**加载：panel.js 顶层的 t() 调用
      需要它已就绪（否则 ReferenceError，页面全白）。
      用同步 <script> 而不是 defer —— 保证顺序。 -->
-<script src="i18n.js"></script>
+<script src="i18n.js?v=__PANEL_VER__"></script>
 </head>
 <body>
 <header>
@@ -147,7 +171,7 @@ PANEL_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<script src="panel.js"></script>
+<script src="panel.js?v=__PANEL_VER__"></script>
 </body>
 </html>
 """
@@ -174,19 +198,42 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
     from .tenant import User
 
     async def dashboard(request: Any) -> Any:
-        return HTMLResponse(PANEL_HTML)
+        """面板骨架。
+
+        ⚠️ 三件都不能省（2026-10-15 用户实测踩出来的）：
+
+        ① **静态资源带 `?v=<指纹>`**：用户改了代码却"一点没动"——
+           根因就是浏览器还在跑几小时前缓存的 panel.js/css。
+           服务端文件早就换了，是浏览器没重新拉。
+
+        ② **HTML `no-cache`**：否则浏览器按启发式规则缓存 HTML，
+           连"指向新指纹的 URL"都拿不到，指纹就白加了。
+
+        ③ **指纹显示在页面上**（panel.js 自己读 `?v=`）：任何截图都能
+           自证"你看的是哪个版本"，不再靠猜。
+        """
+        return HTMLResponse(
+            PANEL_HTML.replace("__PANEL_VER__", _static_ver()),
+            headers={"Cache-Control": "no-cache"},
+        )
 
     async def static_css(request: Any) -> Any:
         p = STATIC_DIR / "panel.css"
         if not p.exists():
             return JSONResponse({"error": "panel.css missing"}, status_code=500)
-        return FileResponse(p, media_type="text/css")
+        # URL 里带 `?v=<指纹>`（见 _static_ver）→ 内容变了 URL 就变，
+        # 所以这里可以放心长缓存；旧 URL 缓存旧内容也是正确行为。
+        return FileResponse(p, media_type="text/css", headers={
+            "Cache-Control": "public, max-age=31536000, immutable"})
 
     async def static_js(request: Any) -> Any:
         p = STATIC_DIR / "panel.js"
         if not p.exists():
             return JSONResponse({"error": "panel.js missing"}, status_code=500)
-        return FileResponse(p, media_type="application/javascript")
+        # URL 里带 `?v=<指纹>`（见 _static_ver）→ 内容变了 URL 就变，
+        # 所以这里可以放心长缓存；旧 URL 缓存旧内容也是正确行为。
+        return FileResponse(p, media_type="application/javascript", headers={
+            "Cache-Control": "public, max-age=31536000, immutable"})
 
     async def static_i18n(request: Any) -> Any:
         """语言包。

@@ -172,7 +172,13 @@ def test_html_does_not_inline_data() -> None:
     for token in ("notes", "instructions", "password", "token"):
         # 只检查有没有像数据的东西（JSON 结构），不是检查单词本身
         pass
-    assert "<script src=\"panel.js\"" in PANEL_HTML
+    # ⚠️ 静态资源必须带 `?v=<指纹>`（2026-10-15 实测踩出来的）：
+    #    不带指纹时浏览器会按启发式规则缓存 panel.js/css，服务端改了代码
+    #    用户看到的还是旧界面（"改了但一点没动"）。指纹在 dashboard.py
+    #    渲染时替换成真实值，所以这里只断言"带 v= 参数的前缀"。
+    assert '<script src="panel.js?v=' in PANEL_HTML
+    assert 'href="panel.css?v=' in PANEL_HTML
+    assert '<script src="i18n.js?v=' in PANEL_HTML
     # 骨架里不该有 JSON 数据块
     assert "const DATA" not in PANEL_HTML
     assert "__INITIAL_STATE__" not in PANEL_HTML
@@ -327,7 +333,7 @@ def test_js_uses_only_existing_element_ids() -> None:
         "ac-cur", "ac-new", "ac-new2", "ac-change", "ac-logout", "ac-msg",
         "cp-link", "cp-md", "relwrap", "dot", "root", "q",
         # P1/P2/P4（2026-10-15）：会话过期横幅、库下拉、接入卡复制按钮
-        "sess-banner", "sess-relogin", "lib-select", "access-copy",
+        "sess-banner", "sess-relogin", "lib-select", "access-copy", "nt-copy",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic

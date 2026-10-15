@@ -425,6 +425,20 @@ function highlight(text, q){
 }
 
 /* ─────────────── 全局状态 ─────────────── */
+/** 面板构建指纹（由 `<script src="panel.js?v=xxx">` 带进来）。
+ *
+ *  为什么要显示它：用户实测反馈过"改了但一点没动"—— 根因是浏览器在跑
+ *  缓存的旧 panel.js。页面上一旦有指纹，"你看的是哪个版本"就不需要猜，
+ *  截个图就能判断。
+ */
+const PANEL_VER = (() => {
+  try {
+    const el = document.querySelector('script[src*="panel.js"]');
+    const m = el && el.getAttribute('src').match(/v=([0-9a-f]+)/);
+    return m ? m[1] : '';
+  } catch (e) { return ''; }
+})();
+
 const STATE = {
   tab: 'library',              // library | knowledge | settings
   groupBy: 'workspace',        // workspace（默认）| time
@@ -887,7 +901,8 @@ async function load(){
 
   const rootEl = document.getElementById('root');
   if (rootEl) rootEl.textContent = (STATE.me && STATE.me.user)
-    ? (STATE.me.user.name + ' @ ' + STATE.libs.length + ' ' + t('stat.libs'))
+    ? (STATE.me.user.name + ' @ ' + STATE.libs.length + ' ' + t('stat.libs')
+       + (PANEL_VER ? ' · build ' + PANEL_VER : ' · build ?'))
     : '';
 
   renderLibChips();
@@ -1253,6 +1268,33 @@ async function loadKnowledge(){
  *
  *  所以：回环地址 → 占位符；否则 → 用你当前访问用的那个地址。
  */
+/** 给定 token，生成可直接粘贴的 `.mcp.json`。
+ *
+ *  与 accessSnippet() 的区别：这里的 token 是**现成的**（刚签发、明文只出现
+ *  这一次），所以能给出完整可用的配置 —— 用户不用把 token 再手抄一遍。
+ *  （2026-10-15 用户实测原话："mcp 为什么要手动配置？？这不就是配置的JSON吗？
+ *  配完这个不就得了？？"—— 对，就该这样。）
+ *
+ *  地址规则同 accessSnippet：回环地址 → 占位符（127.0.0.1 发给别的机器没用）。
+ */
+function mcpSnippet(token){
+  const h = location.hostname;
+  const loopback = (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '');
+  const url = loopback
+    ? 'http://<这台服务器的局域网地址>:8200/mcp'
+    : location.origin + '/mcp';
+  return JSON.stringify({
+    mcpServers: {
+      'shared-memory': {
+        type: 'streamableHttp',
+        url,
+        headers: {Authorization: 'Bearer ' + token},
+        timeout: 240000,
+      },
+    },
+  }, null, 2);
+}
+
 function accessSnippet(){
   const h = location.hostname;
   const loopback = (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '');
@@ -1322,8 +1364,8 @@ async function loadSettings(){
       <div class="saverow" style="margin-top:12px;padding-top:0;border-top:none">
         <button class="btn" id="access-copy">复制配置</button>
         <span class="sectip" style="margin:0;font-size:12px">${LANG === 'zh'
-          ? '把 <占位> 换成下面「凭据」里给这台机器新建的 token（label 写清是哪台机器，换机/离职就吊销那一条）。'
-          : 'Replace the placeholder with a token created for that machine below.'}</span>
+          ? '最省事的路：在下面「凭据」里新建一条（label 写清哪台机器）—— <strong>签发成功后会直接给出含 token 的整段配置</strong>，一键复制、存成项目根的 <code>.mcp.json</code> 就完事。换机/离职就吊销那一条。'
+          : 'Easiest path: issue a token below — the full config snippet is shown right after issuing.'}</span>
       </div>
     </div>
 
@@ -1857,16 +1899,37 @@ async function loadAdminTokens(){
         esc(res.message || t('admin.createFail'))}</span>`;
       return;
     }
-    /* token 明文**只返回这一次**（后端刻意不再提供读取接口）。 */
-    msg.innerHTML = `
+    /* token 明文**只返回这一次**（后端刻意不再提供读取接口）。
+
+       ⚠️ 两处都不能省（2026-10-15 实测）：
+
+       ① **必须先刷新列表、再写提示**。原来反着来：先写提示、
+          再 loadAdminTokens() 重渲染整个容器 —— 提示框刚画出来就被冲掉，
+          **用户根本看不到刚发的 token**。
+
+       ② **必须同时给出可直接粘贴的 `.mcp.json`**。token 明文只有这一次，
+          这里不给配置，用户就得"抄 token → 找地方贴 → 手写 JSON"。 */
+    await loadAdminTokens();
+    const box2 = document.getElementById('nt-msg');
+    if (!box2) return;
+    box2.innerHTML = `
       <div class="okbox" style="margin-top:10px">
         <strong>${t('admin.tokenIssued', {u: esc(res.user), s: esc(res.scope)})}</strong><br>
         ${t('admin.tokenOnce')}
         <div style="margin-top:6px">
           <code style="font-size:12px;user-select:all;word-break:break-all">${esc(res.token)}</code>
         </div>
+        <pre style="margin:10px 0 0;font-size:12px;line-height:1.5;
+             white-space:pre-wrap;user-select:all">${esc(mcpSnippet(res.token))}</pre>
+        <div class="saverow" style="margin-top:8px;padding-top:0;border-top:none">
+          <button class="btn primary" id="nt-copy">复制整段配置</button>
+          <span style="font-size:12px;color:var(--muted)">${LANG === 'zh'
+            ? '存成项目根的 <code>.mcp.json</code>；含凭据，<strong>别提交进 git</strong>。'
+            : 'Save as <code>.mcp.json</code> in the project root; do not commit it.'}</span>
+        </div>
       </div>`;
-    loadAdminTokens();
+    const cp = document.getElementById('nt-copy');
+    if (cp) cp.onclick = () => copyText(mcpSnippet(res.token), cp);
   };
 }
 
