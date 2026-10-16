@@ -51,16 +51,51 @@ ALIASES = {
 
 
 def token() -> str:
-    """从 token 文件读第一把（格式：user:label:token）。"""
-    path = os.environ.get(
-        "SHARED_MEMORY_TOKEN_FILE", "/opt/shared-memory-mcp/.tokens"
-    )
+    """读一把**可写**凭据（行格式：``user[:label[:scope]]:token``）。
+
+    ⚠️ 不能"取第一行就算" —— S-6.4 之后 ``.tokens`` 里可能先出现**只读**
+    凭据（那正是方案 A 保留的能力）。取错钥匙会让 e2e 的写操作全被 403，
+    脚本以为"服务坏了"，其实是自己拿错了。
+
+    优先级：``SHARED_MEMORY_TOKEN_FILE`` 环境变量 → ``~/.shm-master-key``
+    （S-6.4 迁移后运维用的主密钥副本，600 权限）→ ``.tokens``（挑可写那把）。
+    """
+    env_path = os.environ.get("SHARED_MEMORY_TOKEN_FILE", "").strip()
+    if env_path:
+        p = Path(env_path)
+        if not p.exists():
+            raise SystemExit(f"SHARED_MEMORY_TOKEN_FILE 指向的文件不存在：{env_path}")
+        # 单值文件（只有一把钥匙，无 user:label:scope 前缀）
+        return p.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+
+    ops_key = Path.home() / ".shm-master-key"
+    if ops_key.exists():
+        val = ops_key.read_text(encoding="utf-8").strip()
+        if val:
+            return val
+
+    return _token_from("/opt/shared-memory-mcp/.tokens")
+
+
+def _token_from(path: str) -> str:
+    """从 ``.tokens`` 里挑一把**可写**的（格式 ``user[:label[:scope]]:token``）。"""
+    fallback = ""
     for line in open(path, encoding="utf-8"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split(":")
-        return parts[-1]          # 最后一段是 token
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            return parts[1]
+        scope = parts[2] if len(parts) >= 4 else "readwrite"
+        value = parts[2] if len(parts) == 3 else ":".join(parts[3:])
+        if scope == "readwrite":
+            return value
+        fallback = fallback or value
+    if fallback:
+        return fallback          # 只有只读凭据也得跑（调用方会看到 403 提示）
     raise SystemExit(f"token 文件里没有凭据：{path}")
 
 
