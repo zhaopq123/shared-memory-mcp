@@ -380,6 +380,19 @@ class Note:
             if v not in (None, "", []):
                 d[key] = v
 
+        # v2（S-2/S-10）：scope/share/versioned 也提升到顶层。
+        # scope 只在**非缺省**（long-term）时输出 —— 缺省是最常见情形，
+        # 每条都带一个 scope: long-term 是纯噪音；而 task:/archived
+        # 是**需要一眼看见**的（决定这条能不能被默认检索到）。
+        sc = self.scope
+        if sc and sc != SCOPE_LONG_TERM:
+            d["scope"] = sc
+        sh = self.share
+        if sh:
+            d["share"] = sh
+        if self.versioned:
+            d["versioned"] = True
+
         if self.path:
             d["path"] = self.path
         if with_body:

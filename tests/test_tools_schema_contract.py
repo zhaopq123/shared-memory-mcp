@@ -42,10 +42,14 @@ def _wire_tools() -> list[dict]:
     return asyncio.run(_list())
 
 
-def test_tool_count_is_seventeen() -> None:
-    """工具总数钉在 17 —— 新增/删除需同步 README 与 e2e。"""
+def test_tool_count_is_nineteen() -> None:
+    """工具总数钉在 19 —— 新增/删除需同步 README 与 e2e。
+
+    v2 S-2 新增 ``memory_session_start`` / ``memory_session_end``（会话生命周期）；
+    S-4 会把工具面重构到 9 个直觉动词（届时本数字随之更新）。
+    """
     tools = _wire_tools()
-    assert len(tools) == 17, (
+    assert len(tools) == 19, (
         f"工具数变了：{len(tools)} 个。新增/删除工具都要同步 README 与 e2e.py。"
     )
 

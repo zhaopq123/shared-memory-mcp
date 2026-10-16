@@ -37,7 +37,7 @@ from .knowledge import (
     parse_date,
 )
 from .queue import WriteQueue
-from .vault import Note, Vault, now_iso
+from .vault import SCOPE_LONG_TERM, Note, Vault, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +422,7 @@ class SharedMemoryService:
         sort: str = "relevance",
         claim: str = "",
         status: str = "",
+        scope: str = SCOPE_LONG_TERM,
     ) -> dict[str, Any]:
         """检索记忆。逻辑全在 vault.search（见那里的详细说明）。
 
@@ -443,6 +444,7 @@ class SharedMemoryService:
             sort=sort,
             claim=claim,
             status=status_eff,
+            scope=scope,
         )
         out["hint"] = "用 memory_get 按 title 或 id 读全文"
         return out

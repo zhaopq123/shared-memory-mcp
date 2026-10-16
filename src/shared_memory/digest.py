@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from .knowledge import expiry_state
+from .session import active_tasks, task_scope
 from .vault import now_iso
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,40 @@ def _all_note_ids(hub: Any, user_name: str) -> list[str]:
     return ids
 
 
+def session_context(hub: Any, user_name: str, home: Path) -> str:
+    """当前活跃会话的一句话上下文（无会话 → 空串）。
+
+    v2 S-2.5：让 agent 一握手就知道"你正在做 X，相关记忆 N 条"——
+    任务上下文不靠它自己想起来（Q7「会自动存取记忆吗」的读半边）。
+    N 只算该任务域（``scope=task:<task>``）的条数，轻量。
+    """
+    try:
+        tasks = active_tasks(home, user_name)
+        if not tasks:
+            return ""
+        parts: list[str] = []
+        for t in tasks:
+            n = 0
+            try:
+                r = hub.search(
+                    user_name, "", status="all",
+                    scope=task_scope(t), limit=1,
+                )
+                n = int(r.get("total", 0) or 0)
+            except Exception:  # noqa: BLE001
+                n = 0
+            parts.append(f"「{t}」（相关记忆 {n} 条）")
+        return (
+            "── 当前任务上下文 ──\n"
+            "· 你正在做：" + "、".join(parts) + "\n"
+            "· 过程态记忆只在你的默认检索范围里；**收工调 "
+            "memory_session_end** 把它们归类归档（可复用的升长期）。"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("任务上下文计算失败（已忽略）: %s", exc)
+        return ""
+
+
 def build_suffix(hub: Any, user_name: str, home: Path) -> tuple[str, dict[str, str]]:
     """算摘要并推进游标。返回 ``(instructions 追加段, 新游标表)``。
 
@@ -279,6 +314,9 @@ def build_suffix(hub: Any, user_name: str, home: Path) -> tuple[str, dict[str, s
             since = str(entry.get("since", ""))
             seen = list(entry.get("seen") or [])
             now = now_iso()
+            # v2：任务上下文段落 —— 即使没有变更（suffix 为空）也要带上，
+            # 让 agent 一握手就知道"我正在做什么"。
+            sess = session_context(hub, user_name, home)
             if not since:
                 # 首次连接：建基线 + 现存条目全数记进 seen。
                 # seeding 是必须的 —— 否则基线条目若与游标同秒，
@@ -288,14 +326,15 @@ def build_suffix(hub: Any, user_name: str, home: Path) -> tuple[str, dict[str, s
                     "seen": _all_note_ids(hub, user_name)[-_SEEN_CAP:],
                 }
                 update_cursor(home, user_name, new_entry)
-                return "", load_cursors(home)
+                return sess, load_cursors(home)
             d = compute(hub, user_name, since, set(seen))
             suffix = format_digest(d)
+            combined = "\n\n".join(x for x in (sess, suffix) if x)
             # 推进游标 + 记账：本次播报过的 id 进 seen（精确一次）
             merged = list(dict.fromkeys([*seen, *d.get("new_ids", [])]))
             update_cursor(home, user_name,
                           {"since": now, "seen": merged[-_SEEN_CAP:]})
-            return suffix, load_cursors(home)
+            return combined, load_cursors(home)
     except Exception as exc:  # noqa: BLE001
         logger.warning("变更摘要计算失败（已忽略）: %s", exc)
         return "", load_cursors(home)

@@ -58,7 +58,7 @@ async def main() -> int:
         tools = await c.list_tools()
         names = sorted(t.name for t in tools)
         print(f"   工具 {len(tools)} 个: {', '.join(names)}")
-        check("工具齐全（>= 17 个）", len(tools) >= 17,
+        check("工具齐全（>= 19 个）", len(tools) >= 19,
               f"实际 {len(tools)} 个 —— 少了说明注册漏了，多了记得同步这里与 README")
 
         r = await c.call_tool("memory_whoami")

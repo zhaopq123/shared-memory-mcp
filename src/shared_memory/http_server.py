@@ -289,6 +289,59 @@ def build_app(hub: TenantHub) -> Any:
         """
         return await t.memory_libs(require_user())
 
+    # ────────── 会话生命周期（v2 防串台）──────────
+
+    @mcp.tool(output_schema=None)
+    async def memory_session_start(
+        task: str, space: str = "", visibility: str = "private"
+    ) -> dict:
+        """**开工登记会话** + 领取上下文包（动手前调它）。
+
+        ━━━ 为什么必须先登记 ━━━
+
+        共享记忆跨会话可见，不登记就会**串台**：别的会话搜天搜地，
+        把你的任务过程态当成现行口径。登记之后，检索范围默认收窄到
+        「长期记忆 + 本会话任务域」，互不打扰。
+
+        参数：
+          · task        任务名（如"共享记忆v2开发"）。**同任务重复调用幂等**
+          · space       在哪个空间/库做（留空 = 跨库）
+          · visibility  ``private``（默认）/ ``space`` / ``shared``
+
+        返回三段：
+          1. ``constraints`` —— 约束清单（硬约束，常驻，**必须遵守**）
+          2. ``task_notes``  —— 这个任务此前留下的记忆（续做时接得上）
+          3. ``space_brief`` —— 空间长期摘要（workflow/constraint 优先）
+
+        过程态记忆用 ``memory_write(scope="task")`` 写；
+        收工务必 ``memory_session_end``，否则任务过程态不会归档。
+        """
+        return await t.memory_session_start(
+            require_user(), task, space, visibility
+        )
+
+    @mcp.tool(output_schema=None)
+    async def memory_session_end(
+        task: str = "", outcome: str = "", summary: str = ""
+    ) -> dict:
+        """**收工收尾会话** —— 把任务记忆归类（留 / 归档，都不删）。
+
+        归类规则（按 type，确定性）：
+          · ``workflow`` / ``constraint`` / ``habit`` / ``lesson``
+            → 升 **long-term**（可复用的东西最重要）
+          · 其余 → 标 **archived**（退出默认检索，``scope="archived"`` 仍可考古）
+
+        参数：
+          · task     任务名（留空 = 当前唯一活跃会话）
+          · outcome  结果标记（如 done / aborted）
+          · summary  收尾小结；非空会额外写一条 long-term 小结留在库里
+
+        ⚠️ **不调这个 = 任务过程态永远留在默认检索范围里**，
+        是"记忆越来越大、越来越乱"的主因之一。收工就该调。
+        """
+        require_write_scope("memory_session_end")
+        return await t.memory_session_end(require_user(), task, outcome, summary)
+
     # ────────── 工作空间（共享控制）──────────
 
     @mcp.tool(output_schema=None)
@@ -379,6 +432,7 @@ def build_app(hub: TenantHub) -> Any:
         sort: str = "relevance",
         claim: str = "",
         status: str = "",
+        scope: str = "",
     ) -> dict:
         """检索共享记忆（**开工前先调这个**）。
 
@@ -397,6 +451,9 @@ def build_app(hub: TenantHub) -> Any:
           · **status** ``active``（默认）只返回现行口径，排除已被取代/
                       已过期的；``all`` = 含旧代的考古模式。
                       问"现在该怎么做"就用默认，别让过期口径误导你
+          · **scope** 生效域（防串台）。**不传=长期记忆 + 当前会话任务域**；
+                      ``all`` 考古 / ``task:xx`` 指定任务域 / ``archived`` 已归档
+                      过程态。别人的任务过程态摸不到，除非显式指定 scope
 
         ``_lib_label`` 决定你该不该采信这条 —— 公司库的结论比
         某个人的个人笔记更权威。
@@ -405,7 +462,7 @@ def build_app(hub: TenantHub) -> Any:
         """
         return await t.memory_search(
             require_user(), query, tags, workspace, lib, limit, offset,
-            since, until, sort, claim, status,
+            since, until, sort, claim, status, scope,
         )
 
     @mcp.tool(output_schema=None)
@@ -444,6 +501,7 @@ def build_app(hub: TenantHub) -> Any:
         valid_until: str = "",
         review_after: str = "",
         superseded_by: str = "",
+        scope: str = "",
     ) -> dict:
         """写入一条共享记忆（**有结论 / 踩坑 / 口径就该写回**）。
 
@@ -479,6 +537,10 @@ def build_app(hub: TenantHub) -> Any:
         · **superseded_by**  本记忆被哪条取代了（填**新记忆的标题**）。
                               "取代而非删除"的抓手：旧条标上它即退出现行口径，
                               但原文仍在，后人知道"这条路走过、不通"
+        · **scope** 生效域（v2）。不传 = ``long-term``（长期，默认可见）；
+                    ``"task"`` = 绑到当前会话的任务域（**任务过程态用这个**，
+                    收工后自动归档，不污染别人的检索）；也接受
+                    ``"task:名字"`` / ``"archived"``
 
         upsert 更新已有记忆时，这三个时效字段**显式传才覆盖**，
         不传保留原值 —— 避免"只想改正文"却把有效期信息清掉。
@@ -502,7 +564,7 @@ def build_app(hub: TenantHub) -> Any:
         require_write_scope("memory_write")
         return await t.memory_write(
             require_user(), title, body, tags, workspace, lib, mode, author,
-            claim, valid_until, review_after, superseded_by,
+            claim, valid_until, review_after, superseded_by, scope,
         )
 
     @mcp.tool(output_schema=None)

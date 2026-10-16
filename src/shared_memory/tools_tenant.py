@@ -45,6 +45,8 @@ from typing import Any, Callable, TypeVar
 from .errors import ErrorCode, ToolError
 from .knowledge import list_views
 from .tenancy import TenantHub
+from . import session as _session
+from .vault import SCOPE_LONG_TERM
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +180,258 @@ class TenantTools:
         except Exception as exc:  # noqa: BLE001
             return self._err(exc, "列举库")
 
+    # ══════════════════════ 会话生命周期（v2 S-2）══════════════════════
+
+    def _space_lib_id(self, user_name: str, space: str) -> str:
+        """把 ``space`` 解析成**可读**的 lib id；解析不到返回空串（跨库）。
+
+        容错而非报错：会话的 space 是"在哪个空间做这件事"，写错/无权限
+        不该让整个 session_start 失败 —— 退化为跨库范围并如实告知。
+        """
+        s = (space or "").strip()
+        if not s:
+            return ""
+        try:
+            self.hub.tenant.vault_for(user_name, s)  # 无权限/不存在 → 抛
+            return s
+        except ToolError:
+            return ""
+
+    def _effective_scopes(self, user_name: str, scope: str) -> list[str]:
+        """把 memory_search 的 scope 参数解析成**实际要检索的 scope 列表**。
+
+        · 显式传了 → 就那一个（``all`` / ``long-term`` / ``task:xx`` / ``archived``）
+        · 没传（默认）→ ``long-term`` + **当前活跃会话绑定的任务域**。
+          这是防串台的核心：任务过程态只在"正在做这个任务的人"的默认
+          范围里，别人的会话摸不到。
+        """
+        s = (scope or "").strip()
+        if s:
+            return [s]
+        out: list[str] = [SCOPE_LONG_TERM]
+        for t in _session.active_tasks(self.hub.home, user_name):
+            out.append(_session.task_scope(t))
+        return out
+
+    def _resolve_write_scope(self, user_name: str, scope: str) -> str:
+        """把 memory_write 的 scope 参数解析成落盘的 scope 字符串。
+
+        · 空 → 返回空串（交给 vault 缺省 long-term）
+        · ``task`` / ``current`` → 当前活跃会话的任务域（无会话则报错）
+        · 其他（``task:名`` / ``long-term`` / ``archived``）→ 原样交给 vault 校验
+        """
+        s = (scope or "").strip()
+        if not s:
+            return ""
+        if s in ("task", "current"):
+            tasks = _session.active_tasks(self.hub.home, user_name)
+            if not tasks:
+                raise ToolError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "scope=task 需要先开一个会话",
+                    hint="先调 memory_session_start(task=...) 再写过程态记忆",
+                )
+            return _session.task_scope(tasks[0])
+        return s
+
+    async def memory_session_start(
+        self,
+        user_name: str,
+        task: str,
+        space: str = "",
+        visibility: str = "private",
+    ) -> dict[str, Any]:
+        """开工：登记会话 + 返回**结构化上下文包**（三段）。
+
+        ━━━ 为什么要有"会话"这个概念 ━━━
+
+        共享记忆跨会话可见，不登记就会**串台**：b 会话搜天搜地，
+        把 ax 任务的过程态捞出来当现行口径。登记之后，检索范围
+        默认收窄到「长期记忆 + 本会话任务域」，别人的过程态摸不到。
+
+        ━━━ 返回的三段 ━━━
+
+        1. ``constraints`` —— **约束清单**（type=constraint，常驻）。
+           硬约束不该靠"想起来去搜"，开工就摆在面前。
+        2. ``task_notes`` —— 这个任务**此前**留下的记忆（scope=task:<task>）。
+           同一任务分两段做时，上一段的过程态在这里接续。
+        3. ``space_brief`` —— 空间长期摘要（workflow/constraint 优先，
+           其余按更新时间），让你知道"这个空间里已经定过什么"。
+
+        幂等：同 ``(user, task)`` 重复调用不重复登记，只刷新时间。
+
+        调用时机：**动手之前**。收工对应 ``memory_session_end``。
+        """
+        try:
+            lib = self._space_lib_id(user_name, space)
+            entry = await self._io(
+                lambda: _session.start(
+                    self.hub.home, user_name, task,
+                    space=space, visibility=visibility,
+                )
+            )
+
+            def _collect() -> dict[str, Any]:
+                kw: dict[str, Any] = {"lib_id": lib} if lib else {}
+
+                # ① 该任务此前的过程态（含已归档 → status=all 才看得到全貌）
+                task_items = self.hub.search(
+                    user_name, "", status="all",
+                    scope=_session.task_scope(task), limit=50, **kw,
+                ).get("results", [])
+
+                # ② 空间长期记忆（workflow/constraint 优先）
+                long_items = self.hub.search(
+                    user_name, "", scope=SCOPE_LONG_TERM,
+                    limit=100, sort="updated", **kw,
+                ).get("results", [])
+                prio = {"constraint": 0, "workflow": 1, "lesson": 2, "habit": 3}
+                long_items.sort(
+                    key=lambda x: (prio.get(str(x.get("type", "")), 9), "")
+                )
+                constraints = [
+                    x for x in long_items if x.get("type") == "constraint"
+                ]
+                return {
+                    "constraints": constraints[:20],
+                    "task_notes": task_items,
+                    "space_brief": long_items[:8],
+                }
+
+            pkg = await self._io(_collect)
+            return {
+                "ok": True,
+                "action": "started",
+                "session": {
+                    "session_id": entry.get("session_id", ""),
+                    "task": entry.get("task", task),
+                    "space": entry.get("space", ""),
+                    "visibility": entry.get("visibility", visibility),
+                    "started": entry.get("started", ""),
+                },
+                # 三段上下文包
+                "constraints": pkg["constraints"],
+                "task_notes": pkg["task_notes"],
+                "space_brief": pkg["space_brief"],
+                "counts": {
+                    "constraints": len(pkg["constraints"]),
+                    "task_notes": len(pkg["task_notes"]),
+                    "space_brief": len(pkg["space_brief"]),
+                },
+                "hint": "约束清单要当硬约束遵守；写完过程态用 memory_write(scope=\"task\")；"
+                        "收工调 memory_session_end。",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return self._err(exc, "开工登记会话")
+
+    async def memory_session_end(
+        self,
+        user_name: str,
+        task: str = "",
+        outcome: str = "",
+        summary: str = "",
+    ) -> dict[str, Any]:
+        """收工：把任务记忆**归类收尾**（留 / 归档，都不删）。
+
+        ━━━ 归类规则（确定性，非猜测）━━━
+
+        遍历本任务域（``scope=task:<task>``）的记忆，按 **type** 分类：
+
+        · ``workflow`` / ``constraint`` / ``habit`` / ``lesson``
+          → 升 ``long-term``（**可复用的东西最重要** —— 这是它们的归宿）
+        · 其余（``fact`` / ``task`` / 未标注）→ 标 ``archived``
+          （**不删**：过程态退出默认检索，但考古时 ``scope="archived"`` 仍可查）
+
+        ``summary`` 非空时会额外写一条会话小结（type=fact，long-term），
+        让"这个任务最后得到了什么"留在库里，而不是随聊天记录蒸发。
+
+        没传 ``task`` 时自动取当前唯一活跃会话。
+        """
+        try:
+            t = (task or "").strip()
+            if not t:
+                tasks = _session.active_tasks(self.hub.home, user_name)
+                if len(tasks) == 1:
+                    t = tasks[0]
+                else:
+                    raise ToolError(
+                        ErrorCode.INVALID_ARGUMENT,
+                        "看不出要结束哪个会话",
+                        hint=f"活跃会话：{tasks or '无'}；请显式传 task",
+                    )
+            entry = _session.get(self.hub.home, user_name, t)
+            if entry is None:
+                raise ToolError(
+                    ErrorCode.NOT_FOUND,
+                    f"没有这个会话：{t}",
+                    hint="先 memory_session_start(task=...)",
+                )
+            lib = self._space_lib_id(user_name, str(entry.get("space", "")))
+            kw: dict[str, Any] = {"lib_id": lib} if lib else {}
+
+            items = await self._io(
+                lambda: self.hub.search(
+                    user_name, "", status="all",
+                    scope=_session.task_scope(t), limit=200, **kw,
+                ).get("results", [])
+            )
+
+            reusable = ("workflow", "constraint", "habit", "lesson")
+            promoted: list[str] = []
+            archived: list[str] = []
+            errors: list[dict[str, str]] = []
+            for item in items:
+                title = str(item.get("title", ""))
+                note_lib = str(item.get("_lib", "") or lib)
+                typ = str(item.get("type", "") or "fact")
+                new_scope = SCOPE_LONG_TERM if typ in reusable else "archived"
+                try:
+                    # 只改 scope，正文原样带过去（vault.put 更新分支按标题 upsert）
+                    got = self.hub.get(user_name, title, lib_id=note_lib)
+                    body = str((got.get("note") or {}).get("body", ""))
+                    await self.hub.write(
+                        user_name, title=title, body=body, lib_id=note_lib,
+                        extra={"scope": new_scope},
+                    )
+                    (promoted if new_scope == SCOPE_LONG_TERM else archived).append(title)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"title": title, "error": str(exc)[:160]})
+
+            written_summary = ""
+            if summary.strip():
+                written_summary = f"会话小结：{t}"
+                await self.hub.write(
+                    user_name,
+                    title=written_summary,
+                    body=(
+                        f"**任务**：{t}\n\n"
+                        f"**结果**：{outcome or '（未标注）'}\n\n"
+                        f"{summary.strip()}\n"
+                    ),
+                    lib_id=lib,
+                    extra={"type": "fact", "claim": "fact", "scope": SCOPE_LONG_TERM},
+                )
+
+            await self._io(
+                lambda: _session.end(
+                    self.hub.home, user_name, t, outcome=outcome, summary=summary
+                )
+            )
+            return {
+                "ok": True,
+                "action": "ended",
+                "task": t,
+                "promoted": promoted,
+                "archived": archived,
+                "summary_note": written_summary,
+                "errors": errors,
+                "counts": {"promoted": len(promoted), "archived": len(archived)},
+                "hint": "过程态已退出默认检索（archived 仍可用 scope=\"archived\" 考古）。",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return self._err(exc, "收工结束会话")
+
+
     # ══════════════════════ 读 ══════════════════════
 
     async def memory_search(
@@ -194,6 +448,7 @@ class TenantTools:
         sort: str = "relevance",
         claim: str = "",
         status: str = "",
+        scope: str = "",
     ) -> dict[str, Any]:
         """检索共享记忆（**开工前先调这个**）。
 
@@ -211,6 +466,12 @@ class TenantTools:
           · **status** ``active``（默认）只返回现行口径，排除已被取代/
                       已过期的；``all`` = 含旧代的考古模式。
                       问"现在该怎么做"就用默认，别让过期口径误导你。
+          · **scope** 生效域（v2 防串台）。**不传（默认）= 长期记忆 +
+                      当前会话绑定的任务域** —— 任务过程态只在"正在做这个
+                      任务的人"的默认范围里，别人的会话摸不到。
+                      ``all`` = 全都要（考古）；``task:xx`` 只要那个任务域；
+                      ``archived`` 只要已归档的过程态；``long-term`` 只要长期。
+                      想跨任务查别人的过程态，必须显式给 ``scope``。
 
         ⚠️ 返回的 ``_lib_label`` 告诉你结果来自哪个库（公司 / 某小组 /
         某人个人库）—— 这决定你该不该采信、该不该先确认。
@@ -218,13 +479,53 @@ class TenantTools:
         找不到时不要立刻放弃：换短关键词，或用 tags/lib 单独看。
         """
         try:
-            return await self._io(
-                lambda: self.hub.search(
+            scopes = self._effective_scopes(user_name, scope)
+
+            def _one(sc: str, lim: int, off: int) -> dict[str, Any]:
+                return self.hub.search(
                     user_name, query, lib_id=lib, tags=tags, workspace=workspace,
-                    limit=limit, offset=offset, since=since, until=until, sort=sort,
-                    claim=claim, status=status,
+                    limit=lim, offset=off, since=since, until=until, sort=sort,
+                    claim=claim, status=status, scope=sc,
                 )
+
+            if len(scopes) == 1:
+                return await self._io(lambda: _one(scopes[0], limit, offset))
+
+            # 多 scope（默认：长期记忆 + 本会话任务域）→ 各搜一遍再合并。
+            # 子查询 offset 一律 0，合并后统一 offset/limit 切片 ——
+            # 否则每个子查询都扣一次 offset，结果会整体前移（错位）。
+            parts = await self._io(lambda: [_one(sc, limit, 0) for sc in scopes])
+            merged: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
+            total = 0
+            per_lib: list[dict[str, Any]] = []
+            for r in parts:
+                for item in r.get("results", []):
+                    key = (str(item.get("_lib", "")), str(item.get("id", "")))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(item)
+                total += int(r.get("total", 0) or 0)
+                per_lib.extend(r.get("libraries", []) or [])
+            merged.sort(
+                key=lambda x: (x.get("updated") or x.get("created") or ""),
+                reverse=True,
             )
+            off = max(0, offset)
+            lim = max(1, min(limit, 100))
+            page = merged[: off + lim][off:]
+            return {
+                "ok": True,
+                "query": query,
+                "total": total,
+                "count": len(page),
+                "offset": off,
+                "scopes": scopes,
+                "libraries": per_lib,
+                "hint": "结果来自多个库/生效域，看 _lib_label 与 scope 判断来源。",
+                "results": page,
+            }
         except Exception as exc:  # noqa: BLE001
             return self._err(exc, "检索")
 
@@ -274,6 +575,7 @@ class TenantTools:
         valid_until: str = "",
         review_after: str = "",
         superseded_by: str = "",
+        scope: str = "",
     ) -> dict[str, Any]:
         """写入一条共享记忆（**有结论 / 踩坑 / 口径就该写回**）。
 
@@ -336,6 +638,12 @@ class TenantTools:
         if superseded_by:
             extra["superseded-by"] = superseded_by
         try:
+            # v2（S-2）scope：空=缺省 long-term；"task"/"current"=当前会话任务域；
+            # 也接受显式 "task:名"/"archived"。放在 try 内 —— 解析失败（如
+            # scope=task 但没开会话）要走错误信封，不能裸抛。
+            resolved_scope = self._resolve_write_scope(user_name, scope)
+            if resolved_scope:
+                extra["scope"] = resolved_scope
             return await self.hub.write(
                 user_name,
                 title=title, body=body, tags=tags, workspace=workspace,
