@@ -42,6 +42,37 @@ logger = logging.getLogger(__name__)
 #: 但**不是**隐藏目录 —— 用户要能一眼看到它在哪。
 CONFIG_DIR = "_config"
 
+#: v2 行为契约（S-3.1）—— 与 v4 原型 ``INSTRUCTIONS_V2`` 同源。
+#:
+#: ━━━ 为什么要单独抽成常量 ━━━
+#:
+#: 这段契约有**两个出口**，必须字字一致：
+#:   1. 每个空间的 ``_config/instructions.md``（面板可改、随 vault 走）
+#:   2. MCP ``initialize`` 的 instructions（**agent 真正读到的那份**）
+#: 抽成常量后一处改、两处生效。
+#:
+#: ━━━ 与原型原文的两处有意偏差（都是"别下不能执行的指令"）━━━
+#:
+#: · 原型第 2 条写 ``memory_remember`` —— 那是 v2 后续切片（S-4）改名后的
+#:   词，**当前不存在**。这里用现名 ``memory_write``（S-4 落地后再换）。
+#: · 原型第 7 条的 ``versioned`` 开关到 S-8 才提供；这里只保留"按需"的
+#:   原则，**不给一个当前点不动的开关名**（写个用不了的参数 = 编造能力）。
+INSTRUCTIONS_CONTRACT = """\
+## 行为契约（v2：不登记＝没上下文，不归档＝留烂摊子）
+
+1. **开工先调 `memory_session_start(task, space)`** —— 登记会话，拿到该任务的既有记忆与空间的长期记忆（工作流/约束/习惯优先）。
+2. **干活中产生结论/踩坑/口径，当场 `memory_write`**，不要等收工补。
+3. **记忆写六型之一**：`workflow` / `constraint` / `habit` / `fact` / `lesson` / `task`。约束类每次会话都会被提醒，写之前想清楚是不是约束。
+4. **任务过程态写进任务域**（`memory_write(scope="task")`）—— 它只对当前会话可见，不会污染别人的检索。
+5. **收工必须 `memory_session_end(outcome, summary)`** —— 值得留的转长期，过程态归档。不归档＝你的任务记忆永远占着别人的检索位。
+6. **诚实性不变**：`fact` / `inference` / `proposal` 分开写；把推断当事实写是这个库最大的污染源。
+7. **版本控制按需**：只有会反复修订的长文档才值得版本化，其余（绝大多数）不需要。
+"""
+
+#: 契约锚点行 —— 判断一份指令文件是否已含 v2 契约（S-3.3 迁移判定用）。
+CONTRACT_MARKER = "## 行为契约（v2"
+
+
 #: 默认的 instructions —— 服务端对**所有接入 agent** 说的话。
 #:
 #: ━━━ 为什么默认就要带「不幻觉」 ━━━
@@ -56,7 +87,7 @@ DEFAULT_INSTRUCTIONS = """\
 这是一个**跨 agent 共享的长期记忆库**：所有接入的 agent 读写同一份，
 没有隔离 —— 你写的就是所有人（以及后续的你）能读到的。
 
-因此下面两条比"方便"重要得多。
+""" + INSTRUCTIONS_CONTRACT + """
 
 ## 一、诚实性（核心，不可让步）
 
@@ -229,6 +260,18 @@ class Config:
         文件存在但**内容为空**时回落到默认值 —— 空内容多半是误操作，
         而"没有指令"会让 agent 失去所有行为约定（比有默认值更糟）。
         要停用请用面板的显式开关（写 ``_disabled``），而不是清空文件。
+
+        ━━━ v2 行为契约在**哪一层**（S-3）━━━
+
+        七条契约由 **MCP `initialize` 的 instructions 保证**（见 http_server），
+        每个 agent 一握手必拿到 —— 与这里有没有自定义文件无关。
+
+        这份 ``_config/instructions.md`` 是**空间级补充**：可以加"我们组的规矩"，
+        也可以整份改成别的（用户说了算，服务端**不偷偷注入** —— 否则用户在
+        面板里删掉契约、保存后又冒出来，是 bug 级的困惑）。
+
+        缺契约的**存量**文件用 ``migrate_instructions_contract()``
+        一次性头部追加（保留原文）。
         """
         raw = _read_text(self.instructions_path)
         if raw is None or not raw.strip():
@@ -236,6 +279,29 @@ class Config:
         if raw.strip() == "_disabled":
             return ""
         return raw
+
+    def migrate_instructions_contract(self) -> dict[str, Any]:
+        """把 v2 行为契约**物理**并进存量 instructions.md（头部追加，不覆盖）。
+
+        只处理"文件已存在且缺契约"这一种情形：
+
+        · 文件不存在 → 不动（没指令的空间本来就走默认值，已含契约）；
+          **不主动建文件** —— 建了会让 ``instructions_is_default`` 误报成
+          "用户改过"，那是假信号。
+        · 已含契约 → 不动。
+        · 缺契约 → 写 ``契约 + 分隔线 + 原文``，**原文逐字保留**。
+
+        Returns:
+            ``{"ok", "changed", "reason", "path"}``。
+        """
+        p = self.instructions_path
+        raw = _read_text(p)
+        if raw is None:
+            return {"ok": True, "changed": False, "reason": "missing", "path": str(p)}
+        if raw.strip() == "_disabled" or CONTRACT_MARKER in raw:
+            return {"ok": True, "changed": False, "reason": "up-to-date", "path": str(p)}
+        p.write_text(INSTRUCTIONS_CONTRACT + "\n\n---\n\n" + raw, encoding="utf-8")
+        return {"ok": True, "changed": True, "reason": "prepended", "path": str(p)}
 
     def rules(self) -> dict[str, Any]:
         """当前生效的写入约束规则。"""

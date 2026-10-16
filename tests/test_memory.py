@@ -1069,6 +1069,79 @@ def test_config_instructions_can_be_disabled(tmp_path: Path) -> None:
     assert Config(tmp_path).instructions() == ""
 
 
+# ── v2 行为契约（S-3）──
+
+
+def test_default_instructions_contains_v2_contract() -> None:
+    """新空间的默认指令必须含 v2 契约七条（开工/收工是硬动作）。"""
+    from shared_memory.config import CONTRACT_MARKER, DEFAULT_INSTRUCTIONS
+
+    assert CONTRACT_MARKER in DEFAULT_INSTRUCTIONS
+    assert "memory_session_start" in DEFAULT_INSTRUCTIONS
+    assert "memory_session_end" in DEFAULT_INSTRUCTIONS
+    # 六型与两类诚实性标注都点到
+    for tok in ("workflow", "constraint", "fact", "inference"):
+        assert tok in DEFAULT_INSTRUCTIONS
+
+
+def test_custom_instructions_are_not_silently_injected(tmp_path: Path) -> None:
+    """空间自定义指令**原样返回** —— 服务端不偷偷往里塞契约。
+
+    契约由 MCP initialize 层保证（见 test_http 系列）；这里偷偷注入的话，
+    用户在面板删掉契约、保存后又冒出来，是 bug 级困惑。
+    """
+    from shared_memory.config import Config, config_dir
+
+    d = config_dir(tmp_path)
+    d.mkdir(parents=True)
+    mine = "# 我们组的规矩\n\n先看 README。\n"
+    (d / "instructions.md").write_text(mine, encoding="utf-8")
+
+    assert Config(tmp_path).instructions() == mine
+
+
+def test_migrate_instructions_contract_prepends_physically(tmp_path: Path) -> None:
+    """物理迁移 = 头部追加；原文逐字保留；重复调用幂等。"""
+    from shared_memory.config import CONTRACT_MARKER, Config, config_dir
+
+    d = config_dir(tmp_path)
+    d.mkdir(parents=True)
+    p = d / "instructions.md"
+    mine = "用户的原文，一个字都不许动。\n"
+    p.write_text(mine, encoding="utf-8")
+
+    r = Config(tmp_path).migrate_instructions_contract()
+    assert r["changed"] is True and r["reason"] == "prepended"
+
+    text = p.read_text(encoding="utf-8")
+    assert CONTRACT_MARKER in text
+    assert mine.strip() in text, "原文必须逐字保留"
+    assert text.index(CONTRACT_MARKER) < text.index("用户的原文")
+
+    r2 = Config(tmp_path).migrate_instructions_contract()
+    assert r2["changed"] is False and r2["reason"] == "up-to-date"
+
+
+def test_migrate_does_not_create_missing_file(tmp_path: Path) -> None:
+    """没有指令文件的空间**不建文件** —— 建了会让 is_default 误报成"改过"。"""
+    from shared_memory.config import Config
+
+    r = Config(tmp_path).migrate_instructions_contract()
+    assert r["changed"] is False and r["reason"] == "missing"
+    assert not (tmp_path / "_config" / "instructions.md").exists()
+
+
+def test_migrate_respects_disabled(tmp_path: Path) -> None:
+    """显式 _disabled 的指令不该被迁移碰（那是"我就是要关掉"）。"""
+    from shared_memory.config import Config, config_dir
+
+    d = config_dir(tmp_path)
+    d.mkdir(parents=True)
+    (d / "instructions.md").write_text("_disabled", encoding="utf-8")
+    r = Config(tmp_path).migrate_instructions_contract()
+    assert r["changed"] is False and r["reason"] == "up-to-date"
+
+
 def test_validate_rules_catches_type_errors(tmp_path: Path) -> None:
     """漏洞 9：非法配置要被拦下并指明是哪一项。"""
     from shared_memory.config import Config

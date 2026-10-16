@@ -49,7 +49,7 @@ from typing import Any
 
 from .knowledge import expiry_state
 from .session import active_tasks, task_scope
-from .vault import now_iso
+from .vault import SCOPE_LONG_TERM, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,21 @@ def update_cursor(home: Path, user_name: str, entry: dict[str, Any]) -> None:
 # ══════════════════════ 摘要计算 ══════════════════════
 
 
+def _visible_scopes(hub: Any, user_name: str) -> set[str]:
+    """该用户**默认可见**的生效域集合（S-3.2）。
+
+    ``long-term`` + 他自己的活跃任务域。别人的任务域、归档区都不在内
+    —— 摘要是"你不在时发生了什么"，不该播报你看不到的东西。
+    """
+    scopes: set[str] = {SCOPE_LONG_TERM}
+    try:
+        for t in active_tasks(hub.home, user_name):
+            scopes.add(task_scope(t))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("活跃会话读取失败（摘要按 long-term 处理）: %s", exc)
+    return scopes
+
+
 def compute(
     hub: Any, user_name: str, since: str, seen: frozenset[str] | set[str] = frozenset()
 ) -> dict[str, Any]:
@@ -193,12 +208,19 @@ def compute(
     new_ids: list[str] = []              # 本次播报过的 id（回填 seen）
     total_changed = 0
 
+    # v2（S-3.2）：摘要只汇**这个人默认可见的生效域** ——
+    # long-term + 他自己的活跃任务域。别人的任务过程态（task:<别人>）
+    # 与已归档条目都不播报标题：它们是**私域**，进别人的摘要就是泄露。
+    scopes = _visible_scopes(hub, user_name)
+
     for lib in hub.tenant.readable(user_name):
         svc = hub.service_for(lib.id)
         notes = svc.vault.all_notes()
         lib_changed: list[tuple[str, str]] = []
         for n in notes:
             meta = n.meta or {}
+            if str(getattr(n, "scope", SCOPE_LONG_TERM) or SCOPE_LONG_TERM) not in scopes:
+                continue
             updated = str(meta.get("updated", ""))
             # >= 而非 >：秒级精度下同秒写入不能漏（见语义边界）；
             # 同秒边界带来的重复由 seen 记账消除。
@@ -255,10 +277,17 @@ def format_digest(d: dict[str, Any]) -> str:
 
 
 def _all_note_ids(hub: Any, user_name: str) -> list[str]:
-    """该用户可读范围内全部 note id（建基线时 seeding seen 用）。"""
+    """该用户可读范围内全部 note id（建基线时 seeding seen 用）。
+
+    v2：与 compute 同口径，只收默认可见的生效域 —— 否则 seen 会被
+    看不见的 id 灌满（无功能影响，但让"记账"语义变脏）。
+    """
     ids: list[str] = []
+    scopes = _visible_scopes(hub, user_name)
     for lib in hub.tenant.readable(user_name):
         for n in hub.service_for(lib.id).vault.all_notes():
+            if str(getattr(n, "scope", SCOPE_LONG_TERM) or SCOPE_LONG_TERM) not in scopes:
+                continue
             nid = str(getattr(n, "id", "") or "")
             if nid:
                 ids.append(nid)

@@ -241,6 +241,31 @@ upsert 按标题去重 / create 遇已存在报 CONFLICT / append 保留原文 /
 
 ---
 
+## 防串台：会话 + 生效域三层
+
+共享记忆跨会话、跨 agent 可见 —— 于是会**串台**：b 会话搜天搜地，
+把 ax 任务的过程态当成现行口径。v2 用「会话登记 + 生效域」隔开：
+
+| 生效域（scope） | 谁能默认搜到 |
+|---|---|
+| `long-term`（缺省） | 所有人 —— 这是"长期结论"的家 |
+| `task:<任务名>` | **只有绑定该任务的活跃会话** |
+| `archived` | 默认谁都搜不到，`scope="archived"` 可考古 |
+
+- **开工** `memory_session_start(task, space)` —— 登记会话 + 领三段上下文包
+  （约束清单 / 任务既有记忆 / 空间摘要）。同任务重复调用幂等。
+- **过程态**用 `memory_write(scope="task")` 写 —— 只对当前会话可见，
+  不污染别人的检索。
+- **收工** `memory_session_end(outcome, summary)` —— 可复用的
+  （`workflow` / `constraint` / `habit` / `lesson`）升 `long-term`，
+  其余标 `archived`（**不删**）。
+- `memory_search` 默认范围 = `long-term` + 当前活跃任务域；
+  启动变更摘要（④）也**只播报这个范围** —— 别人的任务域标题不会漏给你。
+- 每个空间有一份 `_config/instructions.md`（面板可改）；**agent 在
+  `initialize` 收到的行为契约与之同源**（七条，含开工/收工两条硬动作）。
+
+---
+
 ## 运维
 
 ```bash

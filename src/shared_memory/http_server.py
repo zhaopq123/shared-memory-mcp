@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .auth import COOKIE_NAME, Auth, Token
+from .config import INSTRUCTIONS_CONTRACT
 from .errors import ErrorCode, ToolError
 from .tenancy import TenantHub, default_home
 from .tools_tenant import TenantTools
@@ -249,7 +250,10 @@ def build_app(hub: TenantHub) -> Any:
             "3. **有结论就写回** —— memory_write（不传 lib 就写进你自己的个人库）；\n"
             "4. 记忆是纯 Markdown + git，误删有回收站。\n\n"
             "**诚实性要求**：记忆里没有的东西不许补；区分事实（fact）与\n"
-            "推断（inference）；把推断当事实写是这个库最大的污染源。"
+            "推断（inference）；把推断当事实写是这个库最大的污染源。\n\n"
+            # v2（S-3.1）：七条行为契约。**这里才是 agent 真正读到的那份** ——
+            # 空间里的 _config/instructions.md 是它可被改写的副本。
+            + INSTRUCTIONS_CONTRACT
         ),
     )
 

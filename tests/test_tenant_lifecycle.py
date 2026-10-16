@@ -382,3 +382,68 @@ def test_s2_session_state_survives_reload(hub: TenantHub) -> None:
     assert entry["cursor"] == {"step": 7}
     assert entry["status"] == "active"
     assert "持久任务" in S.active_tasks(hub.home, "admin")
+
+
+# ── digest 按 scope 过滤（S-3.2）──
+
+_SINCE = "2000-01-01T00:00:00+08:00"
+
+
+def _digest_titles(hub: TenantHub, user: str = "admin") -> set[str]:
+    d = D.compute(hub, user, _SINCE, set())
+    return {t for c in d["changed"] for t in c["titles"]}
+
+
+async def test_s3_digest_only_reports_visible_scopes(
+    hub: TenantHub, tools: TenantTools
+) -> None:
+    """别人的任务域与归档条目都不进摘要（标题泄露面为零）。"""
+    await tools.memory_session_start("admin", "ax", space="user-admin")
+    await hub.write("admin", title="长条目", body="x", lib_id="user-admin")
+    await hub.write("admin", title="ax 过程", body="x", lib_id="user-admin",
+                    extra={"scope": "task:ax"})
+    await hub.write("admin", title="别人的过程", body="x", lib_id="user-admin",
+                    extra={"scope": "task:bx"})
+    await hub.write("admin", title="归档条目", body="x", lib_id="user-admin",
+                    extra={"scope": "archived"})
+
+    got = _digest_titles(hub)
+    assert "长条目" in got, "long-term 要播报"
+    assert "ax 过程" in got, "自己的活跃任务域要播报（正在做的过程态）"
+    assert "别人的过程" not in got, "别人的任务域 → 不播报"
+    assert "归档条目" not in got, "归档 → 不播报"
+
+
+async def test_s3_digest_switches_with_task(
+    hub: TenantHub, tools: TenantTools
+) -> None:
+    """换任务 → 摘要范围跟着换（ax 的过程态不再播报）。"""
+    await hub.write("admin", title="ax 过程", body="x", lib_id="user-admin",
+                    extra={"scope": "task:ax"})
+    await tools.memory_session_start("admin", "bx", space="user-admin")
+    assert "ax 过程" not in _digest_titles(hub)
+
+    await hub.write("admin", title="bx 过程", body="x", lib_id="user-admin",
+                    extra={"scope": "task:bx"})
+    assert "bx 过程" in _digest_titles(hub)
+
+
+async def test_s3_digest_reports_new_constraint_without_search(
+    hub: TenantHub, tools: TenantTools
+) -> None:
+    """新增约束（标题含"必须"→ type=constraint）不检索也出现在摘要里。"""
+    await tools.memory_write(
+        "admin", title="上线必须走审批", body="硬约束。", lib="user-admin",
+    )
+    assert "上线必须走审批" in _digest_titles(hub)
+
+
+def test_s3_digest_seen_baseline_is_scoped(hub: TenantHub) -> None:
+    """建基线的 seen 也按 scope 过滤（记账不被看不见的 id 灌脏）。"""
+    v = hub.service_for("user-admin").vault
+    v.put(title="长期条", body="x")
+    v.put(title="归档条", body="x", extra={"scope": "archived"})
+
+    ids = set(D._all_note_ids(hub, "admin"))
+    titles = {n.title for n in v.all_notes() if n.id in ids}
+    assert "长期条" in titles and "归档条" not in titles
