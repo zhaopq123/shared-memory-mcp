@@ -24,7 +24,9 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # 可移植：优先用仓库自带的 src，其次退回生产部署路径。
@@ -189,6 +191,29 @@ async def main() -> int:
         gone = await call(c, "memory_recall", {"query": "自检词B"})
         check("删后不再召回",
               not any(i["title"] == PREFIX + "长期条" for i in gone.get("results", [])))
+
+        # ── 11. 接入零门槛（connect 脚本，S-5.5）──
+        print("11. 接入零门槛（connect）")
+        connect_py = Path(__file__).resolve().parent / "connect.py"
+        with tempfile.TemporaryDirectory() as td:
+            def _run_connect() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [sys.executable, str(connect_py),
+                     "sm://127.0.0.1:8200?k=E2E自检", "--project-dir", td],
+                    capture_output=True, text=True, encoding="utf-8", timeout=60,
+                )
+
+            r1 = _run_connect()
+            cfg_path = Path(td) / ".mcp.json"
+            check("干净目录跑一次即接入", r1.returncode == 0 and cfg_path.exists(),
+                  r1.stdout.strip().splitlines()[0] if r1.stdout else "")
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                entry = cfg["mcpServers"]["shared-memory"]
+                check("条目指向本服务且带凭据",
+                      entry["url"].endswith("/mcp") and "Bearer" in str(entry["headers"]))
+            r2 = _run_connect()
+            check("重复跑幂等（不重写）", "已配置过" in r2.stdout)
 
     print("\n" + "═" * 62)
     print("  结果: " + ("全部通过 ✓" if ok else "有失败 ✗"))

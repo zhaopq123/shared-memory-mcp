@@ -187,6 +187,100 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+#: 接入码默认端口（与 start-mcp.sh 的 PORT 默认值一致）。
+DEFAULT_PORT = 8200
+
+
+def parse_connect_uri(uri: str) -> dict[str, Any]:
+    """解析**接入码** → 连接参数（v2 · S-5.1）。
+
+    格式：``sm://<host>:<port>?k=<密钥>``
+
+      · ``sm://192.168.3.35:8200?k=abc123``  标准
+      · 端口可省（默认 8200）：``sm://192.168.3.35?k=abc123``
+      · 密钥键名兼容 ``k`` / ``key`` / ``token``
+
+    ━━━ 为什么是自定义 scheme 而不是一条 JSON ━━━
+
+    **人要能口述、能手抄**。JSON 里嵌套引号与花括号，抄错一个字符就是
+    "连不上但不知道为什么"。接入码短、可肉眼校验、可以贴微信发给自己。
+
+    Returns:
+        ``{"host", "port", "token", "base_url", "mcp_url"}``
+
+    Raises:
+        ToolError: 格式不合法 —— 消息必须指明**是哪一段**不对，
+            不能只丢一句"非法输入"（那等于让用户猜）。
+    """
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    raw = (uri or "").strip()
+    if not raw:
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            "接入码为空",
+            hint="形如 sm://192.168.3.35:8200?k=你的密钥（端口可省）",
+        )
+    if "://" not in raw:
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"接入码缺少协议头：{raw[:40]}",
+            hint="应以 sm:// 开头，例如 sm://192.168.3.35:8200?k=密钥",
+        )
+    scheme = raw.split("://", 1)[0].strip().lower()
+    if scheme != "sm":
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"协议头不对：{scheme}://",
+            hint="本服务的接入码一律用 sm:// 开头",
+        )
+
+    u = urlparse(raw)
+    if not u.hostname:
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            "接入码里没有主机地址",
+            hint="sm:// 后面要跟 IP 或域名，例如 sm://192.168.3.35:8200?k=密钥",
+        )
+    try:
+        port = u.port or DEFAULT_PORT
+    except ValueError as exc:
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            "端口不是合法数字",
+            hint=f"接在主机后面写端口，例如 sm://{u.hostname}:8200?k=密钥（{exc}）",
+        ) from exc
+    if not (0 < port < 65536):
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"端口超出范围：{port}",
+            hint="端口应在 1~65535 之间",
+        )
+
+    q = parse_qs(u.query or "")
+    token = ""
+    for key_name in ("k", "key", "token"):
+        vals = q.get(key_name) or []
+        if vals and str(vals[0]).strip():
+            token = unquote(str(vals[0])).strip()
+            break
+    if not token:
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            "接入码里没有密钥",
+            hint="在末尾加 ?k=你的密钥（?k= 后面的部分就是凭据）",
+        )
+
+    base = f"http://{u.hostname}:{port}"
+    return {
+        "host": u.hostname,
+        "port": port,
+        "token": token,
+        "base_url": base,
+        "mcp_url": base + "/mcp",
+    }
+
+
 def config_dir(root: Path) -> Path:
     """vault 里的配置目录。"""
     return root / CONFIG_DIR

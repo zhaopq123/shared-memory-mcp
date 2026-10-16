@@ -287,7 +287,7 @@ def build_app(hub: TenantHub) -> Any:
 
     @mcp.tool(output_schema=None)
     async def memory_session_start(
-        task: str, space: str = "", visibility: str = "private"
+        task: str, space: str = "", visibility: str = "private", project: str = ""
     ) -> dict:
         """**开工登记会话** + 领取上下文包（动手前调它）。
 
@@ -301,6 +301,7 @@ def build_app(hub: TenantHub) -> Any:
           · task        任务名（如"共享记忆v2开发"）。**同任务重复调用幂等**
           · space       在哪个空间/库做（留空 = 跨库）
           · visibility  ``private``（默认）/ ``space`` / ``shared``
+          · project     归属标识（项目路径/名字，只登记不写盘）
 
         返回三段：
           1. ``constraints`` —— 约束清单（硬约束，常驻，**必须遵守**）
@@ -311,7 +312,7 @@ def build_app(hub: TenantHub) -> Any:
         收工务必 ``memory_session_end``，否则任务过程态不会归档。
         """
         return await t.memory_session_start(
-            require_user(), task, space, visibility
+            require_user(), task, space, visibility, project
         )
 
     @mcp.tool(output_schema=None)

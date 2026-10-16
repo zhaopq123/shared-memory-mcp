@@ -240,6 +240,7 @@ class TenantTools:
         task: str,
         space: str = "",
         visibility: str = "private",
+        project: str = "",
     ) -> dict[str, Any]:
         """开工：登记会话 + 返回**结构化上下文包**（三段）。
 
@@ -260,6 +261,11 @@ class TenantTools:
 
         幂等：同 ``(user, task)`` 重复调用不重复登记，只刷新时间。
 
+        ``project`` 是**归属标识**（项目路径或名字）：只登记进会话条目，
+        让面板/摘要知道"这个任务属于哪个项目"。接入配置由客户端的
+        ``scripts/connect.py`` 写 ``.mcp.json`` —— 服务端**不碰客户机
+        文件系统**（跨机器时物理上够不着，同机时那也是越权动作）。
+
         调用时机：**动手之前**。收工对应 ``memory_session_end``。
         """
         try:
@@ -267,7 +273,7 @@ class TenantTools:
             entry = await self._io(
                 lambda: _session.start(
                     self.hub.home, user_name, task,
-                    space=space, visibility=visibility,
+                    space=space, visibility=visibility, project=project,
                 )
             )
 

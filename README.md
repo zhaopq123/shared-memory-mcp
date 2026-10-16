@@ -122,6 +122,32 @@ export SHARED_MEMORY_HOME=$PWD/home
 ./venv/bin/python -m shared_memory.http_server
 ```
 
+### 接入客户端：一条命令
+
+服务起来后，从面板「设置 → 接入」拿一条**接入码**（`sm://<地址>:<端口>?k=<密钥>`），
+在客户端机器上跑：
+
+```bash
+# 只接当前项目（写 <项目>/.mcp.json）—— 推荐，凭据随项目走
+npx shared-memory-connect "sm://192.168.3.35:8200?k=xxx" --project-dir .
+
+# 全局接入（写 ~/.workbuddy/mcp.json）
+npx shared-memory-connect "sm://192.168.3.35:8200?k=xxx"
+
+# 先看要写什么（不落盘）
+npx shared-memory-connect "sm://..." --project-dir . --dry-run
+```
+
+**幂等**：已配过 `shared-memory` 条目就跳过（要覆盖加 `--force`）；
+同文件里其它服务的配置**原样保留**；目标是坏 JSON 时**停下报错**而不是覆盖。
+
+接入码为什么长这样：**人要能口述、能手抄**。JSON 里嵌套引号，抄错一个字符
+就是"连不上但不知道为什么"；接入码短、可肉眼校验、能贴给自己。
+
+> 没有 Node 也能用：`python3 scripts/connect.py "<接入码>" --project-dir .`
+> （`npx` 那条只是一层壳，逻辑只有这一份实现）
+
+
 首次启动会创建管理员账号，**密码只打印一次**（同时自动发一把 token，也只在启动日志里出现一次）。之后用户与库由管理员在面板里管理（也可以直接改 `tenants.json`）。
 
 打开 `http://localhost:8200/` 走面板登录（或一次性票据）。

@@ -1142,6 +1142,45 @@ def test_migrate_respects_disabled(tmp_path: Path) -> None:
     assert r["changed"] is False and r["reason"] == "up-to-date"
 
 
+# ── 接入码解析（S-5.1）──
+
+
+def test_parse_connect_uri_standard() -> None:
+    from shared_memory.config import parse_connect_uri
+
+    d = parse_connect_uri("sm://192.168.3.35:8200?k=abc123")
+    assert d["host"] == "192.168.3.35" and d["port"] == 8200
+    assert d["token"] == "abc123"
+    assert d["mcp_url"] == "http://192.168.3.35:8200/mcp"
+
+
+def test_parse_connect_uri_port_optional_and_key_aliases() -> None:
+    """端口可省（默认 8200）；密钥键名兼容 k / key / token。"""
+    from shared_memory.config import DEFAULT_PORT, parse_connect_uri
+
+    assert parse_connect_uri("sm://10.0.0.5?k=x")["port"] == DEFAULT_PORT
+    assert parse_connect_uri("sm://10.0.0.5?key=y")["token"] == "y"
+    assert parse_connect_uri("sm://10.0.0.5?token=z")["token"] == "z"
+
+
+def test_parse_connect_uri_errors_are_specific() -> None:
+    """报错必须指明**哪一段**不对 —— 否则等于让用户猜。"""
+    from shared_memory.config import parse_connect_uri
+    from shared_memory.errors import ToolError
+
+    cases = {
+        "": "为空",
+        "http://h?k=x": "协议头",
+        "sm://?k=x": "主机",
+        "sm://h": "密钥",
+        "sm://h:notaport?k=x": "端口",
+    }
+    for bad, keyword in cases.items():
+        with pytest.raises(ToolError) as ei:
+            parse_connect_uri(bad)
+        assert keyword in ei.value.message, f"{bad!r} 的报错没点明「{keyword}」：{ei.value.message}"
+
+
 def test_validate_rules_catches_type_errors(tmp_path: Path) -> None:
     """漏洞 9：非法配置要被拦下并指明是哪一项。"""
     from shared_memory.config import Config

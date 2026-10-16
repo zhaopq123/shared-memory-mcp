@@ -152,6 +152,7 @@ def start(
     *,
     space: str = "",
     visibility: str = "private",
+    project: str = "",
 ) -> dict[str, Any]:
     """登记（或复用）一个会话。返回该会话条目。
 
@@ -177,6 +178,7 @@ def start(
                 "user": user,
                 "task": t,
                 "space": (space or "").strip(),
+                "project": (project or "").strip(),
                 "visibility": v,
                 "status": STATUS_ACTIVE,
                 "started": now,
@@ -191,6 +193,8 @@ def start(
                 entry.pop("ended", None)
                 entry.pop("outcome", None)
             entry["space"] = (space or "").strip() or entry.get("space", "")
+            if (project or "").strip():
+                entry["project"] = project.strip()
             entry["visibility"] = v
             entry["updated"] = now
             entry.setdefault("cursor", {})
