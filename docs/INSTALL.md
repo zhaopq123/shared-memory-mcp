@@ -63,7 +63,7 @@ Windows 用 `venv\Scripts\pip install -e .`。
 ./venv/bin/python -c "import shared_memory, fastmcp; print('OK')"
 ```
 
-装好后建议跑一遍**全量自检**（19 个工具 + 全部用户旅程：工作空间生命周期 / 回收站 / 导出导入 / 只读凭据 / 越权防护）：
+装好后建议跑一遍**全量自检**（v2 工具面 16 个 = 9 新 + 7 别名；旅程：会话生命周期 / 记住-召回-取全文 / 备份导出导入 / 软删除 / 越权防护）：
 
 ```bash
 ./venv/bin/python scripts/e2e.py

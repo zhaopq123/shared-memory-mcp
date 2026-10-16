@@ -42,16 +42,59 @@ def _wire_tools() -> list[dict]:
     return asyncio.run(_list())
 
 
-def test_tool_count_is_nineteen() -> None:
-    """工具总数钉在 19 —— 新增/删除需同步 README 与 e2e。
+def test_tool_surface_is_nine_plus_seven_aliases() -> None:
+    """v2 工具面：**9 个直觉动词 + 7 个旧名别名**（过渡期）。
 
-    v2 S-2 新增 ``memory_session_start`` / ``memory_session_end``（会话生命周期）；
-    S-4 会把工具面重构到 9 个直觉动词（届时本数字随之更新）。
+    ━━━ 为什么要钉住这个数字 ━━━
+
+    实测结论：工具数量每增加一个，agent 选对的概率都会下降。
+    v1 的 17 个按"一个函数一个工具"长出来；v2 按"一个动作一个工具"
+    收敛到 9 个，旧名留一版别名让存量 agent 平滑过渡。
+
+    ⚠️ 别名是**过渡期**的：下一版删除后这里应改成 9。
     """
     tools = _wire_tools()
-    assert len(tools) == 19, (
-        f"工具数变了：{len(tools)} 个。新增/删除工具都要同步 README 与 e2e.py。"
+    names = {t["name"] for t in tools}
+    canon = {
+        "memory_session_start", "memory_session_end",
+        "memory_recall", "memory_remember", "memory_get", "memory_forget",
+        "memory_spaces", "memory_history", "memory_backup",
+    }
+    aliases = {
+        "memory_search", "memory_write", "memory_delete",
+        "memory_libs", "memory_workspaces", "memory_export", "memory_import",
+    }
+    assert len(tools) == 16, (
+        f"工具面变了：{len(tools)} 个。v2 = 9 新 + 7 别名；新增/删除要同步 README 与 e2e。"
     )
+    assert canon <= names, f"缺新名：{sorted(canon - names)}"
+    assert aliases <= names, f"缺别名：{sorted(aliases - names)}"
+
+
+def test_aliases_are_marked_deprecated() -> None:
+    """别名描述必须带【已废弃】并指向新名 —— 否则 agent 会选错那只。"""
+    tools = {t["name"]: t for t in _wire_tools()}
+    for name in ("memory_search", "memory_write", "memory_delete",
+                 "memory_libs", "memory_workspaces",
+                 "memory_export", "memory_import"):
+        desc = tools[name].get("description", "")
+        assert "已废弃" in desc, f"{name} 的描述没标已废弃：{desc[:60]!r}"
+
+
+def test_removed_tools_are_gone() -> None:
+    """被合并掉的旧工具**不再注册**（能力都在新工具里）。
+
+    whoami→spaces / list→recall / stats→history / commit→history /
+    view·backlinks·restore·workspace_create·workspace_share → 面板或新工具。
+    """
+    names = {t["name"] for t in _wire_tools()}
+    gone = {
+        "memory_whoami", "memory_list", "memory_stats", "memory_commit",
+        "memory_view", "memory_backlinks", "memory_restore",
+        "memory_workspace_create", "memory_workspace_share",
+    }
+    still = sorted(gone & names)
+    assert not still, f"这些旧工具还在注册：{still}"
 
 
 def test_no_tool_has_output_schema() -> None:

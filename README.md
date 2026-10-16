@@ -148,29 +148,46 @@ MCP 端点：`http://<host>:8200/mcp`（streamable-http）
 
 ---
 
-## 工具（19 个）
+## 工具（9 个直觉动词 + 7 个旧名别名）
+
+v2 按**一个动作一个工具**收敛 —— 实测结论：工具越多，agent 选对的概率越低。
 
 | 工具 | 用途 |
 |---|---|
-| `memory_whoami` | 我是谁、能看哪些库（**开工先调它**）|
-| `memory_libs` | 库清单与规模/队列状况 |
-| `memory_session_start` | **开工登记会话** + 领取上下文包（约束清单/任务既有记忆/空间摘要）。防串台的核心 |
-| `memory_session_end` | **收工收尾会话**：任务记忆归类（可复用升 long-term，过程态归档不删）|
-| `memory_search` | 检索（**开工前先调这个**）。`claim`/`status`/`scope` 口径过滤、分页、时间过滤、排序 |
+| `memory_session_start` | **开工登记会话** + 领上下文包（约束清单/任务既有记忆/空间摘要）|
+| `memory_session_end` | **收工收尾**：可复用升 long-term，过程态归档（不删）|
+| `memory_recall` | 检索（**动手前先调这个**）。`claim`/`status`/`scope` 过滤、分页、时间、排序 |
+| `memory_remember` | 写入（`upsert`/`create`/`append`）；`claim` 三值、`scope` 生效域、时效三字段 |
 | `memory_get` | 按标题或 id 读全文 |
-| `memory_list` | 列举，可按标签/工作区过滤 |
-| `memory_write` | 写入（`upsert`/`create`/`append`）；`claim` 三值、`scope` 生效域、`valid_until`/`review_after`/`superseded_by` 时效 |
-| `memory_delete` | 软删除（进回收站），需 `confirm=true` |
-| `memory_restore` | 从回收站恢复（不会覆盖同名记忆）|
-| `memory_view` | 视图（决策/踩坑/待办/时效告警/推断清单），跨库逐库算再合并 |
-| `memory_backlinks` | 引用关系（谁引用了它、它引用了谁）|
-| `memory_stats` | 库况 / 队列 / git 记录；`with_commits` 按需取 git 历史 |
-| `memory_commit` | 立刻提交（不用等防抖）|
-| `memory_export` | 以**工作空间**为单位导出 bundle（字节级 + manifest sha256）|
-| `memory_import` | 导入 bundle（冲突三策略：skip/update/rename）|
-| `memory_workspaces` | 工作空间列表 + **共享范围** + 可管理标记 |
-| `memory_workspace_create` | 为工作空间建独立库（默认**仅自己**）|
-| `memory_workspace_share` | 改共享范围（仅自己 → 小组 → 公司；可随时收回）|
+| `memory_forget` | 软删除（进回收站），需 `confirm=true` |
+| `memory_spaces` | 我是谁 + 库清单与队列状况 + 工作空间共享范围（**三合一**）|
+| `memory_history` | 提交历史；`commit=true` 立刻提交（不用等防抖）|
+| `memory_backup` | `action=export` 导出 / `action=import` 导入（**二合一**）|
+
+### 旧名别名（过渡期，下一版删除）
+
+行为与新工具**完全等价**（直接调同一个函数），描述里标了【已废弃】：
+
+| 旧名 | → 新名 |
+|---|---|
+| `memory_search` | `memory_recall` |
+| `memory_write` | `memory_remember` |
+| `memory_delete` | `memory_forget` |
+| `memory_libs` / `memory_workspaces` | `memory_spaces` |
+| `memory_export` / `memory_import` | `memory_backup` |
+
+### 已从工具面移除（能力都在别处）
+
+| 旧工具 | 去处 |
+|---|---|
+| `memory_whoami` | `memory_spaces` |
+| `memory_list` | `memory_recall`（配 tags / limit）|
+| `memory_stats` | `memory_history` |
+| `memory_commit` | `memory_history(commit=true)` |
+| `memory_view` | 面板（视图页）|
+| `memory_backlinks` | 面板（条目详情）|
+| `memory_restore` | 面板（回收站页）|
+| `memory_workspace_create` / `memory_workspace_share` | 面板（工作空间页）—— **权限变更不该由 agent 自主发起** |
 
 ### 参数速查（最容易写错的几个）
 
@@ -180,31 +197,24 @@ MCP 端点：`http://<host>:8200/mcp`（streamable-http）
 |---|---|
 | `memory_session_start` | `task`（任务名，重复调用幂等）/ `space`（哪个库/空间）/ `visibility`(private·space·shared) |
 | `memory_session_end` | `task`（留空=当前唯一活跃会话）/ `outcome`(done·aborted) / `summary`（非空会额外写一条 long-term 小结）|
-| `memory_write` | `title` / **`body`**（不是 content）/ `tags` / `workspace`（项目标签）/ `lib`（写到哪个库）/ `mode`(upsert·create·append) / `claim`(fact·inference·proposal) / `scope`（空=长期；**`task`=绑当前会话过程态**）|
+| `memory_remember` | `title` / **`body`**（不是 content）/ `tags` / `workspace`（项目标签）/ `lib`（写到哪个库）/ `mode`(upsert·create·append) / `claim`(fact·inference·proposal) / `scope`（空=长期；**`task`=绑当前会话过程态**）|
 | `memory_get` | **`ident`**（不是 title —— 标题或 id 都行）/ `lib` |
-| `memory_search` | `query` / `tags` / `workspace` / `lib` / `limit` / `offset` / `since` / `until` / `sort` / `claim` / `status` / **`scope`**（空=长期+当前任务；`all` 考古）|
-| `memory_list` | `limit` / **`tag`**（单数，不是 tags）/ `workspace` / `lib` |
-| `memory_delete` | `ident` / **`confirm=true`**（不传只返回预览）/ `lib` |
-| `memory_restore` | `filename` / `lib`（两个都必填） |
-| `memory_view` | `kind`(overview·lessons·decisions·todos·expiring·inferences) / `lib` / `tag` |
-| `memory_backlinks` | `title` / `lib` |
-| `memory_export` | `workspace`（**条目项目标签，不是库名**）/ `lib`（按库导）/ `out_dir` |
-| `memory_import` | `bundle` / `target_lib` / `workspace`（过滤器）/ `on_conflict`(skip·update·rename) |
-| `memory_workspace_create` | `workspace` / `share`(留空=仅自己) / `label` |
-| `memory_workspace_share` | `lib` / `share` |
+| `memory_recall` | `query` / `tags` / `workspace` / `lib` / `limit` / `offset` / `since` / `until` / `sort` / `claim` / `status` / **`scope`**（空=长期+当前任务；`all` 考古）|
+| `memory_forget` | `ident` / **`confirm=true`**（不传只返回预览）/ `lib` |
+| `memory_spaces` | 无参数（只返回你有权限的）|
+| `memory_history` | `lib` / `message` / `commit`(true=立刻提交) |
+| `memory_backup` | `action`(export·import) / `workspace`（**条目项目标签，不是库名**）/ `lib` / `out_dir` / `bundle` / `target_lib` / `on_conflict`(skip·update·rename) |
 
-> ⚠️ **两个 "workspace" 不是一回事**：`memory_write(workspace=...)` 是写在
-> 记忆条目上的**项目标签**；`memory_workspace_create(workspace=...)` 建的是一个
-> **独立的库**（`ws-<名>`）。导出按前者过滤，跨库导出用 `lib=`。
+> ⚠️ **两个 "workspace" 不是一回事**：`memory_remember(workspace=...)` 是写在
+> 记忆条目上的**项目标签**；面板里的「工作空间」是一个**独立的库**（`ws-<名>`）。
+> 导出按前者过滤，跨库导出用 `lib=`。
 
-### 为什么控制在 19 个
+### 为什么控制在 9 个
 
 有实测结论指出：**工具数量每增加一个，agent 选对工具的概率都会下降。**
-所以按「一个动词一个工具」划分；新能力优先**加可选参数**，不做
-`memory_write_team` 这种组合爆炸。多租户时代新增 2 个
-（whoami / libs），优化时代新增 2 个（export / import），
-v2 会话生命周期新增 2 个（session_start / session_end）。
-（后续 v2 会把工具面重构到 **9 个直觉动词**——见设计文档。）
+所以按「一个动作一个工具」划分；新能力优先**加可选参数**（如
+`memory_backup(action=…)`、`memory_history(commit=…)`），不做
+`memory_write_team` 这种组合爆炸 —— 团队写入由 `lib` 参数承载。
 
 ### 搜索为什么不用向量
 
@@ -254,12 +264,12 @@ upsert 按标题去重 / create 遇已存在报 CONFLICT / append 保留原文 /
 
 - **开工** `memory_session_start(task, space)` —— 登记会话 + 领三段上下文包
   （约束清单 / 任务既有记忆 / 空间摘要）。同任务重复调用幂等。
-- **过程态**用 `memory_write(scope="task")` 写 —— 只对当前会话可见，
+- **过程态**用 `memory_remember(scope="task")` 写 —— 只对当前会话可见，
   不污染别人的检索。
 - **收工** `memory_session_end(outcome, summary)` —— 可复用的
   （`workflow` / `constraint` / `habit` / `lesson`）升 `long-term`，
   其余标 `archived`（**不删**）。
-- `memory_search` 默认范围 = `long-term` + 当前活跃任务域；
+- `memory_recall` 默认范围 = `long-term` + 当前活跃任务域；
   启动变更摘要（④）也**只播报这个范围** —— 别人的任务域标题不会漏给你。
 - 每个空间有一份 `_config/instructions.md`（面板可改）；**agent 在
   `initialize` 收到的行为契约与之同源**（七条，含开工/收工两条硬动作）。

@@ -85,12 +85,20 @@ def require_user() -> str:
 # 命中名单才检查 scope。新增写工具时忘了登记 → 漏拦（见下方"漏了怎么办"）。
 
 #: 会改变数据的工具。**新增写工具必须登记到这里**，否则只读凭据能写它。
+#:
+#: v2（S-4）三条注意：
+#:   ① 只登记**真正会调 ``require_write_scope`` 的那个名字**。
+#:   ② 旧名别名（memory_write/memory_delete/memory_import）**不用登记** ——
+#:      它们直接调新函数，检查在那边做，登记了是重复。
+#:   ③ ``memory_history`` / ``memory_backup`` 是**混合工具**：只有
+#:      ``commit=True`` / ``action=import`` 分支才校验 —— 只读凭据
+#:      照样能看历史、能导出（那是纯读）。
 WRITE_TOOLS = frozenset({
-    "memory_write",
-    "memory_delete",
-    "memory_restore",
-    "memory_import",
-    "memory_commit",
+    "memory_session_end",
+    "memory_remember",
+    "memory_forget",
+    "memory_history",     # 仅 commit=True 分支会查
+    "memory_backup",      # 仅 action=import 分支会查
 })
 
 

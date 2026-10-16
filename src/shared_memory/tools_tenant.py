@@ -666,7 +666,7 @@ class TenantTools:
             return ToolError(
                 ErrorCode.INVALID_ARGUMENT,
                 f"确认要删除「{ident}」吗？确认后请带 confirm=True 再调一次",
-                hint="这是软删除：会移入 .trash 保留，可用 memory_restore 恢复",
+                hint="这是软删除：会移入 .trash 保留，可在面板的回收站页恢复",
             ).to_dict()
         try:
             return await self.hub.delete(user_name, ident, lib_id=lib)
