@@ -577,7 +577,9 @@ const PANEL_VER = (() => {
 
 const STATE = {
   tab: 'library',              // library | admin | settings
-  groupBy: 'workspace',        // workspace（默认）| time
+  groupBy: 'workspace',        // workspace（默认）| time | type
+  //: 生效域（v2 · S-7.2）：long-term（默认，与 agent 的闸一致）| task | all
+  scope: 'long-term',
   notes: [], tags: [], workspaces: [], commits: [],
   activeTag: '', activeWs: '', q: '', cur: null,
   view: 'overview', viewData: null,
@@ -1014,10 +1016,98 @@ function toggleTag(t){
   load();
 }
 
+/** 自动上下文条 + 生效域三 chip + 会话卡（v2 · S-7.2）。
+ *
+ *  ━━━ 为什么这些要摆在记忆页最上面 ━━━
+ *
+ *  它们回答的是同一个问题："**现在这一屏，是谁的角度、看的是什么范围**"。
+ *   · 上下文条：agent 开工会被自动喂什么（约束 N 条 + 在做什么任务）
+ *   · scope 三 chip：我现在看的是长期口径、任务过程态、还是全部（考古）
+ *   · 会话卡：这个任务的可见性是谁能看见
+ *
+ *  这三件事此前全是"隐形的自动行为"。越是自动的东西越要能看见 ——
+ *  否则它喂错东西的时候，用户连该从哪儿查都不知道。
+ */
+async function loadContextBar(){
+  const bar = document.getElementById('ctxbar');
+  const chips = document.getElementById('scopechips');
+  const card = document.getElementById('sesscard');
+  if (!bar) return;
+  const zh = LANG === 'zh';
+  const r = await api('/api/context');
+  if (!r || !r.ok){
+    bar.innerHTML = '';
+    if (chips) chips.innerHTML = '';
+    if (card) card.innerHTML = '';
+    return;
+  }
+  const sess = r.session;
+  const cs = r.constraints || [];
+
+  bar.innerHTML = `
+    <div class="ctxbar">
+      <span class="ctxdot${sess ? ' on' : ''}"></span>
+      <span>${zh ? '自动上下文' : 'Auto context'}：
+        ${sess
+          ? (zh ? '正在做「' + esc(sess.task) + '」' : 'on ' + esc(sess.task))
+          : (zh ? '无活跃会话' : 'no active session')}
+        · ${zh ? '约束' : 'constraints'} ${cs.length}
+      </span>
+    </div>`;
+
+  /* 生效域三档：默认 long-term —— 与 agent 的默认闸一致。
+     切到"全部"是**考古模式**（会看到别的会话的任务过程态与已归档旧账），
+     所以标签里直说"考古"，别让人以为那是常态。 */
+  if (chips){
+    const cur = STATE.scope || 'long-term';
+    const items = [
+      ['long-term', zh ? '长期' : 'Long-term'],
+      ['task', zh ? '任务域' : 'Task'],
+      ['all', zh ? '全部 · 考古' : 'All · archive'],
+    ];
+    chips.innerHTML = items.map(([v, label]) =>
+      `<button class="chip${cur === v ? ' on' : ''}" data-scope="${v}">${
+        esc(label)}</button>`).join('');
+    chips.querySelectorAll('[data-scope]').forEach(el => el.onclick = () => {
+      STATE.scope = el.dataset.scope;
+      load();
+    });
+  }
+
+  if (!card) return;
+  if (!sess){
+    card.innerHTML = '';
+    return;
+  }
+  const vs = [
+    ['private', zh ? '仅自己' : 'Private'],
+    ['space', zh ? '本空间' : 'Space'],
+    ['shared', zh ? '已共享' : 'Shared'],
+  ];
+  card.innerHTML = `
+    <div class="sesscard">
+      <div class="sesshead">${zh ? '当前会话' : 'Session'} · ${esc(sess.task)}</div>
+      <div class="sessrow">
+        ${vs.map(([v, l]) =>
+          `<button class="chip${(sess.visibility || 'private') === v ? ' on' : ''}" data-vis="${v}">${
+            esc(l)}</button>`).join('')}
+      </div>
+      <div class="sesshint">${zh
+        ? '会话可见性只管「这个任务的存在别人能不能看见」，与库权限无关。'
+        : 'Session visibility is about the task, not library permissions.'}</div>
+    </div>`;
+  card.querySelectorAll('[data-vis]').forEach(el => el.onclick = async () => {
+    const v = el.dataset.vis;
+    const r2 = await apiPost('/api/session/visibility',
+      {task: sess.task, visibility: v});
+    if (r2.ok) loadContextBar();
+  });
+}
+
 async function load(){
   const r = await api('/api/state',
     {q: STATE.q, tag: STATE.activeTag, workspace: STATE.activeWs,
-     lib: STATE.activeLib});
+     lib: STATE.activeLib, scope: STATE.scope || 'long-term'});
   const dot = document.getElementById('dot');
   if (!r.ok){ dot.classList.add('bad'); return; }
   dot.classList.remove('bad');
@@ -1054,6 +1144,8 @@ async function load(){
   /* 视图 chip（v2 · S-7.2）：跟着记忆页一起出现，不用先切 tab。
      失败不阻断 —— 视图条拉不到不该让整个列表打不开。 */
   try { await loadViewBar(STATE.view || 'overview'); } catch (e) {}
+  /* 上下文条 / scope chip / 会话卡：同样是"拉不到不影响看记忆"的辅助块 */
+  try { await loadContextBar(); } catch (e) {}
 
   /* 判故障要看是否**用过**：写者循环惰性创建，新服务里 worker_alive
      本来就是 false —— 那不是故障。判定逻辑必须与服务端 /health 一致，

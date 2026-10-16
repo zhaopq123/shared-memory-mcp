@@ -124,6 +124,8 @@ PANEL_HTML = """<!DOCTYPE html>
   <div class="wrap">
     <div class="rail">
       <div class="tools">
+        <!-- 自动上下文条（v2 · S-7.2）：把"agent 会被喂什么"摊开给用户看 -->
+        <div id="ctxbar"></div>
         <div class="searchwrap">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/>
@@ -131,6 +133,9 @@ PANEL_HTML = """<!DOCTYPE html>
           <input id="q" placeholder="搜索（跨你可读的全部库）…" autocomplete="off" spellcheck="false">
         </div>
         <div id="libchips"></div>
+        <!-- 生效域三档 chip + 会话卡（v2 · S-7.2） -->
+        <div id="scopechips"></div>
+        <div id="sesscard"></div>
         <div id="groupby"></div>
         <div id="chips"></div>
         <!-- 视图 chip（原「体系」页搬来，v2 · S-7.2）：记忆页与体系本来就是
@@ -203,6 +208,35 @@ PANEL_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+
+#: 生效域三档（面板 chip）。与 vault 的 scope 语义一致。
+PANEL_SCOPE_CHIPS = ("long-term", "task", "all")
+
+
+def _filter_by_scope(notes: list[dict], scope: str) -> list[dict]:
+    """按生效域过滤面板列表（v2 · S-7.2）。
+
+    ━━━ 为什么这一刀必须切 ━━━
+
+    ``list_notes`` 返回的是**库里全部条目** —— 包括别的会话写下的任务过程态
+    （``scope=task:xxx``）和早已归档的老账。默认不过滤的话，面板会把
+    "别人正在做的半成品"和"过期老账"一起摊在你面前：那正是防串台要挡的
+    东西，只不过发生在界面上而不是检索里。
+
+    ⚠️ **缺省 scope（long-term）是不输出字段的**（见 ``Note.to_dict``），
+    所以"没带 scope"等于 long-term，不是"未知" —— 判断时要按缺省补上，
+    否则默认视图会把最常见的条目全滤掉。
+    """
+    want = (scope or "long-term").strip()
+    if want == "all":
+        return notes
+    if want == "archived":
+        return [n for n in notes if str(n.get("scope", "")) == "archived"]
+    if want == "task" or want.startswith("task:"):
+        prefix = want if want.startswith("task:") else "task:"
+        return [n for n in notes if str(n.get("scope", "")).startswith(prefix)]
+    return [n for n in notes if str(n.get("scope", "") or "long-term") == "long-term"]
 
 
 def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
@@ -300,6 +334,9 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         tag = request.query_params.get("tag", "")
         ws = request.query_params.get("workspace", "")
         lib = request.query_params.get("lib", "")
+        # v2（S-7.2）：生效域三档 chip。默认 long-term —— 与 agent 的默认闸一致，
+        # 否则面板会显示别的会话的任务过程态（那正是防串台要挡的东西）。
+        scope_req = request.query_params.get("scope", "long-term").strip() or "long-term"
 
         def build() -> dict[str, Any]:
             me = hub.whoami(user)
@@ -312,6 +349,8 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                 notes = found.get("results", [])
             else:
                 notes = hub.list_notes(user, limit=300, lib_id=lib).get("notes", [])
+
+            notes = _filter_by_scope(notes, scope_req)
 
             # 标签统计只算当前可见范围（全库统计会泄露无权库的规模）
             tag_counts: dict[str, int] = {}
@@ -619,6 +658,80 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         return JSONResponse(
             await TenantTools(hub).memory_import(user, str(bundle), target, "", on_conflict)
         )
+
+    # ────────── 上下文条 / 会话卡（v2 · S-7.2）──────────
+
+    async def context_view(request: Any) -> Any:
+        """把「agent 开工时会被自动喂什么」摊开给用户看。
+
+        ━━━ 这一条的价值全在透明 ━━━
+
+        用户真实反馈过"我不知道它到底记得什么、又被喂了什么"。
+        自动上下文是 v2 最"隐形"的机制 —— 越是自动的东西越要能看见，
+        否则一旦它喂错了东西（比如把别的会话的过程态当口径），
+        用户连"该怎么查"都不知道。
+        """
+        from . import session as _session
+
+        user = require_user()
+        entries = [
+            v for v in _session.load(hub.home).values()
+            if v.get("user") == user and v.get("status") == "active"
+        ]
+        entries.sort(key=lambda v: str(v.get("updated", "")), reverse=True)
+        active = entries[0] if entries else None
+
+        # 约束清单：type 会被写成同名标签（见 config._infer_tags），按标签收紧。
+        # 用 list_notes + 本地过滤而不是 search —— 空查询下 search 的
+        # 语义（能不能只靠标签命中）不该被这里依赖。
+        try:
+            notes = hub.list_notes(user, limit=500).get("notes", [])
+            constraints = [
+                {"title": n.get("title", ""), "lib": n.get("_lib_label", "")}
+                for n in notes
+                if "constraint" in {str(t) for t in (n.get("tags") or [])}
+            ][:20]
+        except Exception:  # noqa: BLE001
+            constraints = []
+
+        return JSONResponse({
+            "ok": True,
+            "session": ({
+                "task": active.get("task", ""),
+                "space": active.get("space", ""),
+                "visibility": active.get("visibility", "private"),
+                "started": active.get("started", ""),
+                "updated": active.get("updated", ""),
+            } if active else None),
+            "constraints": constraints,
+            "scope_chips": list(PANEL_SCOPE_CHIPS),
+        })
+
+    async def session_visibility(request: Any) -> Any:
+        """改当前会话的可见性（三档）。**只动会话条目本身**，不碰记忆内容。"""
+        from . import session as _session
+
+        user = require_user()
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"ok": False, "message": "请求体不是合法 JSON"},
+                                status_code=400)
+        v = str((body or {}).get("visibility", "")).strip()
+        task = str((body or {}).get("task", "")).strip()
+        if v not in ("private", "space", "shared"):
+            return JSONResponse(
+                {"ok": False, "message": "可见性只能是 private / space / shared"},
+                status_code=400,
+            )
+        if not task:
+            return JSONResponse({"ok": False, "message": "要指定会话（task）"},
+                                status_code=400)
+        try:
+            entry = _session.start(hub.home, user, task, visibility=v)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "visibility": entry.get("visibility", v)})
 
     # ────────── 主密钥与 PIN（v2 · S-6）──────────
 
@@ -1141,6 +1254,9 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         Route("/api/backup", backup_export, methods=["POST"]),
         Route("/api/backups", backups_list, methods=["GET"]),
         Route("/api/restore", backup_restore, methods=["POST"]),
+        # v2 S-7.2：上下文条 / 会话卡
+        Route("/api/context", context_view, methods=["GET"]),
+        Route("/api/session/visibility", session_visibility, methods=["POST"]),
         Route("/api/auth/token/create", token_create, methods=["POST"]),
         Route("/api/auth/token/revoke", token_revoke, methods=["POST"]),
         Route("/api/admin/users", users_list, methods=["GET"]),

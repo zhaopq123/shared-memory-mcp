@@ -221,6 +221,35 @@ input#q:focus{border-color:var(--brass-dim);
   border-bottom:1px solid var(--line);transition:background .13s;
   user-select:none;
 }
+/* 自动上下文条 / 会话卡（v2 · S-7.2）。
+   刻意做得"轻"：它们是状态提示，不该比记忆列表更抢眼。 */
+.ctxbar{
+  display:flex;align-items:center;gap:7px;
+  font-size:11.5px;color:var(--muted);
+  padding:6px 9px;border-radius:8px;
+  background:color-mix(in srgb,var(--ink) 4%,transparent);
+  border:1px solid var(--line);
+  margin-bottom:8px;line-height:1.45;
+}
+.ctxdot{
+  width:6px;height:6px;border-radius:50%;flex:none;
+  background:var(--muted);opacity:.55;
+}
+.ctxdot.on{background:var(--verdigris);opacity:1}
+.sesscard{
+  border:1px solid var(--line);border-radius:9px;
+  padding:9px 10px;margin:8px 0;
+  background:color-mix(in srgb,var(--ink) 3%,transparent);
+}
+.sesshead{
+  font-size:12px;font-weight:600;margin-bottom:7px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.sessrow{display:flex;gap:5px;flex-wrap:wrap}
+.sesshint{
+  font-size:11px;color:var(--muted);margin-top:7px;line-height:1.45;
+}
+
 .wshead:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}
 
 /* 六型视图里的资产组头（v2 · S-7.2）：workflow/constraint 是所有记忆里

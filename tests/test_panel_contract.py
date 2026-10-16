@@ -345,6 +345,8 @@ def test_js_uses_only_existing_element_ids() -> None:
         "adm-backup", "adm-access", "adm-instr",
         "bk-export", "bk-refresh", "bk-list", "bk-msg",
         "instr-save", "instr-msg",
+        # v2 S-7.2 收口：上下文条 / 生效域 chip / 会话卡
+        "ctxbar", "scopechips", "sesscard",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -632,3 +634,56 @@ def test_restore_guards_against_path_traversal() -> None:
 
     assert "resolve()" in seg, "没有 resolve 后比对（前缀校验形同虚设）"
     assert "startswith(str(base))" in seg, "缺包含校验 —— 路径能越出备份目录"
+
+# ── v2 S-7.2 收口：上下文条 / 生效域 chip / 会话卡 ──
+
+
+def test_context_bar_scope_chips_and_session_card_exist() -> None:
+    """三块"隐形机制的可视化"必须在位。
+
+    它们回答同一个问题：**现在这一屏是谁的角度、看的是什么范围**。
+    此前全是隐形自动行为 —— 越是自动的东西越要能看见。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    html = (root / "dashboard.py").read_text(encoding="utf-8")
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+
+    for eid in ('id="ctxbar"', 'id="scopechips"', 'id="sesscard"'):
+        assert eid in html, f"左栏缺 {eid}"
+    assert "function loadContextBar(" in js, "没有上下文条渲染函数"
+    assert "loadContextBar()" in js, "上下文条没被调用"
+    assert "'/api/context'" in js, "没接后端上下文接口"
+    assert "session/visibility" in js, "会话卡没接可见性接口"
+
+
+def test_panel_default_scope_is_long_term() -> None:
+    """面板默认生效域必须是 **long-term**（与 agent 的默认闸一致）。
+
+    ⚠️ 这是防串台的界面一侧：``list_notes`` 返回库里**全部**条目，
+    默认不过滤的话，面板会把"别人正在做的半成品"和"过期老账"一起摊开。
+
+    最容易写错的一处：**long-term 是缺省值、不输出字段**（见 Note.to_dict），
+    所以判断必须按缺省补上 —— 否则默认视图会把最常见的条目全滤掉
+    （一个"看起来正常但列表空了"的 bug）。
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from shared_memory.dashboard import _filter_by_scope
+
+    notes = [
+        {"title": "长期条"},                                  # 缺省 = long-term
+        {"title": "显式长期", "scope": "long-term"},
+        {"title": "任务过程态", "scope": "task:某任务"},
+        {"title": "老账", "scope": "archived"},
+    ]
+    lt = [n["title"] for n in _filter_by_scope(notes, "long-term")]
+    assert lt == ["长期条", "显式长期"], f"默认视图错了：{lt}"
+
+    task = [n["title"] for n in _filter_by_scope(notes, "task")]
+    assert task == ["任务过程态"]
+
+    arc = [n["title"] for n in _filter_by_scope(notes, "archived")]
+    assert arc == ["老账"]
+
+    allt = [n["title"] for n in _filter_by_scope(notes, "all")]
+    assert len(allt) == 4, "考古模式要能看见全部"
