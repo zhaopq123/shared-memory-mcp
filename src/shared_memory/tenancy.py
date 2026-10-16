@@ -262,7 +262,7 @@ class TenantHub:
             return r
         return self.tenant.search_all(user_name, query, **kwargs)
 
-    def _note_visible(self, user_name: str, note: dict, lib_id: str,
+    def note_visible(self, user_name: str, note: dict, lib_id: str,
                       *, cross_space: bool = False) -> bool:
         """这条记忆对该身份可见吗（v2 S-10.2 的读端闸）。
 
@@ -310,7 +310,7 @@ class TenantHub:
             # 库里真没有这条 → vault 抛 NOT_FOUND，原样透出去（不要包装：
             # 包装出来的文案与下面"被档位挡住"的那份不一致就会变成探针）
             r = self.service_for(lib_id).get(ident)
-            if not self._note_visible(user_name, r["note"], lib_id):
+            if not self.note_visible(user_name, r["note"], lib_id):
                 # ⚠️ 必须与"库里真没有这条"**逐字一样**（含 hint）。
                 # 写一句"这条被共享档位挡住了"看起来更贴心，实际是把
                 # 错误体变成了存在性探针：调用方换个标题一比就分出两种情况。
@@ -325,7 +325,7 @@ class TenantHub:
                 if exc.code != ErrorCode.NOT_FOUND:
                     raise
                 continue
-            if not self._note_visible(user_name, r["note"], lib.id):
+            if not self.note_visible(user_name, r["note"], lib.id):
                 continue
             r["note"]["_lib"] = lib.id
             r["note"]["_lib_label"] = lib.label or lib.id
@@ -339,7 +339,7 @@ class TenantHub:
                 if exc.code != ErrorCode.NOT_FOUND:
                     raise
                 continue
-            if not self._note_visible(user_name, r["note"], lib.id, cross_space=True):
+            if not self.note_visible(user_name, r["note"], lib.id, cross_space=True):
                 continue
             r["note"]["_lib"] = lib.id
             r["note"]["_lib_label"] = lib.label or lib.id

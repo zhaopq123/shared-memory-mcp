@@ -1,4 +1,4 @@
-"""启动变更摘要（方案 11）—— 会话开始时告诉 agent「你不在时发生了什么」。
+"""启动变更摘要（方案 11）+ 自动存取注入层（v2 S-12.1）。
 
 ━━━ 解决什么问题 ━━━
 
@@ -8,14 +8,26 @@
 
 MCP 的 ``initialize`` 响应里有个 ``instructions`` 字段，客户端会
 把它并进系统提示。fastmcp 4.1.0 有 ``on_initialize`` 中间件钩子，
-可以在响应出去前**追加一段变更摘要** —— 这就是本模块。
+可以在响应出去前**追加一段** —— 这就是本模块。
+
+━━━ 三段（S-12.1，口径来自设计文档 D-7/D-9）━━━
+
+1. **长期摘要**（``format_digest``）：你不在时库里变了什么。
+   没变就是空串 —— 不刷屏。
+2. **约束清单**（``constraint_manifest``）：``type=constraint`` 的条目。
+   ⚠️ **这一段与游标无关，每次握手必达**。硬约束的宿命就是"每次都要
+   知道"，靠 agent 想起来搜 = 迟早出事（D-9-1）。所以首次连接、
+   零变更连接都得带上它。
+3. **当前任务上下文包**（``session_context``）：正在做哪些任务 +
+   ``type=workflow`` 的清单**置顶**带回（D-9-2：工作流不用搜，
+   开工就在面前）。
 
 ━━━ 三条设计约束 ━━━
 
-1. **零噪音**：自游标以来什么都没变 → 返回空串，完全不碰
-   instructions。稳态下会话启动零额外 token。
-2. **失败静默**：摘要计算任何异常都不能影响 initialize
-   （中间件里整体兜底）—— 这是个 nice-to-have，不是关键路径。
+1. **零噪音**：自游标以来什么都没变 → 第 1 段为空，不碰 instructions。
+   稳态下会话启动只多"约束 + 工作流"那点固定成本。
+2. **失败静默**：任何异常都不能影响 initialize（中间件里整体兜底）
+   —— 这是 nice-to-have，不是关键路径。
 3. **游标按用户**：``<home>/state/digest-cursors.json``，
    ``{user_name: iso_ts}``。原子写（tmp + os.replace）。
 
@@ -30,11 +42,16 @@ MCP 的 ``initialize`` 响应里有个 ``instructions`` 字段，客户端会
 （播报过的 note id 不再播）—— 两者合起来是**精确一次**：
 不漏报、不重复。详见游标存储的说明。
 
+⚠️ **注入层必须过共享档位闸**（``TenantHub.note_visible``）：
+digest 是服务端**主动**塞进提示词的，调用方没索取就能看到内容 ——
+漏过滤就不是"多看一条"，是**主动泄露**别人的 ``mine`` 条目。
+扫描范围与工具面同口径（只碰 ``readable`` 的库）。
+
 ━━━ 成本 ━━━
 
 每次 initialize 一遍可读库的 ``all_notes()``。读路径有 NoteCache
-（mtime 缓存），重复扫描的边际成本接近零。摘要本身截断到
-「每库 top3 + 告警 top3」，不随数据量膨胀。
+（mtime 缓存），重复扫描的边际成本接近零。三段都截断
+（每库 top3 + 告警 top3 + 约束 12 条 + 工作流 6 条），不随数据量膨胀。
 """
 
 from __future__ import annotations
@@ -57,6 +74,10 @@ logger = logging.getLogger(__name__)
 _MAX_TITLES_PER_LIB = 3
 #: 时效告警最多列几条
 _MAX_ALERTS = 3
+#: 硬约束清单最多列几条（超出时报名字并给出取全的方法，见 constraint_manifest）
+_MAX_CONSTRAINTS = 12
+#: 工作流清单最多列几条
+_MAX_WORKFLOWS = 6
 #: seen 记账上限（note id 很短，1000 条撑爆不了游标文件）
 _SEEN_CAP = 1000
 
@@ -221,6 +242,10 @@ def compute(
             meta = n.meta or {}
             if str(getattr(n, "scope", SCOPE_LONG_TERM) or SCOPE_LONG_TERM) not in scopes:
                 continue
+            # ⚠️ 共享档位闸（S-12.1）：digest 是**主动注入**，别人的
+            # ``mine`` 条目连"标题出现在提示词里"都不能有。
+            if not hub.note_visible(user_name, n.to_dict(with_body=False), lib.id):
+                continue
             updated = str(meta.get("updated", ""))
             # >= 而非 >：秒级精度下同秒写入不能漏（见语义边界）；
             # 同秒边界带来的重复由 seen 记账消除。
@@ -281,6 +306,8 @@ def _all_note_ids(hub: Any, user_name: str) -> list[str]:
 
     v2：与 compute 同口径，只收默认可见的生效域 —— 否则 seen 会被
     看不见的 id 灌满（无功能影响，但让"记账"语义变脏）。
+    S-12.1：同样过共享档位闸，与 compute 逐条对齐（两边口径不一致时，
+    别人隐藏的条目会在下一次连接被当成"新变更"播报出去）。
     """
     ids: list[str] = []
     scopes = _visible_scopes(hub, user_name)
@@ -288,48 +315,123 @@ def _all_note_ids(hub: Any, user_name: str) -> list[str]:
         for n in hub.service_for(lib.id).vault.all_notes():
             if str(getattr(n, "scope", SCOPE_LONG_TERM) or SCOPE_LONG_TERM) not in scopes:
                 continue
+            if not hub.note_visible(user_name, n.to_dict(with_body=False), lib.id):
+                continue
             nid = str(getattr(n, "id", "") or "")
             if nid:
                 ids.append(nid)
     return ids
 
 
+def _reusable(hub: Any, user_name: str) -> dict[str, list[dict[str, str]]]:
+    """扫出可见范围内的「可复用资产」：``constraint`` 与 ``workflow`` 两型。
+
+    D-9 把这两型当**资产**特殊对待：硬约束每次会话常驻（不靠搜），
+    工作流随任务上下文包置顶带回。所以注入层要能**一次性**把它们捞全。
+
+    与 compute 同两条闸：生效域（自己的任务域 + 长期）与共享档位。
+    按更新时间倒序 —— 约束之间没有优先级，但"最近定下的"通常更现行。
+    """
+    out: dict[str, list[dict[str, str]]] = {"constraint": [], "workflow": []}
+    scopes = _visible_scopes(hub, user_name)
+    for lib in hub.tenant.readable(user_name):
+        for n in hub.service_for(lib.id).vault.all_notes():
+            kind = str(getattr(n, "type", "") or "")
+            if kind not in out:
+                continue
+            if str(getattr(n, "scope", SCOPE_LONG_TERM) or SCOPE_LONG_TERM) not in scopes:
+                continue
+            if not hub.note_visible(user_name, n.to_dict(with_body=False), lib.id):
+                continue
+            out[kind].append({
+                "title": str(n.title or ""),
+                "lib": lib.label or lib.id,
+                "updated": str(n.updated or ""),
+            })
+    for items in out.values():
+        items.sort(key=lambda x: x["updated"], reverse=True)
+    return out
+
+
+def _asset_lines(items: list[dict[str, str]], cap: int, tag: str) -> list[str]:
+    """列标题（只给标题 + 来源库）—— 全文走两段式读取（D-8）。"""
+    lines = []
+    for x in items[:cap]:
+        lines.append(f"· [{tag}] {x['title']}（{x['lib']}）")
+    more = len(items) - min(len(items), cap)
+    if more > 0:
+        lines.append(
+            f"· …另有 {more} 条，取全："
+            f"memory_recall(tags=[\"{tag}\"], scope=\"all\", limit=100)"
+        )
+    return lines
+
+
+def constraint_manifest(hub: Any, user_name: str) -> str:
+    """「硬约束」常驻清单（S-12.1 第二段）。没有约束条目时返回空串。
+
+    ⚠️ 调用方**不能**把它当"有变更才带上"的可选段落 ——
+    约束的价值恰恰在于零变更、首次连接时也在场。
+    """
+    items = _reusable(hub, user_name)["constraint"]
+    if not items:
+        return ""
+    lines = ["── 硬约束（每次会话常驻 · 必须遵守，不用搜）──"]
+    lines += _asset_lines(items, _MAX_CONSTRAINTS, "constraint")
+    return "\n".join(lines)
+
+
 def session_context(hub: Any, user_name: str, home: Path) -> str:
-    """当前活跃会话的一句话上下文（无会话 → 空串）。
+    """当前任务上下文包（S-12.1 第三段）：工作流置顶 + 活跃任务。
 
     v2 S-2.5：让 agent 一握手就知道"你正在做 X，相关记忆 N 条"——
     任务上下文不靠它自己想起来（Q7「会自动存取记忆吗」的读半边）。
     N 只算该任务域（``scope=task:<task>``）的条数，轻量。
+
+    v2 S-12.1：按 D-9-2 把 ``workflow`` 型条目**置顶**带进同一个包 ——
+    "怎么做"这类资产和"正在做什么"是同一件事的两半，分开两段反而
+    要 agent 自己拼。两个都空才返回空串。
     """
     try:
+        flows = _reusable(hub, user_name)["workflow"]
+        flow_lines: list[str] = []
+        if flows:
+            flow_lines = ["── 当前任务上下文 ──", "· 工作流（按它走）："]
+            for x in _asset_lines(flows, _MAX_WORKFLOWS, "workflow"):
+                flow_lines.append("  " + x)
         tasks = active_tasks(home, user_name)
-        if not tasks:
-            return ""
-        parts: list[str] = []
-        for t in tasks:
-            n = 0
-            try:
-                r = hub.search(
-                    user_name, "", status="all",
-                    scope=task_scope(t), limit=1,
-                )
-                n = int(r.get("total", 0) or 0)
-            except Exception:  # noqa: BLE001
+        if tasks:
+            if not flow_lines:
+                flow_lines = ["── 当前任务上下文 ──"]
+            parts: list[str] = []
+            for t in tasks:
                 n = 0
-            parts.append(f"「{t}」（相关记忆 {n} 条）")
-        return (
-            "── 当前任务上下文 ──\n"
-            "· 你正在做：" + "、".join(parts) + "\n"
-            "· 过程态记忆只在你的默认检索范围里；**收工调 "
-            "memory_session_end** 把它们归类归档（可复用的升长期）。"
-        )
+                try:
+                    r = hub.search(
+                        user_name, "", status="all",
+                        scope=task_scope(t), limit=1,
+                    )
+                    n = int(r.get("total", 0) or 0)
+                except Exception:  # noqa: BLE001
+                    n = 0
+                parts.append(f"「{t}」（相关记忆 {n} 条）")
+            flow_lines.append("· 你正在做：" + "、".join(parts))
+            flow_lines.append(
+                "· 过程态记忆只在你的默认检索范围里；**收工调 "
+                "memory_session_end** 把它们归类归档（可复用的升长期）。"
+            )
+        return "\n".join(flow_lines) if flow_lines else ""
     except Exception as exc:  # noqa: BLE001
         logger.warning("任务上下文计算失败（已忽略）: %s", exc)
         return ""
 
 
 def build_suffix(hub: Any, user_name: str, home: Path) -> tuple[str, dict[str, str]]:
-    """算摘要并推进游标。返回 ``(instructions 追加段, 新游标表)``。
+    """算三段注入内容并推进游标。返回 ``(instructions 追加段, 新游标表)``。
+
+    段序按设计文档：**长期摘要 → 硬约束 → 当前任务上下文**。
+    其中**只有第 2 段是无条件的**（D-9-1"每次都要知道"）——
+    首次连接（还没游标）也要带上它，那恰恰是最需要约束的一刻。
 
     任何异常都吞掉返回空串 —— 摘要是 nice-to-have，
     绝不能把 initialize 搞挂。
@@ -343,8 +445,8 @@ def build_suffix(hub: Any, user_name: str, home: Path) -> tuple[str, dict[str, s
             since = str(entry.get("since", ""))
             seen = list(entry.get("seen") or [])
             now = now_iso()
-            # v2：任务上下文段落 —— 即使没有变更（suffix 为空）也要带上，
-            # 让 agent 一握手就知道"我正在做什么"。
+            # 常驻两段：与游标无关，每次都算
+            cons = constraint_manifest(hub, user_name)
             sess = session_context(hub, user_name, home)
             if not since:
                 # 首次连接：建基线 + 现存条目全数记进 seen。
@@ -355,10 +457,11 @@ def build_suffix(hub: Any, user_name: str, home: Path) -> tuple[str, dict[str, s
                     "seen": _all_note_ids(hub, user_name)[-_SEEN_CAP:],
                 }
                 update_cursor(home, user_name, new_entry)
-                return sess, load_cursors(home)
+                combined = "\n\n".join(x for x in (cons, sess) if x)
+                return combined, load_cursors(home)
             d = compute(hub, user_name, since, set(seen))
             suffix = format_digest(d)
-            combined = "\n\n".join(x for x in (sess, suffix) if x)
+            combined = "\n\n".join(x for x in (suffix, cons, sess) if x)
             # 推进游标 + 记账：本次播报过的 id 进 seen（精确一次）
             merged = list(dict.fromkeys([*seen, *d.get("new_ids", [])]))
             update_cursor(home, user_name,
@@ -397,8 +500,11 @@ def make_digest_middleware(hub: Any, home: Path) -> Any:
                 suffix, _ = await asyncio.to_thread(
                     build_suffix, hub, user_name, home
                 )
-                if suffix and getattr(result, "instructions", None):
-                    result.instructions = f"{result.instructions}\n\n{suffix}"
+                if suffix:
+                    # instructions 为空也要注入：约束清单是"每次必达"的，
+                    # 不能因为某个客户端/配置把 instructions 清空就失效。
+                    base = getattr(result, "instructions", None) or ""
+                    result.instructions = f"{base}\n\n{suffix}" if base else suffix
             except Exception as exc:  # noqa: BLE001
                 logger.warning("digest 中间件失败（已忽略）: %s", exc)
             return result

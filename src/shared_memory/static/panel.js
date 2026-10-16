@@ -2038,6 +2038,11 @@ async function loadSettings(){
     ${r.instructions_disabled ? `
       <div class="errbox">${t('cfg.disabledInstructions')}</div>` : ''}
 
+    <h3 class="sechead">${t('cfg.autoTitle')}</h3>
+    <p class="sectip">${t('cfg.autoRead')}</p>
+    <p class="sectip">${t('cfg.autoWrite')}</p>
+    <div class="warnbox">${t('cfg.autoNoPush')}</div>
+
     <h3 class="sechead">${t('cfg.writeRules')}</h3>
     <p class="sectip">${t('cfg.writeRulesHint')}</p>
     <div class="field">

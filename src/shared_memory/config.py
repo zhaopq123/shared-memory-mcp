@@ -713,12 +713,22 @@ class Config:
 # ══════════════════════ 自动推断 ══════════════════════
 
 
+#: 类型推断的优先序（v2 S-12.2 / 设计文档 D-9-3）。
+#: 这两型必须**先判**，理由不是"它们更重要"，是**错的代价不对称**：
+#: 一条 ``教训：必须先跑 lint`` 判成 lesson，视图里少一条硬约束、
+#: digest 的常驻清单**永远不会带上它** —— 整个"约束每次必达"机制
+#: 对这条失效，而且没人会察觉。反过来把 lesson 判成 constraint，
+#: 只是常驻清单里多一行（顶多吵）。
+_INFER_PRIORITY: tuple[str, ...] = ("constraint", "workflow")
+
+
 def infer_meta(
     *,
     title: str,
     body: str,
     workspace: str,
     rules: dict[str, Any],
+    active_task_scope: str = "",
 ) -> dict[str, Any]:
     """根据标题/正文自动推断元数据。
 
@@ -758,10 +768,24 @@ def infer_meta(
     ━━━ 想标得准怎么办 ━━━
     显式传 ``extra={"type": "lesson", "claim": "fact"}`` ——
     显式值永远优先于推断。推断只是"没填时的兜底"，不是最终裁决。
+    （D-9-a：误判 workflow/constraint 的兜底同一条 —— 建议值，可覆盖。）
+
+    ━━━ v2 S-12.2 的两处扩展 ━━━
+    1. **优先序**：constraint / workflow 先判（见 :data:`_INFER_PRIORITY`）。
+    2. **scope 推断**：判成 ``task``（待办/进行中型）且调用方给了
+       ``active_task_scope``（当前会话绑定的任务域）时，建议把它写进
+       任务域 —— 过程态**本来就该随会话归档**，留在长期记忆里就是
+       "记忆越来越大越来越乱"的主因。
+       没开会话（``active_task_scope`` 为空）时不猜，按缺省长期。
+
+    Args:
+        active_task_scope: 当前会话的任务域（``task:<名>``），由调用方
+            从会话登记里取。**服务端不猜会话** —— 猜错会把条目写进
+            别人的域。
 
     Returns:
         只包含**推断出来**的字段（显式传了的不覆盖）。
-        可能包含：``type`` / ``claim``。
+        可能包含：``type`` / ``claim`` / ``scope``。
     """
     if not rules.get("auto_infer", True):
         return {}
@@ -773,14 +797,24 @@ def infer_meta(
     head_low = first_para.lower()
 
     # ── 推断 type：**只认标题** ──
-    # 按 infer_type 里配置的顺序找；命中即用（不做多标签）
+    # 命中即用（不做多标签）。先扫优先型（constraint / workflow），
+    # 再按配置的顺序扫其余 —— 顺序错了会让"教训：必须 X"这类标题
+    # 被 lesson 抢走（代价不对称，见 _INFER_PRIORITY 的说明）。
     infer_type = rules.get("infer_type") or {}
-    for kind, words in infer_type.items():
+    order = [k for k in _INFER_PRIORITY if k in infer_type] + [
+        k for k in infer_type if k not in _INFER_PRIORITY
+    ]
+    for kind in order:
+        words = infer_type.get(kind)
         if not isinstance(words, list):
             continue
         if any(str(w) and str(w).lower() in title_low for w in words):
             out["type"] = kind
             break
+
+    # ── 推断 scope：过程态落当前会话绑定的任务域（S-12.2）──
+    if out.get("type") == "task" and active_task_scope:
+        out["scope"] = active_task_scope
 
     # ── 推断 claim：标题 + 正文开头 ──
     # 优先级：明确"未核实/推测" > 明确"实测" > 不标（默认由读取端处理）
@@ -806,6 +840,7 @@ def apply_rules_on_write(
     workspace: str,
     extra: dict[str, Any],
     rules: dict[str, Any],
+    active_task_scope: str = "",
 ) -> tuple[list[str], dict[str, Any], list[str]]:
     """写入前按规则处理，返回 ``(tags, extra, notes)``。
 
@@ -857,13 +892,28 @@ def apply_rules_on_write(
             )
         notes.append("规则建议带 workspace，本条未填（当成跨项目记忆处理）")
 
-    # ── 自动推断 type/claim（只在调用方没显式给时）──
-    inferred = infer_meta(title=title, body=body, workspace=workspace, rules=rules)
+    # ── 自动推断 type/claim/scope（只在调用方没显式给时）──
+    # ⚠️ notes 只报**真正落进 extra 的那几项**：显式值覆盖掉的建议不能
+    # 再写成"已自动推断"，否则 agent 收到的是"我改了你的 scope"这种谎话，
+    # 而它明明传了 long-term（D-9-a 的另一半：诚实报告建议被采纳与否）。
+    inferred = infer_meta(
+        title=title, body=body, workspace=workspace, rules=rules,
+        active_task_scope=active_task_scope,
+    )
+    applied: dict[str, Any] = {}
+    skipped: list[str] = []
     for k, v in inferred.items():
-        if k not in extra:  # 显式传了就不覆盖
+        if k not in extra:
             extra[k] = v
-    if inferred:
-        notes.append("已自动推断：" + "、".join(f"{k}={v}" for k, v in inferred.items()))
+            applied[k] = v
+        else:
+            skipped.append(k)
+    if applied:
+        notes.append("已自动推断：" + "、".join(f"{k}={v}" for k, v in applied.items()))
+    if skipped:
+        notes.append(
+            "推断建议已让位给你的显式值：" + "、".join(skipped)
+        )
 
     # ── 自动补标签 ──
     # type 也补一个同名标签，这样面板/检索按标签过滤也能命中

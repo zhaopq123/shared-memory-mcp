@@ -237,13 +237,14 @@ class SharedMemoryService:
         workspace: str = "",
         mode: str = "upsert",
         extra: dict[str, Any] | None = None,
+        active_task_scope: str = "",
     ) -> dict[str, Any]:
         """写入一条记忆（排队 → 落盘 → 按需进版本库）。
 
         ━━━ 这里体现「闭环」的两个要点 ━━━
 
         1. **写入前按规则处理**（apply_rules_on_write）：
-           自动推断 type/claim、自动补工作区标签、校验长度。
+           自动推断 type/claim/scope、自动补工作区标签、校验长度。
            不合规**不硬拒**，而是补全 + 在返回里提醒 ——
            硬拒会让 agent 反复换写法重试，浪费轮次。
 
@@ -318,6 +319,7 @@ class SharedMemoryService:
             workspace=workspace,
             extra=extra_in,
             rules=rules,
+            active_task_scope=active_task_scope,
         )
         # 标题可能被规则截断 —— 用处理后的值
         title_fixed = (

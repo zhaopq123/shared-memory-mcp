@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "users": {
+    "alice": {
+      "name": "alice",
+      "password": "",
+      "role": "admin",
+      "groups": [],
+      "display": "",
+      "created": 1792150116.2628832,
+      "disabled": false
+    }
+  },
+  "libs": {
+    "group-x": {
+      "id": "group-x",
+      "label": "",
+      "owner": "group:研发",
+      "writable_by_members": true,
+      "hidden_from_agents": false,
+      "created": 1792150116.2628832,
+      "created_by": ""
+    }
+  }
+}

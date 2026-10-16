@@ -263,6 +263,19 @@ class TenantTools:
                 out.append(sc)
         return out
 
+    def _current_task_scope(self, user_name: str) -> str:
+        """当前会话的任务域（``task:<名>``）；没开会话返回空串。
+
+        S-12.2 用它给推断层提供"过程态该落哪儿"。取 ``tasks[0]`` ——
+        与 :meth:`_resolve_write_scope` 里 ``scope="task"`` 的显式路径
+        **同一条规则**（两处各定一套"哪个算当前"必然漂移）。
+        """
+        try:
+            tasks = _session.active_tasks(self.hub.home, user_name)
+        except Exception:  # noqa: BLE001
+            return ""
+        return _session.task_scope(tasks[0]) if tasks else ""
+
     def _resolve_write_scope(self, user_name: str, scope: str) -> str:
         """把 memory_write 的 scope 参数解析成落盘的 scope 字符串。
 
@@ -727,6 +740,10 @@ class TenantTools:
             resolved_scope = self._resolve_write_scope(user_name, scope)
             if resolved_scope:
                 extra["scope"] = resolved_scope
+            # v2（S-12.2）：调用方没显式给 scope 时，把当前会话任务域交给
+            # 推断层 —— 判成 task（待办/进行中）的过程态随会话归档，
+            # 不留在长期记忆里。显式值永远优先（D-9-a：推断只是建议）。
+            auto_scope = "" if resolved_scope else self._current_task_scope(user_name)
 
             # v2（S-10.2）share：空 = 继承空间默认档（读侧解析，不落盘）。
             # 非法值由 vault.validate_v2_fields 拦下（INVALID_ARGUMENT）。
@@ -748,6 +765,7 @@ class TenantTools:
                 user_name,
                 title=title, body=body, tags=tags, workspace=workspace,
                 lib_id=lib, mode=mode, author=author, extra=extra or None,
+                active_task_scope=auto_scope,
             )
         except Exception as exc:  # noqa: BLE001
             return self._err(exc, "写入")
