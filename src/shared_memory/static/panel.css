@@ -222,6 +222,17 @@ input#q:focus{border-color:var(--brass-dim);
   user-select:none;
 }
 .wshead:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}
+
+/* 六型视图里的资产组头（v2 · S-7.2）：workflow/constraint 是所有记忆里
+   "下次开工直接能用"的那两类，值得在视觉上比别的组重一点。 */
+.tyhead.asset .wsname{font-weight:600}
+.assetbadge{
+  font-size:10px;line-height:1.6;padding:0 6px;border-radius:999px;
+  margin-left:6px;white-space:nowrap;
+  background:color-mix(in srgb,var(--accent) 16%,transparent);
+  color:var(--accent);
+  border:1px solid color-mix(in srgb,var(--accent) 32%,transparent);
+}
 .wshead .caret{
   font-size:9px;color:var(--muted);width:11px;flex:0 0 auto;text-align:center;
   transition:transform .14s;

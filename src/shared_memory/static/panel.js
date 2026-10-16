@@ -792,7 +792,7 @@ function renderList(){
   }
   box.innerHTML = (STATE.groupBy === 'time')
     ? renderByTime()
-    : renderByWorkspace();
+    : (STATE.groupBy === 'type' ? renderByType() : renderByWorkspace());
   wireListEvents(box);
 }
 
@@ -871,6 +871,59 @@ function renderByTime(){
   }).join('');
 }
 
+/** 按**六型**分组（v2 · S-7.2）。
+ *
+ *  ━━━ 为什么 type 视图要单独给一个 ━━━
+ *
+ *  v2 把记忆收敛成六型，其中 ``workflow`` / ``constraint`` 是**可复用资产** ——
+ *  "下次开工直接能用"的东西，价值远高于一条普通结论。按工作区分组时它们
+ *  被埋在几十条里，等于没有。
+ *
+ *  所以这个视图把两类资产**置顶并打徽标**，其余按 踩坑→习惯→结论→任务 排。
+ *  日常用法：切到类型视图扫一眼置顶区，就知道"这个库里有什么是我该遵守/
+ *  该复用的"。
+ */
+const TYPE_ORDER = ['workflow', 'constraint', 'lesson', 'habit', 'fact', 'task'];
+const TYPE_LABEL_ZH = {
+  workflow: '工作流', constraint: '约束', lesson: '踩坑',
+  habit: '习惯', fact: '结论', task: '任务',
+};
+//: 可复用资产 —— 置顶 + 打徽标
+const ASSET_TYPES = ['workflow', 'constraint'];
+
+function renderByType(){
+  const groups = new Map();
+  for (const n of STATE.notes){
+    const ty = String(n.type || '').trim() || '(未标注)';
+    if (!groups.has(ty)) groups.set(ty, []);
+    groups.get(ty).push(n);
+  }
+  const known = [...TYPE_ORDER, '(未标注)'];
+  // 已知类型按固定序（workflow/constraint 天然在最前）；未知类型排在后面，
+  // 但**不丢**（旧数据里可能有 v1 的 type，看不见比排序乱更糟）
+  const keys = known.filter(k => groups.has(k))
+    .concat([...groups.keys()].filter(k => !known.includes(k)));
+  const collapsed = collapsedSet();
+  return keys.map(k => {
+    const ckey = 'type:' + k;
+    const isCollapsed = collapsed.has(ckey);
+    const isAsset = ASSET_TYPES.includes(k);
+    const label = LANG === 'zh' ? (TYPE_LABEL_ZH[k] || k) : k;
+    const assetTip = LANG === 'zh' ? '可复用资产' : 'reusable asset';
+    return `
+    <div class="typegroup">
+      <div class="wshead tyhead${isAsset ? ' asset' : ''}" data-key="${esc(ckey)}">
+        <span class="caret">${isCollapsed ? '▶' : '▼'}</span>
+        <span class="wsname">${esc(label)}</span>
+        ${isAsset ? `<span class="assetbadge" title="${assetTip}">${
+          LANG === 'zh' ? '资产' : 'asset'}</span>` : ''}
+        <span class="wscount">${groups.get(k).length}</span>
+      </div>
+      ${isCollapsed ? '' : groups.get(k).map(n => itemHtml(n, false)).join('')}
+    </div>`;
+  }).join('');
+}
+
 /** 列表里的事件接线（条目点击、标签点击、组头折叠） */
 function wireListEvents(box){
   box.querySelectorAll('.item').forEach(el => el.onclick = (e) => {
@@ -899,6 +952,7 @@ function renderChips(){
     <div class="seg">
       <button class="segbtn${STATE.groupBy === 'workspace' ? ' on' : ''}" data-g="workspace">工作区</button>
       <button class="segbtn${STATE.groupBy === 'time' ? ' on' : ''}" data-g="time">时间</button>
+      <button class="segbtn${STATE.groupBy === 'type' ? ' on' : ''}" data-g="type">类型</button>
     </div>`;
   gb.querySelectorAll('.segbtn').forEach(el => el.onclick = () => {
     STATE.groupBy = el.dataset.g;
@@ -2253,7 +2307,7 @@ load().then(() => { if (bootId) select(bootId); });
 /** 启动时恢复用户偏好（分组方式） */
 try {
   const saved = localStorage.getItem('shm-groupby');
-  if (saved === 'time' || saved === 'workspace') STATE.groupBy = saved;
+  if (saved === 'time' || saved === 'workspace' || saved === 'type') STATE.groupBy = saved;
 } catch {}
 
 /* 自动刷新：只在记忆库页且没在搜索时刷新。

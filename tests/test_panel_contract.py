@@ -473,3 +473,50 @@ def test_pin_mode_probe_is_get_only() -> None:
     assert "/api/auth/pin" not in src[start:end], (
         "/api/auth/pin 进了路径豁免集合 —— POST 会被一起放开"
     )
+
+# ── v2 S-7.2：六型分组 + 筛后/全部口径 ──
+
+
+def test_six_type_grouping_exists() -> None:
+    """六型视图必须存在，且 workflow/constraint **置顶**并带资产徽标。
+
+    为什么钉住顺序：这两类是"下次开工直接能用"的资产，按工作区分组时
+    被埋在几十条里等于没有。顺序被人无意改掉，等于这个视图白做。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+
+    assert "function renderByType(" in js, "没有六型分组渲染函数"
+    assert "TYPE_ORDER" in js, "没有类型固定序"
+    # 两类资产必须排在最前
+    order_line = next(l for l in js.split("\n") if "TYPE_ORDER =" in l)
+    assert order_line.index("'workflow'") < order_line.index("'constraint'"), (
+        "workflow 应在 constraint 之前（工作流优先）"
+    )
+    for t in ("'lesson'", "'habit'", "'fact'", "'task'"):
+        assert t in order_line, f"六型缺 {t}"
+    assert "ASSET_TYPES" in js and "assetbadge" in js, "缺资产徽标"
+    # 切到该视图的分段按钮要在
+    assert 'data-g="type"' in js, "分段控件里没有「类型」按钮"
+    assert "STATE.groupBy === 'type'" in js, "renderList 没接 type 分支"
+    # 未知类型不能被丢掉（旧数据里有 v1 的 type）
+    assert "!known.includes(k)" in js, "未知类型会被静默丢弃"
+
+
+def test_filtered_count_shows_denominator() -> None:
+    """顶栏数字必须能区分「筛后」与「全部」。
+
+    ⚠️ 这是**实测暴案**：用户点了一个标签 → 顶栏显示"4 条记忆" →
+    结论是"我这两天做的全没了，是不是有 bug"（库里其实 70 条一条没丢）。
+    有筛选时必须显示 ``筛后 / 全部``，否则同一个数字会被读成两个意思。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+
+    assert "notes_all" in js, "取不到「全部条数」，没法给出分母"
+    seg = js[js.index("const notes_all" if "const notes_all" in js else "nAll"):]
+    seg = seg[:900]
+    assert "' / '" in seg, "没看到「筛后 / 全部」的拼接"
+    assert "!== r.stats.notes" in seg, (
+        "没有「只在两者不同时才显示分母」的判断 —— 无筛选时显示 4/4 是噪音"
+    )
