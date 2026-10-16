@@ -576,7 +576,7 @@ const PANEL_VER = (() => {
 })();
 
 const STATE = {
-  tab: 'library',              // library | knowledge | settings
+  tab: 'library',              // library | admin | settings
   groupBy: 'workspace',        // workspace（默认）| time
   notes: [], tags: [], workspaces: [], commits: [],
   activeTag: '', activeWs: '', q: '', cur: null,
@@ -1051,6 +1051,10 @@ async function load(){
   document.getElementById('s-queue').textContent = pend;
   document.getElementById('st-q').classList.toggle('warn', pend > 0);
 
+  /* 视图 chip（v2 · S-7.2）：跟着记忆页一起出现，不用先切 tab。
+     失败不阻断 —— 视图条拉不到不该让整个列表打不开。 */
+  try { await loadViewBar(STATE.view || 'overview'); } catch (e) {}
+
   /* 判故障要看是否**用过**：写者循环惰性创建，新服务里 worker_alive
      本来就是 false —— 那不是故障。判定逻辑必须与服务端 /health 一致，
      否则会出现"面板说坏了但 /health 说健康"的矛盾。 */
@@ -1159,6 +1163,12 @@ function renderLibChips(){
 
 async function select(title){
   STATE.cur = title;
+  /* 从"视图模式"切回"读某条"（v2 · S-7.2）——视图与条目共用右栏，
+     不切回来会看到视图内容盖在条目上。 */
+  const vp = document.getElementById('kbody');
+  if (vp) vp.style.display = 'none';
+  const nd2 = document.getElementById('notedoc');
+  if (nd2) nd2.style.display = '';
   /* 记住这条来自哪个库 —— 同名条目可能存在于多个库，
      不传 lib 时后端会按可读库顺序返回第一个，未必是用户点的那条。
      所以从列表项上取 data-lib 传回去，保证"点哪条开哪条"。 */
@@ -1349,9 +1359,45 @@ const VIEW_META = {
   recent:    {icon:'◷', hint:'按时间倒序'},
 };
 
+/** 视图 chip 条（v2 · S-7.2：从「体系」页搬到记忆页左栏）。
+ *
+ *  ━━━ 为什么视图要和记忆挤在同一页 ━━━
+ *
+ *  「视图」（决策/踩坑/待办/时效告警）与「记忆列表」本来就是同一批数据的
+ *  两种看法。做成两个顶级 tab 的后果是：想扫一眼待办得切走，
+ *  而当前正在读的那条就没了 —— 来回切三次以后人就不用了。
+ *
+ *  幂等：列表只拉一次；但**每次都按当前 kind 更新高亮** ——
+ *  否则从别的入口切回来时高亮会停在上一个视图上。
+ */
+async function loadViewBar(kind){
+  const bar = document.getElementById('viewbar');
+  if (!bar) return;
+  if (!bar.dataset.done){
+    const list = await api('/api/views');
+    bar.innerHTML = (list.views || []).map(v =>
+      `<button class="chip" data-view="${esc(v.kind)}"
+               title="${esc(v.desc)}">${VIEW_META[v.kind]?.icon || '·'} ${
+         t('view.' + v.kind, {})}</button>
+      `).join('');
+    bar.querySelectorAll('.chip').forEach(el => el.onclick = () => {
+      STATE.view = el.dataset.view;
+      loadKnowledge();
+    });
+    bar.dataset.done = '1';
+  }
+  bar.querySelectorAll('.chip').forEach(x =>
+    x.classList.toggle('on', x.dataset.view === kind));
+}
+
 async function loadKnowledge(){
   const kind = STATE.view || 'overview';
   const holder = document.getElementById('kbody');
+  // 视图显示在**记忆页的右栏**（原「体系」页已并入记忆页）：
+  // 把"读某条记忆"的面板让出来，不然两块内容会叠在一起。
+  const nd = document.getElementById('notedoc');
+  if (nd) nd.style.display = 'none';
+  holder.style.display = '';
   holder.innerHTML = `<div class="empty">${t('common.loading')}</div>`;
   const r = await api('/api/view', {kind, limit: 200});
   if (!r.ok){
@@ -1361,22 +1407,7 @@ async function loadKnowledge(){
   }
   STATE.viewData = r;
 
-  // 视图切换条
-  const bar = document.getElementById('viewbar');
-  if (!bar.dataset.done){
-    const list = await api('/api/views');
-    bar.innerHTML = (list.views || []).map(v =>
-      `<button class="chip${v.kind === kind ? ' on' : ''}" data-view="${esc(v.kind)}"
-               title="${esc(v.desc)}">${VIEW_META[v.kind]?.icon || '·'} ${t('view.' + v.kind, {})}</button>
-      `).join('');
-    bar.querySelectorAll('.chip').forEach(el => el.onclick = () => {
-      STATE.view = el.dataset.view;
-      bar.querySelectorAll('.chip').forEach(x => x.classList.remove('on'));
-      el.classList.add('on');
-      loadKnowledge();
-    });
-    bar.dataset.done = '1';
-  }
+  await loadViewBar(kind);
 
   /* 视图标题与说明：优先用语言包（i18n），后端 label 作兜底。
    *
@@ -1543,8 +1574,8 @@ function copyText(s, btn){
  */
 function securityBlockHtml(){
   const zh = LANG === 'zh';
+  // 标题由管理页的区块提供（这里只出内容）—— 两个标题会显得像两组设置
   return `
-    <h3 class="sechead">${zh ? '接入与安全' : 'Access & security'}</h3>
     <p class="sectip">${zh
       ? '两把钥匙各管一摊：<strong>主密钥</strong>给 agent（MCP），<strong>PIN</strong> 给人（面板）。两者都只存哈希 —— 忘了只能重置，找不回来。'
       : 'A master key for agents, a PIN for humans. Only hashes are stored.'}</p>
@@ -1713,14 +1744,6 @@ async function loadSettings(){
     ${r.instructions_disabled ? `
       <div class="errbox">${t('cfg.disabledInstructions')}</div>` : ''}
 
-    ${securityBlockHtml()}
-
-    <h3 class="sechead">${t('cfg.instructions')}</h3>
-    <p class="sectip">${t('cfg.instructionsHint')}</p>
-    <div class="field">
-      <textarea id="cfg-instructions" spellcheck="false">${esc(r.instructions || '')}</textarea>
-    </div>
-
     <h3 class="sechead">${t('cfg.writeRules')}</h3>
     <p class="sectip">${t('cfg.writeRulesHint')}</p>
     <div class="field">
@@ -1791,10 +1814,6 @@ async function loadSettings(){
       <h3 class="sechead">${t('admin.users')}</h3>
       <p class="sectip">${t('admin.onlyAdmin')}</p>
     `}
-
-    <h3 class="sechead">${t('ws.title')}</h3>
-    <p class="sectip">${t('ws.hint')}</p>
-    <div id="ws-body"><div class="empty">${t('common.loading')}</div></div>
 
     <h3 class="sechead">${t('account.title')}</h3>
     <p class="sectip">${t('account.hint')}</p>
@@ -2310,6 +2329,131 @@ async function loadAdminTokens(){
   };
 }
 
+/** 管理页（v2 · S-7.2/S-7.3）：备份 / 接入 / 空间 / 指令。
+ *
+ *  ━━━ 与「设置」的分界（这条分界是刻意的）━━━
+ *
+ *   · **管理** = 这个库怎么活下去：备份、谁能进（接入）、空间、给 agent 的指令
+ *   · **设置** = 这个服务怎么跑：写入规则、账号、token、外观
+ *
+ *  混在一起的后果很具体：用户找"备份"会先在设置页翻半天，
+ *  而写规则和备份根本不是一类操作。
+ */
+async function loadAdmin(){
+  const zh = LANG === 'zh';
+
+  // ① 接入（主密钥 / PIN / 接入码）
+  const acc = document.getElementById('adm-access');
+  if (acc){
+    acc.innerHTML = securityBlockHtml();
+    wireSecurityBlock();
+  }
+
+  // ② 空间（沿用既有渲染器，它按 id 找 #ws-body）
+  loadWorkspaces();
+
+  // ③ 备份与恢复
+  const bk = document.getElementById('adm-backup');
+  if (bk){
+    bk.innerHTML = `
+      <div class="saverow" style="padding-top:0;border-top:none;flex-wrap:wrap">
+        <button class="btn primary" id="bk-export">${zh
+          ? '一键备份（导出可读的全部库）' : 'Back up now'}</button>
+        <button class="btn" id="bk-refresh">${zh ? '刷新记录' : 'Refresh'}</button>
+      </div>
+      <div id="bk-list" style="margin-top:10px"></div>
+      <div id="bk-msg" style="font-size:12.5px;margin-top:8px"></div>`;
+    document.getElementById('bk-export').onclick = async (e) => {
+      const btn = e.target;
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = zh ? '备份中…' : 'Working…';
+      const r = await apiPost('/api/backup', {});
+      btn.disabled = false; btn.textContent = old;
+      document.getElementById('bk-msg').innerHTML = r.ok
+        ? `<span style="color:var(--verdigris)">${
+            zh ? '已导出 ' + (r.count ?? '?') + ' 条到 ' : 'Exported to '}${esc(r.bundle || '')}</span>`
+        : `<span style="color:var(--rust)">${esc(r.message || 'fail')}</span>`;
+      loadBackups();
+    };
+    document.getElementById('bk-refresh').onclick = () => loadBackups();
+    loadBackups();
+  }
+
+  // ④ 给 agent 的指令（从设置页搬来；契约七条由服务端保证，这里是空间级补充）
+  const instr = document.getElementById('adm-instr');
+  if (instr){
+    const r = await api('/api/config');
+    STATE.config = r.ok ? r : STATE.config;
+    instr.innerHTML = `
+      ${r.ok && r.instructions_is_default ? `<div class="warnbox">${
+        t('cfg.defaultInstructions')}</div>` : ''}
+      ${r.ok && r.instructions_disabled ? `<div class="errbox">${
+        t('cfg.disabledInstructions')}</div>` : ''}
+      <div class="field">
+        <textarea id="cfg-instructions" spellcheck="false">${
+          esc((r.ok ? r.instructions : '') || '')}</textarea>
+      </div>
+      <div class="saverow">
+        <button class="btn primary" id="instr-save">${zh ? '保存指令' : 'Save'}</button>
+        <span id="instr-msg" style="font-size:12.5px"></span>
+      </div>`;
+    document.getElementById('instr-save').onclick = async () => {
+      const msg = document.getElementById('instr-msg');
+      msg.textContent = zh ? '保存中…' : 'Saving…';
+      const r2 = await apiPost('/api/config', {
+        instructions: document.getElementById('cfg-instructions').value,
+      });
+      msg.innerHTML = r2.ok
+        ? `<span style="color:var(--verdigris)">${
+            zh ? '已保存 —— 下次握手生效' : 'Saved — effective on next handshake'}</span>`
+        : `<span style="color:var(--rust)">${esc(r2.message || 'fail')}</span>`;
+    };
+  }
+}
+
+/** 备份记录列表（管理页「备份与恢复」用）。 */
+async function loadBackups(){
+  const box = document.getElementById('bk-list');
+  if (!box) return;
+  const zh = LANG === 'zh';
+  const r = await api('/api/backups');
+  const items = (r && r.items) || [];
+  if (!items.length){
+    box.innerHTML = `<div class="sectip" style="margin:0">${
+      zh ? '还没有备份记录。' : 'No backups yet.'}</div>`;
+    return;
+  }
+  box.innerHTML = items.map(it => `
+    <div class="tocwrap" style="margin-top:8px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <code style="font-size:12px">${esc(it.name)}</code>
+        <span class="sectip" style="margin:0;font-size:12px">${
+          esc(it.when || '')} · ${esc(String(it.count ?? '?'))} ${
+          zh ? '条' : 'notes'} · ${esc(String(it.size_kb ?? '?'))} KB</span>
+        <button class="btn" data-restore="${esc(it.name)}">${
+          zh ? '恢复到…' : 'Restore…'}</button>
+      </div>
+    </div>`).join('');
+  box.querySelectorAll('[data-restore]').forEach(el => el.onclick = async () => {
+    const name = el.dataset.restore;
+    const target = prompt(zh
+      ? '恢复到哪个库？（留空 = 你的个人库；导入不覆盖同名条目，默认 skip）'
+      : 'Restore into which lib? (empty = personal)', '');
+    if (target === null) return;
+    const r2 = await apiPost('/api/restore', {
+      bundle: name, target_lib: target.trim(), on_conflict: 'skip',
+    });
+    const msg = document.getElementById('bk-msg');
+    msg.innerHTML = r2.ok
+      ? `<span style="color:var(--verdigris)">${
+          zh ? '已恢复：新增 ' + (r2.added ?? '?') + '，跳过 ' :
+               'Restored: added '}${esc(String(r2.skipped ?? ''))}</span>`
+      : `<span style="color:var(--rust)">${esc(r2.message || 'fail')}</span>`;
+    loadBackups();
+  });
+}
+
 async function saveSettings(){
   const msg = document.getElementById('cfg-msg');
   const btn = document.getElementById('cfg-save');
@@ -2330,7 +2474,12 @@ async function saveSettings(){
   }
 
   const payload = {
-    instructions: document.getElementById('cfg-instructions').value,
+    /* ⚠️ 指令编辑器已搬到「管理」页（v2 · S-7.2）：它不在这个页面里了，
+       所以这里**不能**无条件读 —— 读不到就当没改过（不传该字段），
+       否则一次"保存规则"会把指令悄悄清空。 */
+    ...(document.getElementById('cfg-instructions')
+        ? {instructions: document.getElementById('cfg-instructions').value}
+        : {}),
     rules: {
       ...(STATE.config.rules || {}),
       missing_field_policy: document.getElementById('cfg-policy').value.trim(),
@@ -2367,10 +2516,10 @@ function switchTab(tab){
   STATE.tab = tab;
   document.querySelectorAll('.navtab').forEach(el =>
     el.classList.toggle('on', el.dataset.tab === tab));
-  for (const t of ['library','knowledge','settings']){
+  for (const t of ['library','admin','settings']){
     document.getElementById('page-' + t).style.display = (t === tab) ? '' : 'none';
   }
-  if (tab === 'knowledge') loadKnowledge();
+  if (tab === 'admin') loadAdmin();
   if (tab === 'settings') loadSettings();
 }
 
@@ -2404,7 +2553,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'j' || e.key === 'ArrowDown'){ e.preventDefault(); move(1); }
   if (e.key === 'k' || e.key === 'ArrowUp'){ e.preventDefault(); move(-1); }
   if (e.key === '1') switchTab('library');
-  if (e.key === '2') switchTab('knowledge');
+  if (e.key === '2') switchTab('admin');
   if (e.key === '3') switchTab('settings');
 });
 
@@ -2450,7 +2599,7 @@ const bootId = bootParams.get('id');
 const bootTab = bootParams.get('tab');
 
 if (bootId) STATE.cur = bootId;
-switchTab(['knowledge', 'settings', 'library'].includes(bootTab) ? bootTab : 'library');
+switchTab(['admin', 'settings', 'library'].includes(bootTab) ? bootTab : 'library');
 
 load().then(() => { if (bootId) select(bootId); });
 

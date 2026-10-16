@@ -85,8 +85,8 @@ PANEL_HTML = """<!DOCTYPE html>
     <div class="seal" data-i18n="app.seal">记</div>
     <div class="brand"><span data-i18n="app.brand">共享记忆</span><em id="root">…</em></div>
     <nav class="navtabs">
-      <button class="navtab on" data-tab="library" data-i18n="nav.library">记忆库</button>
-      <button class="navtab" data-tab="knowledge" data-i18n="nav.knowledge">体系</button>
+      <button class="navtab on" data-tab="library" data-i18n="nav.library">记忆</button>
+      <button class="navtab" data-tab="admin" data-i18n="nav.admin">管理</button>
       <button class="navtab" data-tab="settings" data-i18n="nav.settings">设置</button>
     </nav>
     <div class="spacer"></div>
@@ -133,24 +133,52 @@ PANEL_HTML = """<!DOCTYPE html>
         <div id="libchips"></div>
         <div id="groupby"></div>
         <div id="chips"></div>
+        <!-- 视图 chip（原「体系」页搬来，v2 · S-7.2）：记忆页与体系本来就是
+             同一件事的两种看法 —— 分成两个顶级 tab 会让"我想看的那个视图"
+             和"我正在读的那条"分家。 -->
+        <div id="viewbar"></div>
       </div>
       <div class="scroll" id="list"></div>
     </div>
     <div class="reader" id="reader">
-      <div class="doc">
+      <div class="doc" id="notedoc">
         <div class="empty"><span class="big">◫</span>从左侧选一条记忆开始阅读</div>
       </div>
+      <div class="doc" id="kbody" style="display:none"></div>
     </div>
   </div>
 </div>
 
-<!-- ── 页 2：体系 ── -->
-<div id="page-knowledge" style="display:none">
+<!-- ── 页 2：管理（v2 · S-7.2/S-7.3）──
+     这一页动的是「库本身」：备份、接入、空间、指令 —— 不是某一条记忆。
+     与「设置」的分界：设置是"这个服务怎么跑"（规则/账号/外观），
+     管理是"这个库怎么活下去"（备份/谁能进/空间/给 agent 的指令）。 -->
+<div id="page-admin" style="display:none">
   <div class="wrap" style="grid-template-columns:1fr">
     <div class="reader">
-      <div class="doc" style="max-width:78ch">
-        <div class="viewbar" id="viewbar"></div>
-        <div id="kbody"></div>
+      <div class="doc" style="max-width:86ch">
+        <h2 class="sechead" style="margin-top:0">管理</h2>
+        <p class="sectip">
+          备份、接入、空间、指令 —— 这一页动的是<strong>库本身</strong>，不是某条记忆。
+        </p>
+
+        <h3 class="sechead">备份与恢复</h3>
+        <p class="sectip">导出是字节级 + sha256 校验；导入<strong>不重写内容</strong>。</p>
+        <div id="adm-backup"></div>
+
+        <h3 class="sechead">接入</h3>
+        <p class="sectip">新机器 / 新 agent 接上来的钥匙与命令。</p>
+        <div id="adm-access"></div>
+
+        <h3 class="sechead" data-i18n="ws.title">工作空间与共享</h3>
+        <p class="sectip" data-i18n="ws.hint">工作空间 = 一个独立的库，共享范围决定谁能看。</p>
+        <div id="ws-body"><div class="empty">载入中…</div></div>
+
+        <h3 class="sechead" data-i18n="cfg.instructions">给 agent 的指令</h3>
+        <p class="sectip" data-i18n="cfg.instructionsHint">
+          每次握手都会把这段下发给 agent；契约七条由服务端保证，这里是空间级补充。
+        </p>
+        <div id="adm-instr"></div>
       </div>
     </div>
   </div>
@@ -509,6 +537,88 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             "login_url": f"/?login={ticket}",
             "expires_in": 120,
         })
+
+    # ────────── 备份与恢复（v2 · S-7.3②）──────────
+    #
+    # 为什么要走面板而不是让用户跑命令：备份是"**出事之后**才想起要做"的事，
+    # 而那时候用户最没耐心去翻文档找命令。
+
+    async def backup_export(request: Any) -> Any:
+        """一键备份：导出当前用户**可读**的库。
+
+        纯读操作（不写任何库）—— 所以只读凭据也能用。
+        产物落在 ``<home>/exports/``，**在 vault 之外**（不会被 git 带走）。
+        """
+        from .tools_tenant import TenantTools
+
+        user = require_user()
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        lib = str((body or {}).get("lib", "")).strip()
+        return JSONResponse(await TenantTools(hub).memory_export(user, "", lib, ""))
+
+    async def backups_list(request: Any) -> Any:
+        """列出已有备份（时间倒序，最多 30 条）。"""
+        import time as _t
+
+        out_dir = hub.home / "exports"
+        items: list[dict[str, Any]] = []
+        if out_dir.is_dir():
+            for p in sorted(
+                out_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True
+            ):
+                if not p.is_dir():
+                    continue
+                count = None
+                manifest = p / "manifest.json"
+                if manifest.exists():
+                    try:
+                        data = json.loads(manifest.read_text(encoding="utf-8"))
+                        count = len(data.get("notes") or [])
+                    except (OSError, ValueError):
+                        count = None
+                st = p.stat()
+                items.append({
+                    "name": p.name,
+                    "count": count,
+                    "size_kb": round(st.st_size / 1024, 1),
+                    "when": _t.strftime("%Y-%m-%d %H:%M", _t.localtime(st.st_mtime)),
+                })
+        return JSONResponse({"ok": True, "items": items[:30]})
+
+    async def backup_restore(request: Any) -> Any:
+        """从备份恢复（写路径，走队列串行；默认 skip 不覆盖同名）。
+
+        ⚠️ **只允许恢复 exports 目录下的 bundle** —— 前端传来的名字拼进
+        路径前必须做包含校验，否则 ``../../etc`` 能让这个接口去读
+        服务器上任意目录（这不是理论风险，是这类接口最常见的洞）。
+        """
+        from .tools_tenant import TenantTools
+
+        user = require_user()
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"ok": False, "message": "请求体不是合法 JSON"},
+                                status_code=400)
+        name = str((body or {}).get("bundle", "")).strip()
+        target = str((body or {}).get("target_lib", "")).strip()
+        on_conflict = str((body or {}).get("on_conflict", "skip")).strip()
+        if on_conflict not in ("skip", "update", "rename"):
+            on_conflict = "skip"
+
+        base = (hub.home / "exports").resolve()
+        bundle = (base / name).resolve()
+        if not str(bundle).startswith(str(base)) or not bundle.is_dir():
+            return JSONResponse(
+                {"ok": False, "message": "备份不存在（或名字越出了备份目录）"},
+                status_code=404,
+            )
+        return JSONResponse(
+            await TenantTools(hub).memory_import(user, str(bundle), target, "", on_conflict)
+        )
 
     # ────────── 主密钥与 PIN（v2 · S-6）──────────
 
@@ -1027,6 +1137,10 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         Route("/api/auth/pin", pin_set, methods=["POST"]),
         Route("/api/auth/master-key", master_status, methods=["GET"]),
         Route("/api/auth/master-key", master_post, methods=["POST"]),
+        # v2 S-7.3②：备份与恢复（管理页用）
+        Route("/api/backup", backup_export, methods=["POST"]),
+        Route("/api/backups", backups_list, methods=["GET"]),
+        Route("/api/restore", backup_restore, methods=["POST"]),
         Route("/api/auth/token/create", token_create, methods=["POST"]),
         Route("/api/auth/token/revoke", token_revoke, methods=["POST"]),
         Route("/api/admin/users", users_list, methods=["GET"]),

@@ -341,6 +341,10 @@ def test_js_uses_only_existing_element_ids() -> None:
         "mk-state", "mk-gen", "mk-rotate", "mk-key", "mk-msg",
         "pin-state", "pin-input", "pin-set", "pin-off", "pin-msg",
         "conn-code", "conn-copy", "conn-cmd", "conn-msg",
+        # v2 S-7.3②：管理页的备份块与指令编辑器
+        "adm-backup", "adm-access", "adm-instr",
+        "bk-export", "bk-refresh", "bk-list", "bk-msg",
+        "instr-save", "instr-msg",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -568,3 +572,63 @@ def test_master_key_plaintext_shown_once_only() -> None:
     assert "shownKey = key" in seg
     # 没拿到明文时接入码要是占位
     assert "'<主密钥>'" in seg or "<主密钥>" in seg, "接入码缺占位说明"
+
+# ── v2 S-7.2/S-7.3②：三 tab 结构与视图落位 ──
+
+
+def test_three_tabs_are_memory_admin_settings() -> None:
+    """三个顶级 tab 必须是 **记忆 / 管理 / 设置**，且「体系」不再单独成页。
+
+    ━━━ 为什么合并「体系」━━━
+
+    视图（决策/踩坑/待办/时效告警）与记忆列表是同一批数据的两种看法。
+    做成两个顶级 tab 的后果很具体：想扫一眼待办得切走，正在读的那条就没了；
+    来回切三次以后人就不用了。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    html = (root / "dashboard.py").read_text(encoding="utf-8")
+
+    for tab in ('data-tab="library"', 'data-tab="admin"', 'data-tab="settings"'):
+        assert tab in html, f"缺 tab {tab}"
+    assert 'id="page-admin"' in html, "缺管理页容器"
+    assert "page-knowledge" not in html, "「体系」页还在（应已并入记忆页）"
+    assert 'data-tab="knowledge"' not in html, "还在用旧的 knowledge tab"
+    assert "nav.knowledge" not in html, "还引用着已删的 nav.knowledge 键"
+
+    # 视图元素必须落在记忆页里
+    lib_page = html[html.index('id="page-library"'):html.index('id="page-admin"')]
+    for eid in ('id="viewbar"', 'id="kbody"'):
+        assert eid in lib_page, f"{eid} 不在记忆页里（视图没并进来）"
+    # 且只能出现一次（重复 id 会让 getElementById 拿到错的那个）
+    assert html.count('id="viewbar"') == 1, "viewbar 重复定义"
+    assert html.count('id="kbody"') == 1, "kbody 重复定义"
+
+
+def test_admin_page_has_four_blocks() -> None:
+    """管理页四块：备份与恢复 / 接入 / 空间 / 指令。
+
+    四块都必须在同一个页面容器里 —— 用户找"备份"不该先在设置页翻半天。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    html = (root / "dashboard.py").read_text(encoding="utf-8")
+    admin = html[html.index('id="page-admin"'):]
+
+    for eid in ('id="adm-backup"', 'id="adm-access"',
+                'id="ws-body"', 'id="adm-instr"'):
+        assert eid in admin, f"管理页缺 {eid}"
+
+
+def test_restore_guards_against_path_traversal() -> None:
+    """恢复接口**只能**读 exports 目录下的 bundle。
+
+    ⚠️ 这类接口最经典的洞：前端传来的名字直接拼路径 →
+    ``../../`` 就能让服务端读走任意目录。所以必须在拼完路径后
+    做包含校验（resolve 之后比前缀），而不是只检查"文件存在"。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    src = (root / "dashboard.py").read_text(encoding="utf-8")
+    seg = src[src.index("async def backup_restore("):]
+    seg = seg[:seg.index("async def pin_status(") if "async def pin_status(" in seg else 3000]
+
+    assert "resolve()" in seg, "没有 resolve 后比对（前缀校验形同虚设）"
+    assert "startswith(str(base))" in seg, "缺包含校验 —— 路径能越出备份目录"
