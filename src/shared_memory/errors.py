@@ -26,6 +26,27 @@ class ErrorCode(str, Enum):
     STORAGE_ERROR = "STORAGE_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
+    # ── v2（F-2）：把六类反复出现、调用方必须分支处理的失败单独立码 ──
+    #
+    # 为什么不用 INVALID_ARGUMENT/FORBIDDEN 凑：客户端做自动重试与做
+    # "提示用户改参数"是两条完全不同的路径，混在一个码里只能靠匹配
+    # 中文文案 —— 文案一改，客户端就瞎了。
+
+    #: 记忆类型不在六型枚举内（S-1.5）。
+    INVALID_TYPE = "INVALID_TYPE"
+    #: 档位越权：条目的 share / 会话 visibility 不允许这个身份看或改（S-10）。
+    #: 与 FORBIDDEN 分开 —— FORBIDDEN 是"你没登录/凭据不对"，
+    #: 这个是"你登录了，但这条不在你有权的档位里"。
+    SCOPE_DENIED = "SCOPE_DENIED"
+    #: 会话未开始就调了需要会话上下文的操作（S-2 生命周期）。
+    SESSION_NOT_STARTED = "SESSION_NOT_STARTED"
+    #: PIN 连续输错进入锁定期（S-6.1）。带 Retry-After。
+    PIN_LOCKED = "PIN_LOCKED"
+    #: 主密钥已轮换，手上的旧密钥过了宽限期（S-6.3）。
+    KEY_ROTATED = "KEY_ROTATED"
+    #: 破坏性/治理动作缺少显式确认（红线：治理只建议、不自动执行）。
+    GOV_CONFIRM_REQUIRED = "GOV_CONFIRM_REQUIRED"
+
 
 class ToolError(Exception):
     """可安全回传给 agent 的工具错误。"""

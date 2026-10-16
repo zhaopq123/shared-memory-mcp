@@ -622,7 +622,7 @@ async def test_tools_return_envelope_not_exception(hub: TenantHub) -> None:
     assert r["ok"] is False and r["code"] == "NOT_FOUND"
 
     r2 = await tools.memory_delete("bob", "whatever")  # 未确认
-    assert r2["ok"] is False and r2["code"] == "INVALID_ARGUMENT"
+    assert r2["ok"] is False and r2["code"] == "GOV_CONFIRM_REQUIRED"
 
 
 async def test_tools_write_search_export_roundtrip(hub: TenantHub, tmp_path: Path) -> None:

@@ -228,7 +228,7 @@ class TenantTools:
             tasks = _session.active_tasks(self.hub.home, user_name)
             if not tasks:
                 raise ToolError(
-                    ErrorCode.INVALID_ARGUMENT,
+                    ErrorCode.SESSION_NOT_STARTED,
                     "scope=task 需要先开一个会话",
                     hint="先调 memory_session_start(task=...) 再写过程态记忆",
                 )
@@ -369,7 +369,7 @@ class TenantTools:
             entry = _session.get(self.hub.home, user_name, t)
             if entry is None:
                 raise ToolError(
-                    ErrorCode.NOT_FOUND,
+                    ErrorCode.SESSION_NOT_STARTED,
                     f"没有这个会话：{t}",
                     hint="先 memory_session_start(task=...)",
                 )
@@ -679,7 +679,7 @@ class TenantTools:
         """
         if not confirm:
             return ToolError(
-                ErrorCode.INVALID_ARGUMENT,
+                ErrorCode.GOV_CONFIRM_REQUIRED,
                 f"确认要删除「{ident}」吗？确认后请带 confirm=True 再调一次",
                 hint="这是软删除：会移入 .trash 保留，可在面板的回收站页恢复",
             ).to_dict()

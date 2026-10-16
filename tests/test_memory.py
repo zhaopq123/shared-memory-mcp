@@ -1324,7 +1324,8 @@ def test_put_explicit_type_and_scope_land_in_frontmatter(vault: Vault) -> None:
 def test_put_rejects_unknown_type(vault: Vault) -> None:
     with pytest.raises(ToolError) as ei:
         vault.put(title="坏类型", body="", extra={"type": "decision"})
-    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+    # F-2：类型非法独立成码（客户端据此提示"改类型"，而不是泛泛的"参数错了"）
+    assert ei.value.code == ErrorCode.INVALID_TYPE
 
 
 def test_put_rejects_bad_scope(vault: Vault) -> None:

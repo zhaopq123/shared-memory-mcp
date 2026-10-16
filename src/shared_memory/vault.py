@@ -122,7 +122,7 @@ def validate_v2_fields(extra: dict[str, Any]) -> None:
     t = str(extra.get("type") or "").strip()
     if t and not valid_type(t):
         raise ToolError(
-            ErrorCode.INVALID_ARGUMENT,
+            ErrorCode.INVALID_TYPE,
             f"未知的记忆类型：{t}",
             hint="合法类型（六型）：" + "、".join(NOTE_TYPES),
         )

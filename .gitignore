@@ -2,6 +2,11 @@
 venv/
 .venv/
 env/
+# 本地启动配置（F-6）：里面只该有路径与开关，但**绝不能进仓库** ——
+# 谁把 SHARED_MEMORY_TOKEN 填进去，谁就把钥匙推到了公开仓库。
+.env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 *.egg-info/

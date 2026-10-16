@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -38,6 +39,13 @@ from typing import Any
 from .auth import COOKIE_NAME, Auth, Token
 from .config import INSTRUCTIONS_CONTRACT
 from .errors import ErrorCode, ToolError
+from .request_ctx import (
+    current_request_id,
+    new_request_id,
+    require_user,
+    require_write_scope,
+    set_identity,
+)
 from .tenancy import TenantHub, default_home
 from .tools_tenant import TenantTools
 
@@ -46,6 +54,37 @@ logger = logging.getLogger("shared_memory.http")
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8200
 MCP_PATH = "/mcp"
+
+
+# ══════════════════════ 结构化日志（F-3）══════════════════
+#
+# 一次请求会打多行日志（限速警告 → 未授权 → 工具内部失败），
+# 没有同一个请求 ID 串起来，排查时只能靠时间戳猜"这几行是不是一回事"。
+
+#: 日志格式里固定带 `rid=`；未处于请求上下文时打 `rid=-`。
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s rid=%(request_id)s | %(message)s"
+
+
+class RequestIdFilter(logging.Filter):
+    """把当前请求 ID 注入每条日志记录。
+
+    ⚠️ 挂在 **handler** 上而不是 logger 上：logger 的 filter 只作用于直接
+    发给它的事件，子 logger（uvicorn、shared_memory.vault） propagate 上来的
+    记录会绕过 —— 那正是最需要 rid 的那几行。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = current_request_id() or "-"
+        return True
+
+
+def install_request_id_logging() -> None:
+    """给根 logger 的每个 handler 装上请求 ID 过滤器（幂等）。"""
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if not any(isinstance(f, RequestIdFilter) for f in handler.filters):
+            handler.addFilter(RequestIdFilter())
+
 
 
 # ══════════════════════ 鉴权构造 ══════════════════════
@@ -235,8 +274,6 @@ def build_app(hub: TenantHub) -> Any:
         raise SystemExit(
             f"缺少 fastmcp。请安装：pip install fastmcp uvicorn\n原始错误：{exc}"
         ) from exc
-
-    from .request_ctx import require_user, require_write_scope
 
     t = TenantTools(hub)
     mcp = FastMCP(
@@ -695,8 +732,6 @@ def _wrap_auth(app: Any, auth: Auth) -> Any:
     from starlette.responses import JSONResponse, RedirectResponse
     from urllib.parse import parse_qs
 
-    from .request_ctx import set_identity
-
     #: 不需要鉴权的路径。
     #:
     #: ━━━ 为什么这些必须豁免（实测踩出的死锁）━━━
@@ -859,11 +894,15 @@ def _wrap_auth(app: Any, auth: Auth) -> Any:
 
         user = ""
         token_scope = ""
+        #: 本次请求出示的凭据明文。**只为判"是不是刚轮换掉的旧密钥"而留**，
+        #: 绝不写进日志、绝不往下传（F-3 的"不打印 token/PIN"同样约束这条路径）。
+        presented = ""
 
         # ① Bearer
         authz = headers.get("authorization", "")
         if authz.lower().startswith("bearer "):
-            user, token_scope = auth.resolve(authz[7:].strip())
+            presented = authz[7:].strip()
+            user, token_scope = auth.resolve(presented)
 
         # ② Cookie
         if not user:
@@ -878,11 +917,24 @@ def _wrap_auth(app: Any, auth: Auth) -> Any:
 
         if not user:
             auth.note_failure(source)
-            logger.warning("未授权: %s %s（来源 %s）", method, path, source)
-            resp = JSONResponse(
+            # F-2：把"密钥被轮换掉了"从"凭据无效"里分出来。
+            # 不分的话，主人刚点完轮换、agent 全掉线，日志只写"未授权"，
+            # 排查方向会跑偏到"是不是我 token 抄错了"。
+            rotated_out = bool(presented) and auth.is_rotated_out(presented)
+            logger.warning("未授权: %s %s（来源 %s，%s）",
+                           method, path, source,
+                           "旧密钥已过宽限期" if rotated_out else "无有效凭据")
+            body = (
+                {"ok": False, "error": "key_rotated", "code": "KEY_ROTATED",
+                 "message": "这把密钥已被轮换，宽限期已过。"
+                            "请到面板「管理 → 接入」取当前主密钥"}
+                if rotated_out else
                 {"ok": False, "error": "unauthorized",
                  "message": "缺少或无效的凭据。用 Authorization: Bearer <token> "
-                            "访问；浏览器请走面板登录。"},
+                            "访问；浏览器请走面板登录。"}
+            )
+            resp = JSONResponse(
+                body,
                 status_code=401,
                 headers={"WWW-Authenticate": 'Bearer realm="shared-memory"'},
             )
@@ -910,7 +962,37 @@ def _wrap_auth(app: Any, auth: Auth) -> Any:
         set_identity(user, token_scope, source)
         await app(scope, receive, send)
 
-    return guarded
+    async def logged(scope: dict, receive: Any, send: Any) -> None:
+        """F-3：每个 HTTP 请求一个请求 ID + 一行访问日志。
+
+        为什么包在鉴权**外面**而不是里面：里面那条路径有 6 个出口
+        （豁免放行 / 票据兑换 / 限速 429 / 未授权 401 / scope 403 / 正常放行），
+        包在里面就得逐个出口补日志，漏一个就是"这次请求没留痕"。
+
+        ⚠️ 只打 ``scope["path"]``，**不打 query_string** —— 一次性登录票据
+        就写在 ``?login=<ticket>`` 里，打进日志等于把凭据落进明文文件。
+        """
+        if scope.get("type") != "http":
+            await guarded(scope, receive, send)
+            return
+
+        new_request_id()
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+        seen = {"status": 0}
+
+        async def send_with_status(message: dict) -> None:
+            if message.get("type") == "http.response.start" and not seen["status"]:
+                seen["status"] = int(message.get("status", 0) or 0)
+            await send(message)
+
+        try:
+            await guarded(scope, receive, send_with_status)
+        finally:
+            # request_id 由 RequestIdFilter 注入到这一行（见 install_request_id_logging）
+            logger.info("请求完成 %s %s → %s", method, path, seen["status"] or "-")
+
+    return logged
 
 
 # ══════════════════════ ASGI 组装 ══════════════════════
@@ -954,6 +1036,37 @@ def _normalize_absolute_form(scope: dict) -> None:
         scope["query_string"] = parts.query.encode("utf-8")
 
 
+def shutdown_drain_timeout(env: dict[str, str] | None = None) -> float:
+    """停机排空写队列的预算秒数（F-5）。默认 10，与 uvicorn 的
+    ``timeout_graceful_shutdown`` 同量级 —— 排空必须**先于**进程退出完成，
+    比 uvicorn 的等待更久没意义（它只会强制 cancel）。"""
+    raw = (env or os.environ).get("SHARED_MEMORY_SHUTDOWN_DRAIN_TIMEOUT", "10")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("SHARED_MEMORY_SHUTDOWN_DRAIN_TIMEOUT=%r 非法，按 10 秒", raw)
+        return 10.0
+
+
+async def drain_hub_on_shutdown(hub: TenantHub, *, budget: float | None = None) -> bool:
+    """停机前排空各库写队列（F-5）。返回是否**在预算内**排干净。
+
+    ``hub.close()`` 逐个 ``service.stop()``：补一次防抖提交 + 毒丸停写者循环。
+    排空失败绝不能拦住停机 —— 文件已落盘，卡住不退比少一条 git 记录严重得多
+    （与 ``service.stop`` 里的同一取舍）。
+    """
+    budget = shutdown_drain_timeout() if budget is None else budget
+    try:
+        await asyncio.wait_for(hub.close(), timeout=budget)
+        logger.info("停机排空完成（预算 %.1fs）", budget)
+        return True
+    except asyncio.TimeoutError:
+        logger.warning("写队列未在 %.1fs 内排空，放弃等待", budget)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("停机排空失败: %s", exc)
+    return False
+
+
 def build_asgi(hub: TenantHub, auth: Auth) -> Any:
     """把面板 + MCP 组装成一个 ASGI 应用。
 
@@ -972,7 +1085,19 @@ def build_asgi(hub: TenantHub, auth: Auth) -> Any:
         # _normalize_absolute_form）—— 这里拿到的 scope["path"] 一定是路径。
         # ① lifespan → 交给 MCP（它需要启动 session manager）
         if scope.get("type") == "lifespan":
-            await mcp_app(scope, receive, send)
+            async def send_and_drain(message: dict) -> None:
+                """F-5：MCP 说完"我关完了"之后，把各库写队列排空再交回控制权。
+
+                uvicorn 收到 SIGTERM 走的是标准 lifespan shutdown，所以钩在
+                这里 = **不需要自己装信号处理器**（自己装会把 uvicorn
+                排空在途请求的逻辑顶掉）。这条 send 返回后进程才允许退出，
+                "kill -TERM 后无半截文件"因此成立。
+                """
+                await send(message)
+                if message.get("type") == "lifespan.shutdown.complete":
+                    await drain_hub_on_shutdown(hub)
+
+            await mcp_app(scope, receive, send_and_drain)
             return
         # ② MCP 端点（含带斜杠变体，容错客户端写法差异）
         if scope.get("type") == "http" and scope.get("path") in mcp_paths:
@@ -999,11 +1124,29 @@ def main() -> None:
     """
     import uvicorn
 
+    # 非法 LOG_LEVEL 会让 basicConfig 自己抛 ValueError —— 那样连"哪个变量错了"
+    # 都说不出来。先兜成 INFO，真正的拒绝交给下面的启动校验（它会点名变量）。
+    _level = (os.environ.get("LOG_LEVEL") or "INFO").strip().upper()
     logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        level=getattr(logging, _level, logging.INFO),
+        format=LOG_FORMAT,
         stream=sys.stdout,
     )
+    install_request_id_logging()
+
+    # ── F-1 启动配置校验：畸形值快速失败，别等运行中炸 ──
+    from .config import validate_startup_env
+
+    cfg_errors, cfg_warnings = validate_startup_env()
+    for w in cfg_warnings:
+        logger.warning("[配置提醒] %s", w)
+    if cfg_errors:
+        for e in cfg_errors:
+            logger.error("[配置错误] %s", e)
+        raise SystemExit(
+            f"\n[拒绝启动] 启动配置校验未通过 {len(cfg_errors)} 项"
+            "（上面每条都写了变量名，改掉再启动）\n"
+        )
 
     host = os.environ.get("HOST", DEFAULT_HOST)
     port = int(os.environ.get("PORT", DEFAULT_PORT))

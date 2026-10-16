@@ -548,7 +548,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             locked, wait = auth.pin_locked()
             if locked:
                 return JSONResponse(
-                    {"ok": False, "error": "pin_locked",
+                    {"ok": False, "error": "pin_locked", "code": "PIN_LOCKED",
                      "message": f"PIN 连续输错，已锁定，请 {int(wait)} 秒后再试"},
                     status_code=429, headers={"Retry-After": str(int(wait))},
                 )

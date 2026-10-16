@@ -595,6 +595,9 @@ class TenantHub:
             "libs": len(libs),
             "notes": notes,
             "unreadable": unreadable,
+            # F-4：探针只要一个数就能判"积压了没有"，不必钻进嵌套对象。
+            # 与 queue.pending 同一个来源（不在这里二次计算，避免两处真相）。
+            "queue_depth": pending,
             "queue": {
                 "pending": pending,
                 "outstanding": outstanding,

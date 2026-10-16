@@ -813,6 +813,24 @@ class Auth:
             return hmac.compare_digest(prev_hash, got)
         return False
 
+    def is_rotated_out(self, candidate: str) -> bool:
+        """这把密钥是不是**刚轮换掉的旧密钥**（宽限期已过）。
+
+        为什么要单独判：客户端拿到 401 时只有两种正确反应 ——
+        "密钥错了，去查配置"和"密钥被轮换掉了，去拿新的"。
+        不分开的的话，主人轮换完密钥，agent 只会报"未授权"，
+        排查方向直接跑偏到"是不是我 token 写错了"。
+        """
+        if not candidate:
+            return False
+        prev = (self._load_master().get("prev") or {})
+        prev_hash = str(prev.get("hash", "") or "")
+        if not prev_hash:
+            return False
+        if float(prev.get("until", 0) or 0) > time.time():
+            return False        # 还在宽限期内，verify_master 会放行
+        return hmac.compare_digest(prev_hash, self._hash_secret(candidate))
+
     def rotate_master_key(self) -> str:
         """轮换主密钥：返回新密钥明文；旧密钥在**宽限期**内仍可用。
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +190,119 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 #: 接入码默认端口（与 start-mcp.sh 的 PORT 默认值一致）。
 DEFAULT_PORT = 8200
+
+
+# ══════════════════ 启动期配置校验（F-1）══════════════════
+#
+# ━━━ 为什么"必填"清单是空的 ━━━
+#
+# 本产品每个变量都有可用默认值（见模块 docstring：服务不需要先初始化就能跑）。
+# 所以 F-1 拦的不是"你没配"，而是**三类真会咬人的情况**：
+#   ① 畸形值 —— PORT=abc、LOG_LEVEL=vorbse、DEBOUNCE=-1，
+#      现在的下场是运行到一半抛 traceback，或**静默用默认值跑起来**（更坏）。
+#   ② 配了路径但文件不在 —— SHARED_MEMORY_TOKEN_FILE 指了个不存在的文件，
+#      旧行为只 logger.error 然后当"一把 token 都没有"，
+#      于是鉴权判定整个跑偏（实测最坑的静默降级）。
+#   ③ 拼错变量名 —— SHARED_MEMORY_TOKN=... 看起来配了，实际没生效。
+#
+# 错误（errors）→ 拒绝启动；提醒（warnings）→ 照常启动但说清楚。
+
+#: 已知的环境变量白名单（拼写探测器用；值含义见 ``.env.example``）。
+#: 最后两个是**客户端脚本**（e2e / 走查）读的，服务本身不读 ——
+#: 列进来是为了同机跑脚本时不误报"未识别的变量"。
+KNOWN_ENV_VARS: frozenset[str] = frozenset({
+    "HOST", "PORT", "LOG_LEVEL",
+    "SHARED_MEMORY_HOME", "SHARED_MEMORY_ROOT",
+    "SHARED_MEMORY_TOKEN", "SHARED_MEMORY_TOKEN_FILE",
+    "SHARED_MEMORY_AUTOCOMMIT", "SHARED_MEMORY_COMMIT_DEBOUNCE",
+    "SHARED_MEMORY_ALLOW_INSECURE", "SHARED_MEMORY_SHUTDOWN_DRAIN_TIMEOUT",
+    "SHARED_MEMORY_E2E_URL", "SHARED_MEMORY_E2E_TOKEN",
+})
+
+_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+#: 会被本服务读取的变量前缀（用于识别拼错的变量名）。
+_OWN_PREFIXES = ("SHARED_MEMORY_",)
+
+
+def _int_env(env: dict[str, str], name: str, errors: list[str],
+             *, minimum: int = 0) -> None:
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return
+    try:
+        if int(raw) < minimum:
+            raise ValueError(raw)
+    except ValueError:
+        errors.append(f"{name}={raw!r} 不是 ≥{minimum} 的整数")
+
+
+def validate_startup_env(
+    env: dict[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """校验启动配置，返回 ``(errors, warnings)``。
+
+    ``errors`` 非空时调用方**必须拒绝启动**（快速失败，退出码非 0），
+    并把每一条缺/错的变量名打进日志 —— 运维看日志第一行就知道改哪个。
+    """
+    e = dict(os.environ if env is None else env)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    host = (e.get("HOST") or "").strip()
+    if "HOST" in e and not host:
+        errors.append("HOST 被显式设为空 —— 绑所有地址请写 0.0.0.0，"
+                      "只绑本机写 127.0.0.1")
+
+    raw_port = (e.get("PORT") or "").strip()
+    if raw_port:
+        try:
+            port = int(raw_port)
+            if not 1 <= port <= 65535:
+                raise ValueError(raw_port)
+        except ValueError:
+            errors.append(f"PORT={raw_port!r} 不是 1~65535 的整数")
+
+    raw_level = (e.get("LOG_LEVEL") or "").strip()
+    if raw_level and raw_level.upper() not in _LOG_LEVELS:
+        errors.append(f"LOG_LEVEL={raw_level!r} 非法，"
+                      f"只认 {'、'.join(sorted(_LOG_LEVELS))}")
+
+    _int_env(e, "SHARED_MEMORY_COMMIT_DEBOUNCE", errors)
+    auto = (e.get("SHARED_MEMORY_AUTOCOMMIT") or "").strip()
+    if auto and auto.lower() not in ("0", "1", "true", "false"):
+        errors.append(f"SHARED_MEMORY_AUTOCOMMIT={auto!r} 只认 0/1")
+
+    # ② 配了 token 文件却读不到 = 静默降级成无凭据启动，必须硬拦。
+    token_file = (e.get("SHARED_MEMORY_TOKEN_FILE") or "").strip()
+    if token_file and not Path(token_file).is_file():
+        errors.append(f"SHARED_MEMORY_TOKEN_FILE={token_file!r} 不存在或不是文件"
+                      " —— 服务不会带着「没有凭据」的状态启动，"
+                      "要么把文件放好，要么删掉这一行")
+
+    for name in ("SHARED_MEMORY_HOME", "SHARED_MEMORY_ROOT"):
+        raw = (e.get(name) or "").strip()
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            warnings.append(f"{name}={raw!r} 是相对路径，会随启动目录漂移"
+                            "（ systemd/runsv 的工作目录未必是你想的那个）")
+        if p.exists() and not p.is_dir():
+            errors.append(f"{name}={raw!r} 已存在但不是目录，记忆库无处可建")
+
+    # ③ 拼写探测器：前缀是我们的、名字不在白名单 → 大概率打错字了。
+    for key in e:
+        if key.startswith(_OWN_PREFIXES) and key not in KNOWN_ENV_VARS:
+            warnings.append(f"未识别的变量 {key}（本服务不读取，"
+                            "拼错的配置变量比没配更危险 —— 它看起来像生效了）")
+
+    if (e.get("SHARED_MEMORY_TOKEN") or "").strip():
+        warnings.append("SHARED_MEMORY_TOKEN 写在环境变量里会出现在 "
+                        "`ps e`、容器 inspect 与崩溃转储中，建议改用 "
+                        "SHARED_MEMORY_TOKEN_FILE")
+
+    return errors, warnings
+
 
 
 def parse_connect_uri(uri: str) -> dict[str, Any]:

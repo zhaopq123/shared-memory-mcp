@@ -331,7 +331,8 @@ async def test_s2_write_task_scope_without_session_errors(
         "admin", title="无会话过程态", body="x", lib="user-admin", scope="task",
     )
     assert r["ok"] is False
-    assert r["code"] == "INVALID_ARGUMENT"
+    # F-2：会话没开始独立成码（客户端据此先去 session_start）
+    assert r["code"] == "SESSION_NOT_STARTED"
 
 
 async def test_s2_bob_cannot_reach_admin_task_notes(

@@ -38,6 +38,15 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_HERE / "src"))
 
+# Windows 控制台默认 cp936，吐不出 ✓ 与 ⚠️ —— 直接 UnicodeEncodeError 崩掉，
+# 用户看到的是"接入失败"而不是成功。输出编码由脚本定，不由调用方 locale 定。
+# 被重定向时 stdout 未必是 TextIOWrapper（pytest 捕获就是），拿不到就跳过。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from shared_memory.config import parse_connect_uri  # noqa: E402
 from shared_memory.errors import ToolError  # noqa: E402
 

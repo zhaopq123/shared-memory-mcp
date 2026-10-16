@@ -22,6 +22,7 @@ contextvar 是协程安全的（每个请求一个上下文），
 
 from __future__ import annotations
 
+import uuid
 from contextvars import ContextVar
 
 #: 当前请求的身份。空串 = 未鉴权（工具层必须拒绝）。
@@ -32,6 +33,21 @@ _current_scope: ContextVar[str] = ContextVar("shm_current_scope", default="")
 
 #: 请求来源（IP），用于日志与限速
 _current_source: ContextVar[str] = ContextVar("shm_current_source", default="")
+
+#: 请求 ID（F-3）。一次请求往往打三四行日志（限速警告 + 未授权 + 工具失败），
+#: 没有同一个 ID 串起来，看日志的人分不清哪几行属于同一次调用。
+_current_request_id: ContextVar[str] = ContextVar("shm_request_id", default="")
+
+
+def new_request_id() -> str:
+    """给本次请求分配一个短 ID（8 位十六进制）并写入上下文。"""
+    rid = uuid.uuid4().hex[:8]
+    _current_request_id.set(rid)
+    return rid
+
+
+def current_request_id() -> str:
+    return _current_request_id.get()
 
 
 def set_identity(user: str, scope: str = "", source: str = "") -> None:
