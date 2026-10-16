@@ -324,3 +324,27 @@ def test_static_text_uses_attributes_not_rebuild() -> None:
     assert "innerHTML =" not in body.replace("el.innerHTML = s", ""), (
         "applyStaticText 里似乎在重建 DOM（会丢事件监听器）"
     )
+
+def test_html_data_i18n_keys_exist_in_packs() -> None:
+    """⚠️ HTML 里的 ``data-i18n`` 键必须存在于两个语言包。
+
+    ━━━ 为什么补这条（真实事故）━━━
+
+    2026-10-16：改导航键名时只改了语言包，``dashboard.py`` 里的
+    ``data-i18n="nav.knowledge"`` 没跟上 —— 界面上那个标签会显示成
+    **裸键名**。而当时的 i18n 测试只扫 ``panel.js``，**对 HTML 是盲的**，
+    全绿放行。
+
+    这类 bug 的特征就是静默：没人会去点遍每个标签检查文案。
+    所以把 dashboard.py 的 HTML 也纳入扫描。
+    """
+    import re
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    html = (root / "dashboard.py").read_text(encoding="utf-8")
+    zh, en = _extract_pack("ZH"), _extract_pack("EN")
+
+    keys = set(re.findall(r'data-i18n="([^"]+)"', html))
+    assert keys, "没扫到任何 data-i18n（选择器写错了？那这条测试就是假绿）"
+
+    missing = sorted(k for k in keys if k not in zh or k not in en)
+    assert not missing, f"HTML 用了语言包里没有的键（界面会显示裸键名）：{missing}"
