@@ -801,6 +801,19 @@ def _wrap_auth(app: Any, auth: Auth) -> Any:
             await app(scope, receive, send)
             return
 
+        # ── ②a 鉴权模式元数据：**仅** GET /api/auth/pin（v2 · S-7.1）──
+        #
+        # 登录屏必须知道"这个面板要 PIN 还是账号密码"才能渲染对应表单；
+        # 它此刻还没有任何凭据，读不到就会退化成"两种都显示"。
+        #
+        # ⚠️ 只放行 **GET**：同一路径的 POST 是**设置 PIN**（要 admin）——
+        # 按路径整条豁免会把改 PIN 的能力一起放开，那是权限漏洞。
+        # 返回体也只有 enabled/locked/wait/panel_open 四个布尔与计数，
+        # 不含任何记忆内容或用户信息。
+        if method == "GET" and path == "/api/auth/pin":
+            await app(scope, receive, send)
+            return
+
         # ── ②b 未启用鉴权（loopback 绑定）时，/health 也放行 ──
         #
         # 实测踩过：绑 127.0.0.1 时日志说"未强制鉴权"，但 /health 仍 401 ——

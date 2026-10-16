@@ -333,7 +333,10 @@ def test_js_uses_only_existing_element_ids() -> None:
         "ac-cur", "ac-new", "ac-new2", "ac-change", "ac-logout", "ac-msg",
         "cp-link", "cp-md", "relwrap", "dot", "root", "q",
         # P1/P2/P4（2026-10-15）：会话过期横幅、库下拉、接入卡复制按钮
-        "sess-banner", "sess-relogin", "lib-select", "access-copy", "nt-copy",
+        "sess-banner", "sess-relogin", "lib-select", "access-copy",
+        "access-gen", "access-gen-msg", "access-snippet", "nt-copy",
+        # v2 S-7.1：PIN 六盒登录屏（动态构建，不在静态 HTML 里）
+        "pinwrap", "pin-wait", "login-pw-link",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -422,4 +425,51 @@ def test_share_url_contains_no_credentials() -> None:
     assert "token" not in expr.lower(), (
         f"分享链接里带了凭据：{expr.strip()[:120]} —— "
         "那等于把钥匙贴在门牌上"
+    )
+
+# ── v2 S-7.1：PIN 登录屏 + 鉴权模式探测 ──
+
+
+def test_pin_login_screen_contract() -> None:
+    """PIN 六盒登录屏必须齐全（v4 原型照做）。
+
+    钉住四件事，缺一件用户就进不去面板：
+      · ``#pinwrap`` 六个盒子
+      · ``#login-err`` 错误位（含锁定剩余秒数的位置 ``#pin-wait``）
+      · 探测鉴权模式的 ``GET /api/auth/pin`` 调用
+      · 降级入口 ``#login-pw-link``（PIN 忘了还能用账号密码）
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+    css = (root / "static" / "panel.css").read_text(encoding="utf-8")
+
+    assert "function renderPinLogin(" in js, "没有 PIN 登录屏函数"
+    assert "id=\"pinwrap\"" in js, "缺 #pinwrap 容器"
+    assert "class=\"pinbox\"" in js, "缺 PIN 盒子"
+    assert "login-pw-link" in js, "缺降级入口（PIN 忘了要用账号密码）"
+    assert "pin-wait" in js, "缺锁定剩余秒数显示位"
+    assert "'/api/auth/pin'" in js, "登录屏没探测鉴权模式，会显示错表单"
+    assert "#pinwrap .pinbox" in css, "PIN 盒子没有样式（会挤成一坨）"
+    # 6 个盒子
+    assert "length: n" in js.replace(" ", " "), "盒子数量不是按 n 生成"
+
+
+def test_pin_mode_probe_is_get_only() -> None:
+    """``GET /api/auth/pin`` 免鉴权（登录屏要它），但 **POST 不行**。
+
+    ⚠️ 这是本片最容易写错的一处：按**路径**整条豁免会把
+    "设置 PIN"（POST，要 admin）一起放开 —— 那就成了
+    "不用登录就能改 PIN"，是把门锁换个方向装。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    src = (root / "http_server.py").read_text(encoding="utf-8")
+
+    assert 'method == "GET" and path == "/api/auth/pin"' in src, (
+        "缺少「仅 GET」的窄豁免 —— 很可能被写成整条路径豁免"
+    )
+    # 不能出现在按路径豁免的集合里
+    start = src.index("AUTH_EXEMPT_PATHS = {")
+    end = src.index("}", start)
+    assert "/api/auth/pin" not in src[start:end], (
+        "/api/auth/pin 进了路径豁免集合 —— POST 会被一起放开"
     )

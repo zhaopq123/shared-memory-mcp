@@ -536,10 +536,27 @@ input#q:focus{border-color:var(--brass-dim);
   box-shadow:var(--shadow);
   animation:rise .24s cubic-bezier(.2,.7,.3,1) both;
 }
+/* PIN 六盒（v2 · S-7.1）。
+   盒子等宽且整体居中 —— 输错时"第几个盒子空了"一眼能看出来。 */
+#pinwrap{
+  display:flex;gap:8px;justify-content:center;margin:4px 0 10px;
+}
+#pinwrap .pinbox{
+  width:44px;height:54px;
+  text-align:center;font-size:22px;font-weight:600;
+  letter-spacing:.06em;
+  border-radius:10px;
+  font-family:var(--mono,ui-monospace,monospace);
+}
+#pinwrap .pinbox:focus{
+  outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent);
+}
+#pin-wait{color:var(--warn,#b45309);margin-top:2px}
+
 #login-mask h2{
   font-family:var(--serif);font-size:20px;font-weight:600;
-  margin:0 0 8px;text-align:center;letter-spacing:-.015em;
-}
+  margin:0 0 8px;text-align:center;letter-spacing:-.015em;}
 /* ⚠️ 遮罩内的输入框要单独给样式：JS 里 #login-pw / #login-token 是
    `type=password`，**不在** `.field input[type=text]` 的覆盖范围内。
    漏掉这条的形态：用户名框是设计好的样式，密码框是浏览器原生白框，

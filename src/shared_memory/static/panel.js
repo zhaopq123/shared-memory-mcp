@@ -197,7 +197,143 @@ function showSessionBanner(){
     () => location.replace(location.pathname);
 }
 
+/** 登录入口：先问服务端"要哪种凭据"，再渲染对应表单。
+ *
+ *  ━━━ 为什么要先问 ━━━
+ *
+ *  PIN 与账号密码是两套完全不同的表单，猜错会让用户看到不相干的东西。
+ *  `GET /api/auth/pin` 是**免鉴权**的极窄接口（就是为登录屏准备的）：
+ *  只回 enabled / locked / wait_seconds / panel_open 四个字段，不含任何数据。
+ */
 function showLogin(msg){
+  if (document.getElementById('login-mask')) return;
+  fetch('/api/auth/pin', {headers: {'Accept': 'application/json'}})
+    .then(r => r.json())
+    .then(info => {
+      const d = info || {};
+      // 服务端说"这个面板不用登录"（非公开绑定 + 未设 PIN）→ 直接重载进面板
+      if (d.panel_open){ location.replace(location.pathname); return; }
+      if (d.enabled){ renderPinLogin(d, msg); } else { renderFormLogin(msg); }
+    })
+    .catch(() => renderFormLogin(msg));   // 探不到就回到最保守的账号密码
+}
+
+/** PIN 登录屏：**6 个数字盒**。
+ *
+ *  每个细节都是有意的：
+ *   · 输入即前进（不用点下一个盒子）；退格回上一个
+ *   · 填满 6 位**自动提交**（少一次点击）
+ *   · **回车提交当前长度** —— PIN 允许 4~8 位，6 位只是最常见形态；
+ *     硬等 6 位会让设了 4 位 PIN 的人永远进不去
+ *   · 支持直接粘贴整串
+ *   · 锁定期把剩余秒数显示出来（干等会让人以为坏了）
+ */
+function renderPinLogin(info, msg){
+  if (document.getElementById('login-mask')) return;
+  const n = 6;
+  const boxes = Array.from({length: n}, () =>
+    '<input class="pinbox" type="password" inputmode="numeric" maxlength="1" ' +
+    'autocomplete="off" aria-label="PIN">').join('');
+  const mask = document.createElement('div');
+  mask.id = 'login-mask';
+  mask.innerHTML = `
+    <div class="loginbox">
+      <div class="seal" style="margin:0 auto 14px">记</div>
+      <h2>${t('login.title')}</h2>
+      <p class="sectip" style="text-align:center;margin-bottom:18px">
+        ${LANG === 'zh' ? '输入 PIN 进入面板' : 'Enter your PIN to unlock'}
+      </p>
+      <div id="login-err" class="errbox" style="display:none"></div>
+      <div id="pinwrap">${boxes}</div>
+      <p class="sectip" id="pin-wait" style="text-align:center;display:none"></p>
+      <button class="btn primary" id="login-btn" style="width:100%;margin-top:16px">
+        ${t('login.button')}
+      </button>
+      <p class="sectip" style="text-align:center;margin:14px 0 0;font-size:12px">
+        <a href="javascript:void 0" id="login-pw-link">${
+          LANG === 'zh' ? '用账号密码登录' : 'Use username & password'}</a>
+      </p>
+    </div>`;
+  document.body.appendChild(mask);
+
+  const els = [...mask.querySelectorAll('.pinbox')];
+  const btn = document.getElementById('login-btn');
+  const errBox = document.getElementById('login-err');
+  const waitEl = document.getElementById('pin-wait');
+  let busy = false;
+
+  if (msg){ errBox.style.display = ''; errBox.textContent = msg; }
+  if (info && info.locked){
+    errBox.style.display = '';
+    errBox.textContent = (LANG === 'zh' ? 'PIN 已锁定，请 ' : 'PIN locked, retry in ')
+      + (info.wait_seconds || 0) + (LANG === 'zh' ? ' 秒后再试' : 's');
+  }
+  els[0].focus();
+
+  const value = () => els.map(e => e.value).join('');
+  const clear = () => {
+    els.forEach(e => { e.value = ''; });
+    els[0].focus();
+  };
+
+  const submit = async () => {
+    const pin = value();
+    if (busy || pin.length < 4) return;
+    busy = true;
+    btn.disabled = true; btn.textContent = t('login.submitting');
+    const r = await apiPost('/api/auth/login', {pin});
+    btn.disabled = false; btn.textContent = t('login.button');
+    busy = false;
+    if (!r.ok){
+      errBox.style.display = '';
+      errBox.textContent = r.message || t('login.invalid');
+      clear();
+      if (r.error === 'pin_locked'){
+        waitEl.style.display = '';
+        waitEl.textContent = r.message || '';
+      }
+      return;
+    }
+    location.replace(r.login_url);
+  };
+
+  els.forEach((el, i) => {
+    el.oninput = () => {
+      el.value = el.value.replace(/\D/g, '').slice(0, 1);
+      if (el.value && i < n - 1) els[i + 1].focus();
+      if (value().length === n) submit();
+    };
+    el.onkeydown = (e) => {
+      if (e.key === 'Backspace' && !el.value && i > 0){
+        e.preventDefault();
+        els[i - 1].focus();
+        els[i - 1].value = '';
+      } else if (e.key === 'Enter'){
+        e.preventDefault();
+        submit();
+      }
+    };
+    el.onpaste = (e) => {
+      const txt = ((e.clipboardData || window.clipboardData || {})
+        .getData('text') || '').replace(/\D/g, '').slice(0, n);
+      if (!txt) return;
+      e.preventDefault();
+      els.forEach(x => { x.value = ''; });
+      [...txt].forEach((ch, k) => { els[k].value = ch; });
+      els[Math.min(txt.length, n - 1)].focus();
+      if (txt.length === n) submit();
+    };
+  });
+
+  btn.onclick = submit;
+  document.getElementById('login-pw-link').onclick = () => {
+    const m = document.getElementById('login-mask');
+    if (m) m.remove();
+    renderFormLogin();
+  };
+}
+
+function renderFormLogin(msg){
   if (document.getElementById('login-mask')) return;
   const mask = document.createElement('div');
   mask.id = 'login-mask';
@@ -1359,14 +1495,16 @@ async function loadSettings(){
       ? '任何机器上的任何 agent 都只认两行：<strong>服务地址 + token</strong>。不用搬数据、不用同步 —— 全平台只有服务端这一份数据。'
       : 'Any agent on any machine needs just two lines: service URL + token. Nothing to sync.'}</p>
     <div class="tocwrap">
-      <pre style="margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap">${
+      <pre id="access-snippet" style="margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap">${
         esc(accessSnippet())}</pre>
       <div class="saverow" style="margin-top:12px;padding-top:0;border-top:none">
+        <button class="btn primary" id="access-gen">生成 token 并填进配置</button>
         <button class="btn" id="access-copy">复制配置</button>
         <span class="sectip" style="margin:0;font-size:12px">${LANG === 'zh'
-          ? '最省事的路：在下面「凭据」里新建一条（label 写清哪台机器）—— <strong>签发成功后会直接给出含 token 的整段配置</strong>，一键复制、存成项目根的 <code>.mcp.json</code> 就完事。换机/离职就吊销那一条。'
-          : 'Easiest path: issue a token below — the full config snippet is shown right after issuing.'}</span>
+          ? '点「生成」当场签发一条新 token 并<strong>直接填进上面的 JSON</strong> —— 复制出去存成项目根的 <code>.mcp.json</code> 就能用，不用再去别处找 token。'
+          : 'Click Generate: a fresh token is issued and filled into the JSON above.'}</span>
       </div>
+      <div id="access-gen-msg" style="font-size:12.5px;margin-top:8px"></div>
     </div>
 
     ${r.instructions_is_default ? `
@@ -1480,8 +1618,43 @@ async function loadSettings(){
 
   document.getElementById('cfg-save').onclick = saveSettings;
   document.getElementById('cfg-reload').onclick = () => { loadSettings(); };
+  /* 「生成 token 并填进配置」—— 标准管理系统的「Generate API key」形态：
+     当场签发、当场填进 JSON、当场可复制。用户不需要去任何别的地方找 token。
+     （2026-10-15 用户实测原话："token你直接给他写在这里面就完事了呗
+     还非得让用户再找"） */
+  const gen = document.getElementById('access-gen');
+  if (gen) gen.onclick = async () => {
+    const pre = document.getElementById('access-snippet');
+    const gmsg = document.getElementById('access-gen-msg');
+    gen.disabled = true;
+    const oldLabel = gen.textContent;
+    gen.textContent = '签发中…';
+    const res = await apiPost('/api/auth/token/create', {
+      user: (STATE.me && STATE.me.user && STATE.me.user.name) || 'admin',
+      label: '面板接入 ' + new Date().toISOString().slice(0, 16).replace('T', ' '),
+      scope: 'readwrite',
+    });
+    gen.disabled = false;
+    gen.textContent = oldLabel;
+    if (!res.ok){
+      if (gmsg) gmsg.innerHTML =
+        `<span style="color:var(--rust)">${esc(res.message || '签发失败')}</span>`;
+      return;
+    }
+    const full = mcpSnippet(res.token);
+    if (pre) pre.textContent = full;
+    if (gmsg) gmsg.innerHTML = `<span style="color:var(--verdigris)">${LANG === 'zh'
+      ? '✓ 已签发并填入（readwrite，label「面板接入 …」）。token 明文只显示这一次，复制走即可。'
+      : '✓ Issued and filled in. The token is shown only this once.'}</span>`;
+    /* 下面的「凭据」列表同步刷新（新 token 要立刻可见、可吊销） */
+    if (typeof loadAdminTokens === 'function') loadAdminTokens();
+  };
+
   const accCopy = document.getElementById('access-copy');
-  if (accCopy) accCopy.onclick = () => copyText(accessSnippet(), accCopy);
+  if (accCopy) accCopy.onclick = () => {
+    const pre = document.getElementById('access-snippet');
+    copyText(pre ? pre.textContent : accessSnippet(), accCopy);
+  };
   if (isAdmin()) { loadAdminUsers(); loadAdminTokens(); }
   loadWorkspaces();
   bindAccount();
