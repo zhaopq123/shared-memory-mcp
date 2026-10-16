@@ -347,6 +347,8 @@ def test_js_uses_only_existing_element_ids() -> None:
         "instr-save", "instr-msg",
         # v2 S-7.2 收口：上下文条 / 生效域 chip / 会话卡
         "ctxbar", "scopechips", "sesscard",
+        # v2 S-7.4：治理抽屉
+        "gov-close",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -687,3 +689,67 @@ def test_panel_default_scope_is_long_term() -> None:
 
     allt = [n["title"] for n in _filter_by_scope(notes, "all")]
     assert len(allt) == 4, "考古模式要能看见全部"
+
+# ── v2 S-7.4 / S-7.6：治理抽屉 + 面板只读原则 ──
+
+
+def test_governance_drawer_contract() -> None:
+    """体检抽屉在位，且**只出报告**。
+
+    体检的四个指标 + 重复候选必须来自真数据（/api/governance），
+    不能是写死的演示数字 —— 演示数据和真实数据混在一起时，
+    用户没法判断"这个 0 是真的没有，还是没接上"。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    html = (root / "dashboard.py").read_text(encoding="utf-8")
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+
+    assert 'id="gov-btn"' in html and 'id="gov-drawer"' in html
+    assert "function openGovernance(" in js, "没有抽屉渲染函数"
+    assert "'/api/governance'" in js, "没接真实体检接口"
+    assert "_govBtn.onclick = () => openGovernance()" in js, "按钮没接线"
+    # 四个核心指标都要显示
+    for k in ("total", "growth_30d", "duplicate_rate", "low_reference_count"):
+        assert k in js, f"抽屉缺指标 {k}"
+
+
+def test_governance_module_has_no_delete_path() -> None:
+    """⚠️ 治理模块**不许有删除/改写路径**（红线，代码级确认）。
+
+    理由不是"暂时没写"：自动清理是在你没看着的时候跑的功能，
+    出错了也不会弹报错。所以治理只算账、列候选、给建议 ——
+    真要动由人或 agent 显式执行。
+
+    这条测试就是那道红线的守门人：以后谁往里加一句 unlink，
+    这里会立刻变红。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    src = (root / "governance.py").read_text(encoding="utf-8")
+    body = "\n".join(
+        l for l in src.split("\n") if not l.strip().startswith("#")
+    )
+
+    for bad in ("unlink(", "rmtree(", "os.remove(", "shutil.move(", "rename("):
+        assert bad not in body, f"governance.py 出现删除/移动路径：{bad}"
+    # 也不该反过来写库（那等于偷偷改内容）
+    for bad in ("vault.put", "vault.delete", "self.put(", ".write_note("):
+        assert bad not in body, f"governance.py 出现写库调用：{bad}"
+
+
+def test_panel_has_no_direct_memory_write_entry() -> None:
+    """面板是**阅览室**：不许有任何直写记忆的入口（v2 · S-7.6）。
+
+    这条不是洁癖：面板直写会绕过 write 队列、绕过校验、绕过审计，
+    等于在服务端开一个没有守卫的旁门。要改记忆就走 agent（MCP 工具面）。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+    html = (root / "dashboard.py").read_text(encoding="utf-8")
+
+    for bad in ("apiPost('/api/note'", 'apiPost("/api/note"',
+                "apiPost('/api/notes'", "apiPost('/api/remember'"):
+        assert bad not in js, f"面板出现直写入口：{bad}"
+    # /api/note 只允许是 GET（读全文）
+    assert 'Route("/api/note", note, methods=["GET"])' in html, (
+        "/api/note 不是只读路由 —— 面板可能被改成能写"
+    )

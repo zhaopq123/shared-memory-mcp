@@ -116,6 +116,7 @@ PANEL_HTML = """<!DOCTYPE html>
          必须有这个元素 —— 否则那个提示永远不显示（实测被契约测试抓到）。 -->
     <div class="st warn" id="st-bad" style="display:none"><b id="s-bad">–</b><span data-i18n="stat.readFail">读取失败</span></div>
     <div class="st ok"><b id="s-who">–</b><span id="s-role"></span></div>
+    <button class="btn" id="gov-btn" data-i18n="gov.btn">体检</button>
   </div>
 </header>
 
@@ -203,6 +204,9 @@ PANEL_HTML = """<!DOCTYPE html>
     </div>
   </div>
 </div>
+
+<!-- 治理抽屉（v2 · S-7.4）：体检报告 —— 只列候选与建议，不提供任何删除入口 -->
+<div id="gov-drawer" style="display:none"></div>
 
 <script src="panel.js?v=__PANEL_VER__"></script>
 </body>
@@ -658,6 +662,20 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         return JSONResponse(
             await TenantTools(hub).memory_import(user, str(bundle), target, "", on_conflict)
         )
+
+    async def governance_view(request: Any) -> Any:
+        """治理体检（v2 · S-11.5）—— **只出报告，不动任何数据**。
+
+        红线：这个接口以及它背后的 governance 模块里**没有删除路径**。
+        自动清理是最容易把人的东西弄丢的一类功能：它在你没看着的时候跑，
+        出错了也没有报错弹给你。所以治理只算账、列候选、给建议。
+        """
+        from . import governance as _gov
+
+        user = require_user()
+        notes = hub.list_notes(user, limit=2000).get("notes", [])
+        report = _gov.capacity_report(notes, _gov.load_refs(hub.home))
+        return JSONResponse({"ok": True, **report})
 
     # ────────── 上下文条 / 会话卡（v2 · S-7.2）──────────
 
@@ -1256,6 +1274,8 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         Route("/api/restore", backup_restore, methods=["POST"]),
         # v2 S-7.2：上下文条 / 会话卡
         Route("/api/context", context_view, methods=["GET"]),
+        # v2 S-7.4/S-11.5：治理体检
+        Route("/api/governance", governance_view, methods=["GET"]),
         Route("/api/session/visibility", session_visibility, methods=["POST"]),
         Route("/api/auth/token/create", token_create, methods=["POST"]),
         Route("/api/auth/token/revoke", token_revoke, methods=["POST"]),

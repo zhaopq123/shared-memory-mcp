@@ -250,6 +250,39 @@ input#q:focus{border-color:var(--brass-dim);
   font-size:11px;color:var(--muted);margin-top:7px;line-height:1.45;
 }
 
+/* 治理抽屉（v2 · S-7.4）。刻意不给"删除"按钮留位置 —— 面板是阅览室。 */
+#gov-drawer{
+  position:fixed;inset:0;z-index:60;
+  background:color-mix(in srgb,var(--ink) 28%,transparent);
+  display:flex;justify-content:flex-end;
+}
+#gov-drawer .drawer{
+  width:min(560px,94vw);height:100%;overflow:auto;
+  background:var(--panel);border-left:1px solid var(--line);
+  padding:20px 22px;animation:rise .22s cubic-bezier(.2,.7,.3,1) both;
+}
+.drawerhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.drawerhead h3{margin:0;font-family:var(--serif);font-size:17px}
+.gaugegrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.gauge{
+  border:1px solid var(--line);border-radius:9px;padding:9px 10px;
+  background:color-mix(in srgb,var(--ink) 3%,transparent);
+}
+.gauge .gv{font-size:19px;font-weight:600;line-height:1.2}
+.gauge .gk{font-size:11px;color:var(--muted);margin-top:2px}
+.dupcard{
+  border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin-top:8px;
+}
+.dupcard ul{margin:6px 0 0;padding-left:18px;font-size:12.5px;line-height:1.6}
+.dupwhy{font-size:11.5px;color:var(--muted)}
+.dupsug{font-size:11.5px;color:var(--verdigris);margin-top:6px}
+.govlist{margin:6px 0 0;padding-left:18px;font-size:12.5px;line-height:1.7}
+.redline{
+  margin-top:20px;padding:9px 11px;border-radius:8px;font-size:12px;line-height:1.6;
+  background:color-mix(in srgb,var(--ink) 4%,transparent);
+  border:1px dashed var(--line);color:var(--muted);
+}
+
 .wshead:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}
 
 /* 六型视图里的资产组头（v2 · S-7.2）：workflow/constraint 是所有记忆里

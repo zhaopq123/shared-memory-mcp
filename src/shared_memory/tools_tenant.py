@@ -46,6 +46,7 @@ from .errors import ErrorCode, ToolError
 from .knowledge import list_views
 from .tenancy import TenantHub
 from . import session as _session
+from . import governance as _governance
 from .vault import SCOPE_LONG_TERM
 
 logger = logging.getLogger(__name__)
@@ -521,6 +522,14 @@ class TenantTools:
             off = max(0, offset)
             lim = max(1, min(limit, 100))
             page = merged[: off + lim][off:]
+
+            # v2（S-11.4）：引用计数 —— 本次召回命中了哪些条目。
+            # 落在 state/（非 git）。**旁路统计，失败不影响召回**：
+            # 统计坏了只是"低引用候选"不准，而召回失败是功能不可用。
+            _governance.bump_refs(
+                self.hub.home,
+                [str(n.get("id", "")) for n in page if n.get("id")],
+            )
             return {
                 "ok": True,
                 "query": query,

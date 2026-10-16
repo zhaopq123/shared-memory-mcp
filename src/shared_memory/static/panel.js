@@ -1104,6 +1104,72 @@ async function loadContextBar(){
   });
 }
 
+/** 治理抽屉（v2 · S-7.4）：体检报告。
+ *
+ *  ━━━ 这里**没有**任何"一键清理"━━━
+ *
+ *  不是还没做，是不做。自动清理是最容易把人的东西弄丢的一类功能：
+ *  它在你没看着的时候跑，出错了也不会有报错弹给你。
+ *  所以抽屉里只有三样东西：**数字**（现状）、**候选**（哪几条像重复/过期）、
+ *  **建议**（走取代链而不是删除）。真要动，由人或 agent 显式执行。
+ */
+async function openGovernance(){
+  const d = document.getElementById('gov-drawer');
+  if (!d) return;
+  const zh = LANG === 'zh';
+  d.style.display = '';
+  d.innerHTML = `<div class="drawer"><div class="empty">${t('common.loading')}</div></div>`;
+  const r = await api('/api/governance');
+  if (!r || !r.ok){
+    d.innerHTML = `<div class="drawer"><div class="empty">${
+      esc((r && r.message) || (zh ? '体检失败' : 'failed'))}</div></div>`;
+    return;
+  }
+  const dups = r.duplicates || [];
+  const pct = (v) => `${Math.round((v || 0) * 100)}%`;
+  d.innerHTML = `
+    <div class="drawer">
+      <div class="drawerhead">
+        <h3>${zh ? '体检' : 'Checkup'}</h3>
+        <button class="btn" id="gov-close">${zh ? '关闭' : 'Close'}</button>
+      </div>
+      <div class="gaugegrid">
+        <div class="gauge"><div class="gv">${r.total ?? '–'}</div>
+          <div class="gk">${zh ? '总条数' : 'Total'}</div></div>
+        <div class="gauge"><div class="gv">${r.growth_30d ?? '–'}</div>
+          <div class="gk">${zh ? '近 30 天新增' : 'Added 30d'}</div></div>
+        <div class="gauge"><div class="gv">${pct(r.duplicate_rate)}</div>
+          <div class="gk">${zh ? '重复率' : 'Dup rate'}</div></div>
+        <div class="gauge"><div class="gv">${r.expired_count ?? 0}</div>
+          <div class="gk">${zh ? '已过期' : 'Expired'}</div></div>
+        <div class="gauge"><div class="gv">${r.superseded_count ?? 0}</div>
+          <div class="gk">${zh ? '已被取代' : 'Superseded'}</div></div>
+        <div class="gauge"><div class="gv">${r.low_reference_count ?? 0}</div>
+          <div class="gk">${zh ? '低引用候选' : 'Low-ref'}</div></div>
+      </div>
+      ${dups.length ? `
+        <h4 class="sechead" style="font-size:13px;margin-top:18px">${
+          zh ? '疑似重复（' + r.duplicate_clusters + ' 簇）' : 'Possible duplicates'}</h4>
+        ${dups.map(c => `
+          <div class="dupcard">
+            <div class="dupwhy">${esc(c.reason)}</div>
+            <ul>${(c.titles || []).map(t => `<li>${esc(t)}</li>`).join('')}</ul>
+            <div class="dupsug">${esc(c.suggestion || '')}</div>
+          </div>`).join('')}` : `
+        <p class="sectip" style="margin-top:16px">${
+          zh ? '没有检测到疑似重复。' : 'No duplicates detected.'}</p>`}
+      ${(r.expired_sample || []).length ? `
+        <h4 class="sechead" style="font-size:13px;margin-top:16px">${
+          zh ? '已过期（默认检索不再返回，考古可查）' : 'Expired'}</h4>
+        <ul class="govlist">${r.expired_sample.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
+      <p class="redline">${
+        zh ? '面板是阅览室：这里只出报告与建议，<strong>没有任何自动删除或改写</strong>。'
+             + '真要清理，由你或 agent 显式执行。'
+           : 'The panel is a reading room: reports and suggestions only. Nothing is auto-deleted.'}</p>
+    </div>`;
+  document.getElementById('gov-close').onclick = () => { d.style.display = 'none'; };
+}
+
 async function load(){
   const r = await api('/api/state',
     {q: STATE.q, tag: STATE.activeTag, workspace: STATE.activeWs,
@@ -2682,6 +2748,11 @@ qi.addEventListener('input', (e) => {
 });
 document.querySelectorAll('.navtab').forEach(el =>
   el.onclick = () => switchTab(el.dataset.tab));
+
+/* 顶栏「体检」按钮：治理抽屉（v2 · S-7.4）。按钮可能在 boot 时才存在，
+   所以判空后再接 —— 让一个可选按钮把整页脚本打断不值得。 */
+const _govBtn = document.getElementById('gov-btn');
+if (_govBtn) _govBtn.onclick = () => openGovernance();
 
 /* 深链接支持：?tab=knowledge / ?id=某标题
    用途：把"这个视图"或"这条记忆"直接分享出去 ——
