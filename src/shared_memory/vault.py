@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -463,6 +464,248 @@ class Note:
         return d
 
 
+def _run_git(
+    cwd: Path, *args: str, timeout: int = 30, check: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """跑一条 git 命令（Vault 与 VersionRepo 共用）。失败不抛。
+
+    ⚠️ 两处细节都必须保住，它们是实测踩出来的，**任何一份副本写漏都会咬人**：
+
+    1. ``encoding="utf-8"`` + ``errors="replace"`` —— 不指定时 subprocess 用
+       系统区域编码（Windows 是 GBK）解码 git 的 UTF-8 输出，
+       中文提交信息会把一次**已经成功的提交**变成 UnicodeDecodeError。
+    2. ``GIT_CEILING_DIRECTORIES`` —— git 默认**向上**找 ``.git``。记忆库放在
+       一个本身是 git 仓库的目录里时（生产 ``/opt/shared-memory-mcp`` 就是代码仓库），
+       不设这个的话 ``add``/``commit`` 会落进**代码仓库**：
+       代码改动被"memory: 自动提交"卷走，而记忆自己反而没有版本化。
+       设成目标目录本身 = 禁止再往上找。
+
+    ``check=False`` 是刻意的：git 的"非零退出"在很多场景里是正常结果
+    （``diff --cached --quiet`` 用退出码表示有/无改动），统一抛异常会让调用方
+    分不清"失败"和"有内容"。
+
+    超时 / 找不到 git 都返回一个 ``returncode=-1`` 的 CompletedProcess，
+    保持"不抛"的契约，让上层用 returncode 判断。
+    """
+    git_env = dict(os.environ)
+    git_env["GIT_CEILING_DIRECTORIES"] = str(cwd)
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=check,
+            timeout=timeout,
+            env=git_env,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("git %s 超时（%ss）", " ".join(args), timeout)
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=-1, stdout="", stderr="timeout"
+        )
+    except FileNotFoundError:
+        logger.error("找不到 git 可执行文件；版本化功能不可用")
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=-1, stdout="", stderr="git not found"
+        )
+
+
+#: 共享版本库的目录名（v2 · S-8.2）。放在**租户根目录**下而不是 ``libs/`` 里 ——
+#: 后者会被当成一个库。
+VERSIONED_DIRNAME = "_versioned"
+
+
+class VersionRepo:
+    """一个**跨库共享**的 git 仓库，只跟踪 ``versioned: true`` 的记忆。
+
+    ━━━ 为什么单独一个仓库，而不是"记忆库自己的 git" ━━━
+
+    v1 的模型是"一库一仓库、每次写自动提交"，代价是 F-8 那条抱怨：
+    绝大多数记忆根本不需要版本控制，却每次写都产生一个提交 ——
+    历史被"改了个错别字"淹没，真需要 diff 的那几条反而找不到。
+
+    v2 把版本控制做成**按需**：默认写入不碰 git（防手滑另有 `.history/` 快照，
+    见 S-8.1），只有标了 ``versioned`` 的长文（架构文档、口径文件）
+    才提交进这里，于是这个仓库的历史**天然就是有用的**。
+
+    布局：``<_versioned>/files/<库 id>/<原文件名>``。
+    用原文件名（含 ``mem-…`` id）而不是另建索引：路径能从条目本身算出来，
+    少一份可能漂移的映射表。
+
+    ━━━ 并发 ━━━
+
+    这个仓库被**所有库共用**，而每个库有自己的写队列（线程），
+    所以两个库同时写 versioned 记忆会抢同一个 ``.git/index.lock``。
+    进程内用一把锁串行掉；跨进程的 lock 冲突不报失败，
+    而是如实返回 ``committed=false`` —— 正文已经落盘，缺的只是一条版本记录，
+    不该因此让用户的写入报错。
+    """
+
+    def __init__(self, root: str | Path, *, git_timeout: int = 30) -> None:
+        self.root = Path(root).expanduser()
+        self.git_timeout = git_timeout
+        self._lock = threading.Lock()
+
+    def _git(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+        return _run_git(self.root, *args, timeout=self.git_timeout, check=check)
+
+    @property
+    def files_dir(self) -> Path:
+        return self.root / "files"
+
+    def path_for(self, lib_id: str, filename: str) -> Path:
+        """条目在版本库里的相对路径。"""
+        return self.files_dir / lib_id / Path(filename).name
+
+    def ensure_repo(self) -> bool:
+        """首次使用时 ``git init`` + 配身份。返回"现在是不是可用仓库"。
+
+        ⚠️ 显式设 ``user.name/user.email``：容器/CI 里常常没有全局 git 身份，
+        不设的话 commit 会失败，而 "Please tell you who you are" 对使用者
+        毫无指向性。
+        """
+        if (self.root / ".git").exists():
+            return True
+        with self._lock:
+            if (self.root / ".git").exists():
+                return True
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning("版本库目录建不出来：%s", exc)
+                return False
+            r = self._git("init", "-b", "main")
+            if r.returncode != 0:
+                logger.warning("版本库 git init 失败：%s", (r.stderr or "")[:200])
+                return False
+            self._git("config", "user.name", "shared-memory")
+            self._git("config", "user.email", "shared-memory@local")
+            return True
+
+    def save(self, lib_id: str, src: Path, *, reason: str, author: str = "") -> dict[str, Any]:
+        """把一条 versioned 记忆的**当前全文**收进版本库并提交。
+
+        Returns:
+            ``{"tracked": bool, "committed": bool, "commit": str?, "message": str?}``
+            —— 永远不抛：正文早已落盘，这里失败只意味着"这一版没进版本库"。
+        """
+        out: dict[str, Any] = {"tracked": False, "committed": False}
+        if not self.ensure_repo():
+            out["message"] = "版本库不可用（git init 失败）"
+            return out
+        rel = self.path_for(lib_id, src.name)
+        try:
+            with self._lock:
+                rel.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, rel)
+                r = self._commit(reason, author)
+        except (OSError, shutil.Error) as exc:
+            logger.warning("版本库收录失败 %s: %s", rel.name, exc)
+            out["message"] = str(exc)[:200]
+            return out
+        out["tracked"] = True
+        out.update(r)
+        return out
+
+    def remove(self, lib_id: str, filename: str, *, reason: str) -> dict[str, Any]:
+        """条目被删时把它从版本库摘掉（历史仍在 git 里，可查回）。"""
+        rel = self.path_for(lib_id, filename)
+        if not rel.exists():
+            return {"tracked": False, "committed": False}
+        with self._lock:
+            rel.unlink(missing_ok=True)
+            r = self._commit(reason)
+        return {"tracked": True, **r}
+
+    def _commit(self, reason: str, author: str = "") -> dict[str, Any]:
+        """``add -A`` + commit。无改动不算失败。
+
+        与 :meth:`Vault.commit` 同一套"两次 fork"的省法，
+        也共用同一份"无改动/不是仓库"的文案判定。
+        """
+        self._git("add", "-A")
+        args: tuple[str, ...] = ("commit", "-m", reason)
+        if author:
+            args = (
+                "-c", f"user.name={author}",
+                "-c", f"user.email={author}@shared-memory.local",
+                "commit", "-m", reason,
+            )
+        r = self._git(*args)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip()[:300]
+            if any(k in err for k in ("nothing to commit", "no changes added",
+                                      "working tree clean")):
+                return {"committed": False, "message": "无改动"}
+            if "not a git repository" in err:
+                return {"committed": False, "message": "不是 git 仓库"}
+            return {"committed": False, "message": err}
+        sha = self._git("rev-parse", "--short", "HEAD").stdout.strip()
+        return {"committed": True, "commit": sha, "message": reason}
+
+    def _note_path(self, lib_id: str, filename: str) -> Path | None:
+        """把（库 id, 文件名）解析成版本库内的路径，**越界就返回 None**。
+
+        ⚠️ 文件名来自条目本身，但拼路径前只取 ``name``（丢掉任何目录成分），
+        并要求结果仍落在 ``files/<lib>/`` 下 —— 否则 ``..`` 能让这个只读接口
+        去读版本库以外的文件。这不是理论风险，是这类接口最常见的洞
+        （面板备份接口同口径防过一次）。
+        """
+        rel = self.path_for(lib_id, filename)
+        try:
+            rel.relative_to(self.files_dir)
+        except ValueError:
+            return None
+        return rel
+
+    def history(self, lib_id: str, filename: str, *, limit: int = 20) -> dict[str, Any]:
+        """一条记忆的版本历史列表（``memory_history`` 的数据源）。"""
+        rel = self._note_path(lib_id, filename)
+        if rel is None:
+            return {"ok": False, "message": "非法的版本库路径", "versions": []}
+        if not (self.root / ".git").exists():
+            return {"ok": True, "versions": [], "note": "还没有任何版本提交"}
+        # %x1f 做分隔符：提交说明里可能有制表符/竖线，用控制字符才不会被劈错。
+        fmt = "%H%x1f%h%x1f%ad%x1f%an%x1f%s"
+        r = self._git(
+            "log", f"--max-count={max(1, min(limit, 100))}",
+            f"--format={fmt}", "--date=iso", "--", str(rel),
+        )
+        if r.returncode != 0:
+            return {"ok": False, "message": (r.stderr or r.stdout).strip()[:200],
+                    "versions": []}
+        versions: list[dict[str, Any]] = []
+        for line in r.stdout.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) == 5:
+                versions.append({
+                    "sha": parts[0], "short": parts[1], "when": parts[2],
+                    "author": parts[3], "subject": parts[4],
+                })
+        return {"ok": True, "versions": versions, "path": f"{lib_id}/{rel.name}"}
+
+    def diff(self, lib_id: str, filename: str, sha: str = "") -> dict[str, Any]:
+        """最近一版（或指定 sha）的补丁文本。
+
+        ⚠️ ``sha`` 必须是十六进制才交给 git —— 它是直接进 argv 的，
+        虽然 subprocess 不过 shell（没有注入），但校验能让"传错参数"
+        在这里就失败，而不是变成一条 git 报错让人误以为版本库坏了。
+        """
+        rel = self._note_path(lib_id, filename)
+        if rel is None:
+            return {"ok": False, "message": "非法的版本库路径"}
+        s = (sha or "").strip()
+        if s and not re.fullmatch(r"[0-9a-fA-F]{4,40}", s):
+            return {"ok": False, "message": f"sha 不合法：{s!r}"}
+        target = s or "HEAD"
+        r = self._git("show", "--format=", "--patch", target, "--", str(rel))
+        if r.returncode != 0:
+            return {"ok": False, "message": (r.stderr or r.stdout).strip()[:200]}
+        return {"ok": True, "sha": target, "diff": (r.stdout or "")[:20000]}
+
+
 class Vault:
     """一个 git 仓库形态的共享记忆库。
 
@@ -476,6 +719,9 @@ class Vault:
         *,
         auto_commit: bool = True,
         git_timeout: int = 30,
+        versioned_dir: str | Path | None = None,
+        history_keep: int = 3,
+        lib_id: str = "",
     ) -> None:
         """
         Args:
@@ -483,12 +729,26 @@ class Vault:
             auto_commit: 是否启用 git 版本化（关闭后 commit() 变成空操作）。
             git_timeout: 单条 git 命令的超时秒数。手机上 git 偶尔会卡，
                 设超时可以避免整条写入链路被一个卡住的 git 挂死。
+            versioned_dir: 跨库共享版本库的根目录（v2 · S-8.2）。
+                传 None 表示这个库不接版本库 —— 单库独立测试时的常态。
+            history_keep: 每条记忆最多留几份改前快照（S-8.1，0 = 关快照）。
+            lib_id: 在共享版本库里的目录名。留空时用根目录名 ——
+                租户形态下两者相同（`libs/<lib-id>`），
+                独立模式（无租户）则靠显式传入避免把点目录名当库名。
         """
         self.root = Path(root).expanduser().resolve()
         self.notes_dir = self.root / "notes"
         self.trash_dir = self.root / ".trash"
+        self.history_dir = self.root / ".history"
         self.auto_commit = auto_commit
         self.git_timeout = git_timeout
+        self.lib_id = (lib_id or self.root.name).strip("/")
+        self.history_keep = max(0, int(history_keep))
+        self.version_repo = (
+            VersionRepo(versioned_dir, git_timeout=git_timeout)
+            if versioned_dir is not None
+            else None
+        )
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
         # ── 读缓存（性能层）──
@@ -529,47 +789,13 @@ class Vault:
     def _git(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
         """跑一条 git 命令。失败不抛（由调用方决定要不要在意）。
 
-        ⚠️ ``encoding="utf-8"`` + ``errors="replace"`` 是**必需**的：
-        不指定时 subprocess 用**系统区域编码**解码（Windows 上是 GBK），
-        而 git 输出是 UTF-8 —— 中文提交信息会让解码抛 UnicodeDecodeError，
-        把一次已经成功的提交变成异常。实测踩过。
-
-        ``check=False`` 是刻意的：git 的「非零退出」在很多场景下是正常结果
-        （比如 `diff --cached --quiet` 用退出码表示"有/无改动"），
-        统一抛异常会让调用方难以区分「失败」和「有内容」。
+        实现与 :func:`_run_git` 共用一份 —— ``encoding`` 与
+        ``GIT_CEILING_DIRECTORIES`` 两处细节**写漏任何一处都会咬人**
+        （详见 _run_git 的 docstring），所以这里不留第二份副本。
         """
-        # ⚠️ GIT_CEILING_DIRECTORIES 是**必需**的，不是加固：
-        # `git -C <dir>` 默认会向上遍历找 .git。当记忆库放在一个本身是
-        # git 仓库的目录里（生产 /opt/shared-memory-mcp 就是代码仓库），
-        # 记忆的 add/commit 会落进**代码仓库** —— 代码改动被
-        # "memory: 自动提交" 卷走，而记忆自己反而没有版本化。
-        # 设成库目录本身 = 禁止再往上找，git 只认这个目录及其子目录。
-        git_env = dict(os.environ)
-        git_env["GIT_CEILING_DIRECTORIES"] = str(self.root)
-        try:
-            return subprocess.run(
-                ["git", "-C", str(self.root), *args],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=check,
-                timeout=self.git_timeout,
-                env=git_env,
-            )
-        except subprocess.TimeoutExpired:
-            # 超时也返回一个 CompletedProcess，而不是抛 —— 保持"不抛"的契约，
-            # 让上层用 returncode 判断（timeout 用 -1 表示，不会与 git 的退出码冲突）
-            logger.warning("git %s 超时（%ss）", " ".join(args), self.git_timeout)
-            return subprocess.CompletedProcess(
-                args=["git", *args], returncode=-1, stdout="", stderr="timeout"
-            )
-        except FileNotFoundError:
-            # 目标机没装 git —— 记忆服务**不应该因此起不来**
-            logger.error("找不到 git 可执行文件；版本化功能不可用")
-            return subprocess.CompletedProcess(
-                args=["git", *args], returncode=-1, stdout="", stderr="git not found"
-            )
+        return _run_git(
+            self.root, *args, timeout=self.git_timeout, check=check
+        )
 
     def is_repo(self) -> bool:
         """这个目录是不是 git 工作树。
@@ -1055,6 +1281,146 @@ class Vault:
     # ══════════════════════ 写 ══════════════════════
     # 以下方法都会被 queue 包起来串行调用 —— 见模块 docstring 的职责边界
 
+    # ──────────────── 改前快照（v2 · S-8.1）────────────────
+
+    @staticmethod
+    def _hist_key(meta: dict[str, Any], path: Path) -> str:
+        """快照目录名：优先用条目 id，退回文件名。
+
+        ⚠️ 必须消毒：id 来自 frontmatter，而那是**用户可以手改**的字段，
+        写个 `../../x` 就能把"往库里存快照"变成"往库外写文件"。
+        这里只保留 `[A-Za-z0-9._-]` 且要求结果不是 `..` 或以 `.` 开头。
+        """
+        raw = str(meta.get("id") or path.stem or "").strip()
+        safe = re.sub(r"[^A-Za-z0-9._-]", "-", raw)
+        if not safe or safe.startswith(".") or safe == "..":
+            safe = re.sub(r"[^A-Za-z0-9._-]", "-", path.stem) or "note"
+        return safe
+
+    def snapshot_history(self, meta: dict[str, Any], path: Path, body: str) -> str | None:
+        """把**上一版正文**存成 `.history/<id>/<ts>.md`，并裁到 `history_keep` 份。
+
+        ━━━ 为什么每条记忆都有、与 versioned 无关 ━━━
+
+        `upsert` 覆盖正文是**不可逆**的，而绝大多数覆盖只是"改个措辞"。
+        为这种覆盖建一条 git 提交是噪音（F-8 抱怨的正是这个），
+        但留 3 份纯文本快照几乎不要钱 —— 所以 v2 把两件事拆开：
+        **防手滑**用快照（人人有），**版本控制**用 git（只给 versioned）。
+
+        文件名里的时间戳用微秒 + 把 `:` 换成 `-`：
+        前者防"同一秒改两次只留一份"，后者因为 **Windows 文件名不允许冒号**
+        （生产在 Linux、开发在 Windows，只按 Linux 想就会在开发机上直接炸）。
+
+        ⚠️ 快照失败绝不影响写入：正文已经落盘，这里只是副本。
+        一次"存快照失败"要是冒泡成写入报错，agent 就会重试 → 写出重复内容。
+        """
+        if self.history_keep <= 0 or not body.strip():
+            return None
+        key = self._hist_key(meta, path)
+        ts = datetime.now(CST)
+        name = ts.isoformat(timespec="microseconds").replace(":", "-") + ".md"
+        d = self.history_dir / key
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            self._ensure_history_ignored()
+            (d / name).write_text(
+                f"{dump_frontmatter({'title': meta.get('title', ''), 'snapshot_of': str(path.relative_to(self.root)), 'taken_at': ts.isoformat()})}\n\n{body}\n",
+                encoding="utf-8",
+            )
+            self._prune_history(d)
+        except OSError as exc:
+            logger.warning("改前快照写入失败 %s: %s", key, exc)
+            return None
+        return f"{self.history_dir.name}/{key}/{name}"
+
+    def _ensure_history_ignored(self) -> None:
+        """让 `.history/` 不进 git —— 只往**快照目录自己**里塞一份 `.gitignore`。
+
+        ━━━ 为什么不改库根的 .gitignore ━━━
+
+        库根的 `.gitignore` 只在 `init_repo()` 那一次写，**已存在的库拿不到**；
+        而快照是 v2 新增的目录，老库里第一次删除/恢复触发的审计提交是
+        ``git add -A``，会顺手把整堆快照提进库历史 ——
+        那就违背了「防手滑不进 git」这条口径。
+        目录内的 `.gitignore`（内容就一个 `*`）对新旧库都生效，
+        且不需要任何迁移步骤。
+        """
+        gi = self.history_dir / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n", encoding="utf-8")
+
+    def _prune_history(self, d: Path) -> None:
+        """只留最近 `history_keep` 份（文件名可排序，所以按名字倒序切）。"""
+        try:
+            files = sorted(d.glob("*.md"), reverse=True)
+        except OSError:
+            return
+        for old in files[self.history_keep:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def list_history(self, ident: str) -> list[dict[str, Any]]:
+        """列一条记忆的改前快照（新→旧）。找不到条目就返回空。"""
+        out: list[dict[str, Any]] = []
+        for f in self._history_files(ident):
+            meta = self._read_meta(f)
+            out.append({
+                "when": str(meta.get("taken_at") or f.stem),
+                "path": f"{self.history_dir.name}/{f.parent.name}/{f.name}",
+                "bytes": f.stat().st_size if f.exists() else 0,
+            })
+        return out
+
+    def newest_history_body(self, ident: str) -> str:
+        """最近一份改前快照的正文（没有则空串）。
+
+        ⚠️ 只接受「标题/id」，不接受路径 —— 快照文件名是机器生成的时间戳，
+        要是开一个"按路径读快照"的接口，就得防 `..` 穿越；
+        从条目本身定位到它自己的快照目录，这个问题不存在。
+        """
+        files = self._history_files(ident)
+        if not files:
+            return ""
+        _, body = parse_note(files[0].read_text(encoding="utf-8"))
+        return body
+
+    def _history_files(self, ident: str) -> list[Path]:
+        """这条记忆的快照文件，新→旧。"""
+        try:
+            path = self.resolve(ident)
+        except ToolError:
+            return []
+        if not path.exists():
+            return []
+        d = self.history_dir / self._hist_key(self._read_meta(path), path)
+        if not d.is_dir():
+            return []
+        return sorted(d.glob("*.md"), reverse=True)
+
+    def _read_meta(self, path: Path) -> dict[str, Any]:
+        """只要 frontmatter（快照定位用，读不动就当没有）。"""
+        try:
+            meta, _ = parse_note(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            return {}
+        return meta
+
+    def _mirror_version(self, meta: dict[str, Any], path: Path) -> dict[str, Any] | None:
+        """``versioned: true`` 的条目收进共享版本库；其余直接返回 None。
+
+        ⚠️ S-8.2 的验收口径就是这里：**没标 versioned 的写入零 git 操作**。
+        所以这个判断必须在任何 git 调用之前，别"先提交再看标记"。
+        """
+        if self.version_repo is None or not meta.get("versioned"):
+            return None
+        return self.version_repo.save(
+            self.lib_id, path,
+            reason=f"version: {meta.get('title', path.stem)}",
+            author=str(meta.get("author", "") or ""),
+        )
+
     def put(
         self,
         *,
@@ -1094,7 +1460,10 @@ class Vault:
             extra: 额外写入 frontmatter 的自定义字段。
 
         Returns:
-            ``{"ok", "action", "id", "title", "path", "workspace"}``
+            ``{"ok", "action", "id", "title", "path", "workspace",
+            "snapshot", "version"}``。
+            ``snapshot`` 是本次覆盖前存的改前快照（新建为 None）；
+            ``version`` 只在条目 ``versioned: true`` 且接了版本库时非 None。
         """
         title = (title or "").strip()
         if not title:
@@ -1123,6 +1492,8 @@ class Vault:
                 meta, old_body = parse_note(existing.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError):
                 meta, old_body = {}, ""
+            # 覆盖**之前**先存上一版正文 —— 顺序很重要，写在后面就存成新值了
+            snap = self.snapshot_history(meta, existing, old_body)
             new_body = (
                 f"{old_body.rstrip()}\n\n{body}".strip() if mode == "append" else body
             )
@@ -1159,6 +1530,8 @@ class Vault:
                 "title": title,
                 "workspace": str(meta.get("workspace", "")),
                 "path": str(existing.relative_to(self.root)),
+                "snapshot": snap,
+                "version": self._mirror_version(meta, existing),
             }
 
         note_id = _new_id()
@@ -1192,6 +1565,9 @@ class Vault:
             "title": title,
             "workspace": workspace,
             "path": str(path.relative_to(self.root)),
+            # 新建没有"上一版"可存，但首版就该进版本库
+            "snapshot": None,
+            "version": self._mirror_version(meta, path),
         }
 
     def delete(self, ident: str) -> dict[str, Any]:
@@ -1214,13 +1590,25 @@ class Vault:
         self.trash_dir.mkdir(parents=True, exist_ok=True)
         dest = self.trash_dir / f"{p.stem}--{_stamp()}.md"
         p.rename(dest)
-        # 文件离开 notes/ → 结构变了，索引必须重建
+        # 文件离开 notes/ → 结构变了，索引必须重建。
+        # ⚠️ 失效的是**原路径** p（缓存里那条是它），不是 dest ——
+        # .trash 根本不在扫描范围内，拿 dest 去 drop 等于没清，
+        # 删掉的记忆会继续从缓存里被读到。
         self.invalidate_cache(p)
+        # versioned 条目同时从共享版本库摘除：那里面只该有"还活着的"长文。
+        # 历史不会丢 —— 摘除本身就是一次提交，之前的版本都能从 git 捞回。
+        vr = None
+        if meta.get("versioned") and self.version_repo is not None:
+            vr = self.version_repo.remove(
+                self.lib_id, p.name,
+                reason=f"unversion: {meta.get('title', p.stem)}",
+            )
         return {
             "ok": True,
             "action": "deleted",
             "title": str(meta.get("title", p.stem)),
             "moved_to": str(dest.relative_to(self.root)),
+            "version": vr,
             "note": "已移入 .trash（可恢复）；如需彻底删除请手工处理",
         }
 
@@ -1322,6 +1710,8 @@ class Vault:
             "action": "restored",
             "title": title,
             "path": str(dest.relative_to(self.root)),
+            # 恢复一条 versioned 记忆 = 它重新成为"活着的长文"，收回版本库
+            "version": self._mirror_version(meta, dest),
         }
 
     # ══════════════════════ 搜索 ══════════════════════

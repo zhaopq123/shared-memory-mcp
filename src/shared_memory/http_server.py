@@ -535,15 +535,17 @@ def build_app(hub: TenantHub) -> Any:
         不需要写：能从代码直接读到的、临时中间状态、只对当前这句话
         有意义的上下文。
 
-        ━━━ 关于提交（重要，别误读返回）━━━
+        ━━━ 关于提交与"改坏了怎么办"（v2 S-8，别误读返回）━━━
 
         写入成功时 ``ok=true``，且**内容已经安全落盘**。
 
-        返回里的 ``committed`` 是「本次是否**立刻** git 提交」。
-        默认是防抖模式（静默 8 秒后自动提交），所以它通常是 ``false`` ——
-        **这不代表失败**，别因此重试（重试会写出重复内容）。
+        ``committed`` 现在是「本次是否进了**版本库**」——
+        只有标了 ``versioned: true`` 的长文才会进，普通条目恒为 ``false``。
+        **这不是失败，别因此重试**（重试会写出重复内容）。
 
-        要立刻入库（给别人看 / 确认生效），调 ``memory_history(commit=True)``。
+        覆盖是**不可逆**的，所以每次覆盖前都会存一份改前快照（库内
+        ``.history/``，默认留 3 份）。想退回上一版：
+        ``memory_history(title=这条的标题)``。
         """
         require_write_scope("memory_remember")
         return await t.memory_write(
@@ -558,9 +560,9 @@ def build_app(hub: TenantHub) -> Any:
         需要 ``confirm=True`` —— 防误删的一道闸。
         不传时只返回"将要删的是哪条"的预览，让你先看一眼。
 
-        怎么恢复：``memory_backup`` 不管回收站；恢复用面板的回收站页
-        （或运维脚本）—— 工具面刻意不提供 restore，避免 agent 反复
-        "删了又恢复"把库搅浑。
+        怎么恢复：工具面刻意不提供 restore 单条记忆 —— 避免 agent 反复
+        "删了又恢复"把库搅浑。恢复用面板的回收站页（或运维脚本）；
+        ``memory_backup(action="restore")`` 是**整目录**回退，不是单条恢复。
         """
         require_write_scope("memory_forget")
         return await t.memory_delete(require_user(), ident, confirm, lib)
@@ -569,19 +571,34 @@ def build_app(hub: TenantHub) -> Any:
 
     @mcp.tool(output_schema=None)
     async def memory_history(
-        lib: str = "", message: str = "", commit: bool = False, limit: int = 10
+        lib: str = "",
+        message: str = "",
+        commit: bool = False,
+        limit: int = 10,
+        title: str = "",
+        sha: str = "",
     ) -> dict:
-        """提交历史 + **立即提交**（合一；旧 ``commit`` + ``stats`` 的 git 部分）。
+        """三种用法合一：看库况 / **立即提交** / 看一条记忆的版本历史。
 
+        · ``title`` 非空 —— 问"这条被我用不用得回去"
+          返回 git 版本序列（仅 ``versioned`` 条目有）+ 改前快照与上一版正文。
+          没标 versioned 不说"没有历史"：`.history/` 快照人人都有，
+          覆盖是不可逆的，所以这条路径总能给出可用的东西
         · 默认（``commit=False``）—— 看库况与最近提交
           （排查"我写的怎么没进历史"「队列是不是卡住了」时先看这个）
-        · ``commit=True`` —— 立刻把待提交的写落进 git（**不用等 8 秒防抖**），
-          ``lib`` 指定库（留空 = 你有权限的库都提交）、``message`` 自定义提交信息
+        · ``commit=True`` —— 把当前工作树的改动落进本库 git。
+          ``lib`` 指定库（留空 = 你有权限的库都提交）、``message`` 自定义说明
 
-        平时不用管提交 —— 防抖会在静默 8 秒后自动提交。
-        要"写给别人看之前确认已进版本库"时再显式提交。
+        ━━━ 别按旧模型理解"提交"（v2 S-8 起）━━━
+
+        写入**不再自动产生 git 提交**（防手滑改由 `.history/` 快照负责）。
+        所以 ``committed=false`` 从此不再等于"待提交"：普通条目本来就不提交，
+        只有标了 ``versioned`` 的长文会随写进共享版本库。
+        要把一段时间的成果固化成一个版本，就显式 ``commit=True``。
         """
         u = require_user()
+        if title:
+            return await t.memory_versions(u, title, lib=lib, sha=sha)
         if commit:
             require_write_scope("memory_history")
             return await t.memory_commit(u, lib, message)
@@ -596,8 +613,21 @@ def build_app(hub: TenantHub) -> Any:
         bundle: str = "",
         target_lib: str = "",
         on_conflict: str = "skip",
+        confirm: bool = False,
+        with_state: bool = False,
     ) -> dict:
-        """备份与还原：**导出 / 导入** 合一（旧 ``export`` + ``import``）。
+        """备份与还原四种动作（``action`` 选一个）。
+
+        ━━━ 先分清两种"备份"，选错了等于没备份 ━━━
+
+        · ``export`` / ``import`` —— **条目层**：导出可移植的 bundle
+          （按 ``workspace`` 过滤、按 ``target_lib`` 导入，字节级还原正文）。
+          适合"把这个项目的成绩带到另一台机器"。
+        · ``snapshot`` / ``restore`` —— **磁盘层**：tar 整个数据目录
+          （``libs/`` + ``_versioned/`` + ``tenants.json``）。
+          回收站、改前快照、frontmatter 这些 export 不带的东西都在里面。
+          **恢复一台机器只有这个管用** —— S-8 之后普通写入不再产生 git
+          提交，所以"git 里还能捞回来"这个指望已经不成立了。
 
         · ``action="export"``（默认）—— 以工作空间为单位导出 bundle
           （字节级 + manifest sha256）
@@ -609,9 +639,13 @@ def build_app(hub: TenantHub) -> Any:
           · ``target_lib``   导入到哪个库，需**写权限**（不传 = 个人库）
           · ``workspace``    **过滤器**不是改写器：只导入该工作区的条目
           · ``on_conflict``  skip（默认，不覆盖）/ update / rename
-
-        ⚠️ 导入**不重写内容** —— 字节级还原是这条链路的意义
-        （manifest 里有 sha256，导入前后可校验）。
+        · ``action="snapshot"`` —— 打整目录快照，返回包路径
+          · ``with_state=True`` 才连 ``state/``（令牌/主密钥/PIN）一起打；
+            **默认不含**，因为那种包等于一袋凭据。含 state 的包按机密对待
+        · ``action="restore"`` —— 从快照恢复整目录（**仅 admin**）
+          · 必须 ``confirm=True``；不传只返回将覆盖什么的预览
+          · 恢复前自动打一个回退快照，返回值里给路径
+          · 恢复完要**重启服务**，``tenants.json`` 才重新载入
         """
         u = require_user()
         if action == "export":
@@ -621,10 +655,16 @@ def build_app(hub: TenantHub) -> Any:
             return await t.memory_import(
                 u, bundle, target_lib, workspace, on_conflict
             )
+        if action == "snapshot":
+            require_write_scope("memory_backup")
+            return await t.memory_snapshot(u, out_dir=out_dir, with_state=with_state)
+        if action == "restore":
+            require_write_scope("memory_backup")
+            return await t.memory_restore(u, bundle, confirm=confirm)
         return {
             "ok": False,
             "code": "INVALID_ARGUMENT",
-            "message": f"action 只能是 export / import，收到 {action!r}",
+            "message": f"action 只能是 export / import / snapshot / restore，收到 {action!r}",
         }
 
     # ────────── 旧名别名（deprecated，下一版删除）──────────

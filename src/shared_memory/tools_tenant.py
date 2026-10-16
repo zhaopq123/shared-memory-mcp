@@ -933,23 +933,28 @@ class TenantTools:
     async def memory_commit(
         self, user_name: str, lib: str = "", message: str = ""
     ) -> dict[str, Any]:
-        """立刻提交（**不用等防抖**）。
+        """把库里的改动**手动提交**进 git（v2 · S-8 之后这是常规通道）。
 
-        ━━━ 什么时候需要它 ━━━
+        ━━━ 模型变了，别再按"防抖会自动提交"理解 ━━━
 
-        默认是「静默 8 秒后自动提交」—— 所以写完**通常什么都不用做**，
-        几秒后 git 里就有了。
+        v1 是"每次写都提交（防抖 8 秒）"，结果是历史被"改个错别字"淹没，
+        真想 diff 的那条找不到。v2 改成**按需**：
 
-        但下面三种情况需要手动提交：
-          1. **你写完马上要给别人看** —— 防抖还没到时间
-          2. **你要确认提交真的成功了** —— 排查「写了没生效」
-          3. **要写一个有意义的提交说明** —— 自动提交的说明是模板
+          · 普通写入 **不碰 git** —— 防手滑靠库内 `.history/` 改前快照
+          · 标了 ``versioned: true`` 的长文 → 进共享版本库，每次一提交
+          · 删除/恢复 → 立刻提交本库（破坏性动作必须留痕）
+          · **其余想进版本库时，就是这个工具**
+
+        所以什么时候需要它：
+          1. **要把一段时间的成果固化成一个版本**（做完一个阶段、给别人看）
+          2. **要确认改动真的入库了** —— 排查"写了没生效"
+          3. **要写一条有意义的提交说明**（默认说明是模板）
 
         ``lib`` 不传则提交**你所有可写的库**（一次全提）。
         传 ``lib`` 只提那一个（需要写权限）。
 
-        提交成功会返回 commit 短哈希，失败会返回原因
-        （比如「无改动」—— 那不是错误）。
+        返回 ``committed=false`` + ``message="无改动"`` **不是失败**，
+        是"工作树本来就干净"。
         """
         try:
             if lib:
@@ -981,6 +986,71 @@ class TenantTools:
             }
         except Exception as exc:  # noqa: BLE001
             return self._err(exc, "提交")
+
+    async def memory_snapshot(
+        self, user_name: str, *, out_dir: str = "", with_state: bool = False
+    ) -> dict[str, Any]:
+        """整目录快照（v2 S-8.4）—— **这是唯一的"能把数据捞回来"的动作**。
+
+        ⚠️ 别把它和 ``memory_export`` 混：export 导的是**条目内容 bundle**
+        （可跨库导入、按工作区过滤），快照打的是**磁盘现状**
+        （`libs/` + `_versioned/` + `tenants.json`，含 frontmatter、回收站、
+        改前快照这些 export 不带的东西）。要恢复一台机器用快照。
+
+        ``with_state=True`` 才连 `state/`（令牌/主密钥/PIN）一起打 ——
+        默认不给，因为那个包等于一袋凭据。
+        """
+        try:
+            r = self.hub.snapshot_home(out_dir=out_dir, with_state=with_state)
+            r["_actor"] = user_name
+            return r
+        except Exception as exc:  # noqa: BLE001
+            return self._err(exc, "快照")
+
+    async def memory_restore(
+        self, user_name: str, bundle: str, *, confirm: bool = False
+    ) -> dict[str, Any]:
+        """从快照恢复整目录。``confirm=False`` 只返回预览、不动数据。
+
+        恢复前**自动**给当前状态打一个快照（``pre_restore_snapshot``）——
+        恢复本身是可回退的动作，这才是"敢恢复"的前提。
+
+        ⚠️ 只限 admin：这条动作的覆盖面是**整个目录**（所有人的库 +
+        身份表），不是"我这份记忆"。member 拿不到它，也不该拿到。
+        """
+        user = self.hub.store.user(user_name)
+        if user is None or not user.is_admin:
+            return {
+                "ok": False,
+                "code": ErrorCode.SCOPE_DENIED,
+                "message": "整目录恢复只允许 admin 身份调用",
+                "hint": "member 请用 memory_backup(action=\"export\") 导自己的条目",
+            }
+        try:
+            r = self.hub.restore_home(bundle, confirm=confirm)
+            r["_actor"] = user_name
+            return r
+        except Exception as exc:  # noqa: BLE001
+            return self._err(exc, "恢复")
+
+    async def memory_versions(
+        self, user_name: str, ident: str, *, lib: str = "", sha: str = ""
+    ) -> dict[str, Any]:
+        """一条记忆的历史：git 版本序列（仅 versioned）+ 改前快照。
+
+        ━━━ 什么时候用它 ━━━
+        "这条被我改坏了，上一版是什么" —— 就调它，不用先判断有没有 versioned。
+
+        · ``versioned=true`` → ``versions`` 是共享版本库里的提交序列，
+          并附最近一版（或 ``sha`` 指定那版）的 diff
+        · ``versioned=false`` → ``versions`` 为空并说明"未启用版本控制"，
+          但 ``snapshots``/``previous_body`` 仍给出库里的改前快照 ——
+          防手滑那层对每条记忆都开着，覆盖是不可逆的，所以这里必须给得出内容
+        """
+        try:
+            return self.hub.versions(user_name, ident, lib_id=lib, sha=sha)
+        except Exception as exc:  # noqa: BLE001
+            return self._err(exc, "版本历史")
 
     async def memory_stats(
         self, user_name: str, lib: str = "", commit_now: bool = False,

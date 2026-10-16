@@ -211,7 +211,8 @@ if self._outstanding >= self._max_depth:
 
 **③ 写时防重五层**
 upsert 标题去重 / create 报 CONFLICT / append 保留原文 /
-防抖期 `committed=false`（防 agent 把"没提交"当失败而重试出重复）/
+`ok` 与 `committed` 分家（v2：`ok=true` 即已落盘，`committed` 只说进没进
+版本库 —— 防 agent 把"没提交"当失败而重试出重复）/
 撞名加 id 后缀。外加**写时关联提示**：写入响应带 top3 相似既有记忆，
 "先拉再推"不强制（决策：强制会拖慢每一笔写），但服务端把"拉"的
 时机还给你。

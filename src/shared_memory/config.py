@@ -185,6 +185,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "trash_max_files": 200,
     # 单库条数配额告警阈值（方案 5c）：到量只在 stats 里提醒，不硬拒。0 = 关闭
     "quota_warn_notes": 500,
+    # 上一条正文的本地快照保留几版（v2 · S-8.1）。0 = 关闭。
+    # 这是"防手滑"层，**与 versioned 无关**：默认档下 git 不再每次写都提交，
+    # 所以改坏一条记忆能不能就地找回，全靠这个目录。
+    "history_keep": 3,
 }
 
 
@@ -660,6 +664,7 @@ class Config:
             "trash_ttl_days": (0, 3650),
             "trash_max_files": (0, 100000),
             "quota_warn_notes": (0, 1000000),
+            "history_keep": (0, 50),
         }
         for key, (lo, hi) in bounds.items():
             v = settings.get(key)

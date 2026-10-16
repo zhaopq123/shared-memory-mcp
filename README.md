@@ -92,9 +92,11 @@ agent C ─┘                        ↑ 串行在这，所以不会互相覆�
 
 **关键约定：ack 在落盘之后。** `submit()` 返回的 future 在写入真正完成之后才 resolve —— 绝不允许「入队即返回成功」，否则进程一崩 agent 会基于假事实继续工作。
 
-### 3. git 就是那个「无副作用的锁」
+### 3. git 只用来兜底，不用来记录每一次改动
 
-并发控制靠队列，**防丢失靠 git**：写入静默 8 秒后自动提交（防抖，避免一个 agent 连写 5 条产生 5 个提交）。
+并发控制靠队列，**防手滑靠库内 `.history/` 改前快照**（每次覆盖写前把上一版正文存一份，默认留 3 版，不进 git）。
+
+git 现在是**按需**的：只有 frontmatter 标了 `versioned: true` 的记忆才提交进一个**跨库共享**的版本库；普通写入零 git 操作。破坏性动作（删除/恢复）仍然立刻提交所在库 —— 这类留痕不能等。
 
 好处是**后验的**：冲突不会被静默吞掉、误删能回滚、整个库能 push 到任意远端做异地备份。
 
@@ -187,8 +189,8 @@ v2 按**一个动作一个工具**收敛 —— 实测结论：工具越多，ag
 | `memory_get` | 按标题或 id 读全文 |
 | `memory_forget` | 软删除（进回收站），需 `confirm=true` |
 | `memory_spaces` | 我是谁 + 库清单与队列状况 + 工作空间共享范围（**三合一**）|
-| `memory_history` | 提交历史；`commit=true` 立刻提交（不用等防抖）|
-| `memory_backup` | `action=export` 导出 / `action=import` 导入（**二合一**）|
+| `memory_history` | 提交历史；`commit=true` 立刻提交；`title=` 查某条记忆的版本与 diff（`.history` 快照 + 版本库）|
+| `memory_backup` | `export`/`import` 单条与批量；`snapshot`/`restore` 整目录灾备（restore 限 **admin**）|
 
 ### 旧名别名（过渡期，下一版删除）
 
@@ -268,7 +270,8 @@ v2 按**一个动作一个工具**收敛 —— 实测结论：工具越多，ag
 
 **③ 写时防重五层**
 upsert 按标题去重 / create 遇已存在报 CONFLICT / append 保留原文 /
-防抖期 `committed=false` 防 agent 重试写出重复 / 撞名自动加 id 后缀。
+`ok=true` 即「已落盘」（`committed` 只说进没进版本库，两者分开，防 agent 把"没提交"当失败而重试出重复）/
+撞名自动加 id 后缀。
 
 **④ 启动变更摘要（不漏报、不刷屏）**
 会话 initialize 时，中间件把「你离开期间的变更」追加进 instructions：
@@ -338,6 +341,8 @@ memory_stats(with_commits=true)
 | `trash_ttl_days` | `30` | 回收站懒清理年龄阈值（stats 时顺带执行）|
 | `trash_max_files` | `200` | 回收站条数上限 |
 | `quota_warn_notes` | `500` | 单库条数告警阈值（只提醒，不拦截）|
+| `history_keep` | `3` | 每条记忆的改前快照留几版（`.history/`，`0` = 关闭）|
+| `commit_debounce_seconds` | `8` | 配置变更/批量导入的提交间隔；**普通写入不等它**（见下）|
 
 ---
 
@@ -345,7 +350,10 @@ memory_stats(with_commits=true)
 
 | 机制 | 说明 |
 |---|---|
-| **自动提交** | 写入静默 8 秒后 git commit（防抖，避免噪音提交）|
+| **改前快照** | 每次覆盖写前把上一版正文存进 `.history/<id>/<ts>.md`，默认留 3 版（不进 git，防手滑）|
+| **按需版本库** | 只有 `versioned: true` 的记忆提交进跨库共享版本库；普通写入零 git 操作 |
+| **破坏性动作即时留痕** | 删除/恢复立刻提交所在库 —— 回收站靠 git 兜底，这条不能等 |
+| **整目录灾备** | `memory_backup(action=snapshot)` 打 tar；`restore` 先自动快照当前状态再覆盖（**admin + confirm**）|
 | **优雅停机** | 收到 SIGTERM 时先把未提交的改动落盘，再退出 |
 | **软删除 + 懒清理** | 删除进 `.trash/` 可恢复；超期/超量由 stats 顺带物理清除（git 全历史是兜底）|
 | **不覆盖** | 标题 slug 撞名时自动加 id 后缀；恢复时若已同名另行落盘 |

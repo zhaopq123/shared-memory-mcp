@@ -33,7 +33,7 @@ from typing import Any
 from .config import Config
 from .errors import ErrorCode, ToolError
 from .tenant import Library, TenantStore, User, can_write, visible_libraries
-from .vault import Vault, now_iso, share_visible
+from .vault import VERSIONED_DIRNAME, Vault, now_iso, share_visible
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,24 @@ class LibrarySet:
         ⚠️ 调用方必须**先确认有权限**再调这里 —— 本方法不做权限检查。
         权限检查集中在 Tenant 层（见 `Tenant.vault_for`），
         这样"检查哪些库"只有一处实现，不会漏。
+
+        v2（S-8.2）：所有库共用**一个** `_versioned` 版本库，
+        目录放在租户根而不是 `libs/` 里 —— 放 libs/ 会被当成一个库。
         """
         v = self._vaults.get(lib.id)
         if v is None:
-            v = Vault(self.path_of(lib))
+            path = self.path_of(lib)
+            keep = 3
+            try:
+                keep = int(Config(path).settings().get("history_keep", 3))
+            except Exception:  # noqa: BLE001 - 配置读不出来就用缺省，别挡住开库
+                pass
+            v = Vault(
+                path,
+                versioned_dir=self.home / VERSIONED_DIRNAME,
+                history_keep=keep,
+                lib_id=lib.id,
+            )
             v.init_repo()
             self._vaults[lib.id] = v
             logger.info("已打开库 %s（%s）", lib.id, lib.owner)

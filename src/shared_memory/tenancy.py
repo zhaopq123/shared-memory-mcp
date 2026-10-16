@@ -36,6 +36,7 @@ from .errors import ErrorCode, ToolError
 from .library import LibrarySet, Tenant
 from .service import SharedMemoryService
 from .tenant import TenantStore, User
+from .vault import VERSIONED_DIRNAME
 from .workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -84,8 +85,9 @@ class TenantHub:
         self.workspace = WorkspaceManager(self.store, self.tenant)
         # 单库服务缓存（每个库一个 service，复用其写队列）
         self._services: dict[str, SharedMemoryService] = {}
-        #: 测试用开关：True 时所有库都关掉防抖（每次写立刻提交）。
-        #: 生产环境保持 False —— 防抖是为了避免"每写一条就 fork 一次 git"。
+        #: 测试用开关：True 时配置/导入类改动的防抖降到 0（改动立刻提交）。
+        #: ⚠️ v2 S-8 之后它**不再影响普通写入** —— 写入本来就不产生提交了，
+        #: 所以别再把它理解成"每次写都提交"。
         self.fast_commit = False
 
     # ────────────────────── 生命周期 ──────────────────────
@@ -322,6 +324,72 @@ class TenantHub:
             f"在你可读的库里找不到：{ident}",
             hint="用 memory_search 确认标题，或换一个库试试",
         )
+
+    def versions(
+        self,
+        user_name: str,
+        ident: str,
+        *,
+        lib_id: str = "",
+        sha: str = "",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """一条记忆的**版本历史 + 最近一版 diff**（v2 · S-8.3）。只读。
+
+        ━━━ 为什么不报错，而是老实说"没启用版本控制" ━━━
+
+        S-8 之后只有标了 ``versioned`` 的长文才进 git 版本库，普通条目没有
+        版本序列 —— 但**这不等于"改坏了没法退"**：每条记忆都有 `.history/`
+        改前快照（防手滑层，与 versioned 无关）。所以这里两种数据都给：
+        `versions`（git 里，可能有）与 `snapshots`（盘上，人人有）。
+        让"我改坏了"这种提问总能拿到一个可用的答案，比维持概念整洁重要。
+
+        权限与读一条记忆同闸：**直接复用 get()**，不自己拼"找库 + 判档位"。
+        不是省事 —— 自己拼的话，"库里真没有"与"有但档位不给看"很容易
+        写成两句不同的文案，那两句差异就是一个存在性探针（S-10.5 的教训）。
+        """
+        r = self.get(user_name, ident, lib_id=lib_id)
+        note = r["note"]
+        lib_id = str(note.get("_lib") or lib_id)
+
+        vault = self.service_for(lib_id).vault
+        snaps = vault.list_history(ident)
+        out: dict[str, Any] = {
+            "ok": True,
+            "ident": ident,
+            "title": note.get("title", ""),
+            "lib": lib_id,
+            "versioned": bool(note.get("versioned")),
+            "snapshots": snaps,
+        }
+        if snaps:
+            # 只给最近一版正文：够用（"改坏了想退回上一版"要的就是它），
+            # 且不会把整个快照目录灌进上下文。
+            out["previous_body"] = vault.newest_history_body(ident)[:4000]
+        if not out["versioned"]:
+            out["versions"] = []
+            out["message"] = (
+                "未启用版本控制（这条没标 versioned，不进 git 版本库）；"
+                + ("下面是改前快照" if snaps else "而且还没有过覆盖，没有快照")
+            )
+            return out
+
+        vr = vault.version_repo
+        if vr is None:  # pragma: no cover - 生产必配，独立模式才会走到
+            out["versions"] = []
+            out["message"] = "服务端没有启用共享版本库"
+            return out
+        name = vault.resolve(ident).name
+        h = vr.history(vault.lib_id, name, limit=limit)
+        out["versions"] = h.get("versions", [])
+        if h.get("message"):
+            out["message"] = h["message"]
+        if out["versions"]:
+            d = vr.diff(vault.lib_id, name, sha or out["versions"][0]["sha"])
+            out["diff"] = d.get("diff", "") if d.get("ok") else ""
+            if not d.get("ok"):
+                out["diff_error"] = d.get("message", "")
+        return out
 
     def list_notes(
         self, user_name: str, *, limit: int = 50, lib_id: str = "", **kwargs: Any
@@ -561,7 +629,258 @@ class TenantHub:
         result["_lib_label"] = (lib.label if lib else target)
         return result
 
+    # ────────────────────── 全量快照 / 恢复（v2 S-8.4）──────────────────────
+
+    #: 快照必含的目录（数据本体）。`exports` 刻意不含：那是产物目录，
+    #: 含进来会让"备份的备份"无限套娃，还会把上一次快照再打一遍。
+    SNAPSHOT_DIRS = ("libs", VERSIONED_DIRNAME)
+    SNAPSHOT_FILES = ("tenants.json",)
+
+    def snapshot_home(
+        self, *, out_dir: str = "", with_state: bool = False
+    ) -> dict[str, Any]:
+        """打包整个租户根目录（**这才是 v2 的备份机制**）。
+
+        ━━━ 为什么备份不再靠 git ━━━
+
+        v1 把 git 当备份：每次写都提交，于是"有历史"和"能恢复"被混成
+        一件事。S-8 之后普通写入不产生提交，git 里只剩 versioned 长文 ——
+        拿它当备份会**静默漏掉绝大多数记忆**。所以备份明确成另一条路：
+        tar 整个目录（`libs/` + `_versioned/` + `tenants.json`）。
+
+        Args:
+            with_state: 是否连 `state/`（令牌、主密钥、PIN）一起打。
+                默认 **False**：那个 tar 里是凭据，落到 exports/ 就成了
+                一个等着被误传的密钥包。要备份凭据请显式传 True，
+                返回值里也会提醒你这个包按机密对待。
+
+        Returns:
+            ``{"ok", "path", "bytes", "members", "with_state", "warnings"}``
+        """
+        import tarfile
+        import time as _time
+
+        stamp = _time.strftime("%Y%m%d-%H%M%S")
+        base = Path(out_dir).expanduser() if out_dir else (self.home / "exports")
+        base.mkdir(parents=True, exist_ok=True)
+        out = base / f"shm-snapshot-{stamp}.tar.gz"
+
+        warnings: list[str] = []
+        if with_state:
+            warnings.append(
+                "本包含 state/（令牌 / 主密钥 / PIN）—— 按机密对待，"
+                "不要发到共享盘或聊天里"
+            )
+        members = 0
+        with tarfile.open(out, "w:gz") as tf:
+            for d in self.SNAPSHOT_DIRS:
+                p = self.home / d
+                if p.is_dir():
+                    before = members
+                    for f in p.rglob("*"):
+                        if f.is_file():
+                            tf.add(f, arcname=str(f.relative_to(self.home)), recursive=False)
+                            members += 1
+                    if members == before:
+                        warnings.append(f"{d}/ 是空的（这个库还没数据）")
+            for f in self.SNAPSHOT_FILES:
+                p = self.home / f
+                if p.is_file():
+                    tf.add(p, arcname=f, recursive=False)
+                    members += 1
+            if with_state:
+                st = self.home / "state"
+                if st.is_dir():
+                    for f in st.rglob("*"):
+                        if f.is_file():
+                            tf.add(f, arcname=str(f.relative_to(self.home)), recursive=False)
+                            members += 1
+        try:
+            # 快照可能含凭据 → 权限收到 600，别做成同机可读
+            out.chmod(0o600)
+        except OSError:
+            pass
+        bytes_total = out.stat().st_size
+
+        # ⚠️ 打完必须**真解一遍**：实测里"备份文件存在但打不开"是常见事故
+        # （打包时进程被 kill、磁盘满）。只报"存在"不报"可读"的备份工具
+        # 会让人带着一个废包去恢复。
+        try:
+            with tarfile.open(out, "r:gz") as tf:
+                back = len([m for m in tf.getmembers() if m.isfile()])
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "code": ErrorCode.STORAGE_ERROR,
+                "message": f"快照写出来但读不回（这个包不可用）：{exc}",
+                "path": str(out),
+            }
+        if back != members:
+            warnings.append(f"回读清点不一致：写入 {members}，读到 {back} —— 别用这个包")
+
+        return {
+            "ok": True,
+            "action": "snapshot",
+            "path": str(out),
+            "bytes": bytes_total,
+            "members": members,
+            "with_state": with_state,
+            "warnings": warnings,
+        }
+
+    def restore_home(self, bundle: str, *, confirm: bool = False) -> dict[str, Any]:
+        """从快照 tar 恢复整个租户根目录（**明示覆盖 + 恢复前自动快照**）。
+
+        两道闸都是必需的：
+          1. ``confirm=True`` —— 恢复是整目录覆盖，正在写的记忆会没
+          2. 覆盖前先给当前状态打一个快照 —— 恢复错了还能退回恢复前
+
+        ⚠️ 解包必须防 **tar slip**：包里若有 `../../` 或绝对路径的成员，
+        直接 extractall 等于让一个 tar 文件写到目录外。这里逐成员校验
+        并拒整个包（不是"跳过坏成员"—— 一个畸形包通常意味着包被改过，
+        那种情况下"部分恢复"比不恢复更糟）。
+        """
+        import tarfile
+
+        src = Path(bundle).expanduser()
+        if not src.is_file():
+            raise ToolError(
+                ErrorCode.NOT_FOUND,
+                f"找不到快照文件：{bundle}",
+                hint="用 memory_backup(action=\"snapshot\") 生成；路径要给到 .tar.gz 文件本身",
+            )
+        if not confirm:
+            return {
+                "ok": False,
+                "code": ErrorCode.GOV_CONFIRM_REQUIRED,
+                "message": "恢复会**覆盖整个记忆目录**，必须显式 confirm=True",
+                "preview": {
+                    "bundle": str(src),
+                    "bytes": src.stat().st_size,
+                    "will_replace": list(self.SNAPSHOT_DIRS) + list(self.SNAPSHOT_FILES),
+                },
+                "hint": "先看 preview 确认要覆盖的是哪台机器的哪个目录",
+            }
+
+        with tarfile.open(src, "r:gz") as tf:
+            members = [m for m in tf.getmembers() if m.isfile()]
+            bad: list[str] = []
+            for m in members:
+                name = m.name
+                if name.startswith("/") or ".." in Path(name).parts:
+                    bad.append(name)
+            if bad:
+                raise ToolError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    f"快照里有越界路径，整包拒绝：{bad[:3]}",
+                    hint="这个包可能被手工改过或损坏 —— 换一个包，别强行恢复",
+                )
+            counted = len(members)
+
+        # 恢复前自动快照当前状态
+        pre = self.snapshot_home(with_state=True)
+        if not pre.get("ok"):
+            raise ToolError(
+                ErrorCode.STORAGE_ERROR,
+                f"恢复前的自动快照没做成，为安全起见不执行恢复：{pre.get('message')}",
+            )
+
+        # ━━━ 先解到暂存区，清点无误再换目录 ━━━
+        #
+        # 为什么不"边解包边覆盖"：那样第一条失败就把库留在"一半新一半旧"
+        # 的状态，而这种状态没人能收拾（连"现在到底恢复了什么"都说不清）。
+        # 也是在这里避开了 git 对象文件**只读**（444）的坑：直接覆盖
+        # `.git/objects/**` 会 PermissionError，必须先解到别处、
+        # 再把旧目录整体移走（见 _make_writable）。
+        import shutil
+        import time as _time
+
+        staging = self.home / ".restore-staging" / _time.strftime("%Y%m%d-%H%M%S")
+        staging.mkdir(parents=True, exist_ok=True)
+        try:
+            with tarfile.open(src, "r:gz") as tf:
+                # 上面已逐成员验过名字（拒绝 / 开头与 .. 段），这里再要一层
+                # 解释器自己的防护：filter="data" 会拒硬链接/符号链接/特殊文件。
+                # 版本没有这个参数时（<3.11.4）退回只用我们自己那道校验。
+                try:
+                    tf.extractall(staging, members=members, filter="data")
+                except TypeError:  # pragma: no cover - 老版本 Python
+                    tf.extractall(staging, members=members)
+            got = sum(1 for p in staging.rglob("*") if p.is_file())
+            if got != counted:
+                raise ToolError(
+                    ErrorCode.STORAGE_ERROR,
+                    f"解包不完整（应有 {counted}，实得 {got}），不执行覆盖",
+                    hint=f"包 {src} 可能损坏；当前库**没有被改动**，换一个包再试",
+                )
+
+            for entry in sorted(staging.iterdir()):
+                live = self.home / entry.name
+                if entry.is_dir():
+                    self._swap_dir(entry, live)
+                else:
+                    self._replace_file(entry, live)
+        finally:
+            root = self.home / ".restore-staging"
+            if root.exists():
+                for d in root.iterdir():
+                    self._make_writable(d)
+                    shutil.rmtree(d, ignore_errors=True)
+
+        # 恢复完**必须重启服务**：tenants.json 是启动时载入内存的，
+        # 直接跑的话内存里还是旧身份表，会出现"文件已恢复但登录不上"。
+        return {
+            "ok": True,
+            "action": "restore",
+            "restored": counted,
+            "pre_restore_snapshot": pre["path"],
+            "message": (
+                f"已恢复 {counted} 个文件；恢复前的状态存进了 "
+                f"{pre['path']}。⚠️ 重启服务后 tenants.json 才会重新载入 —— "
+                "不重启会出现「文件已恢复但身份还是旧的」"
+            ),
+        }
+
+    @staticmethod
+    def _make_writable(path: Path) -> None:
+        """把一棵树全部加上写位。
+
+        ⚠️ 必需，不是洁癖：git 的对象文件是**只读 444**，
+        直接覆盖或 ``shutil.rmtree`` 都会 ``PermissionError`` ——
+        而 Windows 上连"先删后写"都救不了（只读文件删不掉）。
+        恢复一个 git 仓库形态的目录，绕不开这一步。
+        """
+        import stat
+
+        if not path.exists():
+            return
+        for p in [path, *path.rglob("*")]:
+            try:
+                p.chmod(stat.S_IRUSR | stat.S_IWUSR | (stat.S_IXUSR if p.is_dir() else 0))
+            except OSError:
+                pass  # 单个改不动不该中断整棵树的准备，后面真会失败的会自己抛
+
+    def _swap_dir(self, src: Path, dst: Path) -> None:
+        """用暂存目录整个替换线上目录（先让两边都可写，再搬）。"""
+        import shutil
+
+        self._make_writable(dst)
+        if dst.exists():
+            shutil.rmtree(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+
+    def _replace_file(self, src: Path, dst: Path) -> None:
+        """用一个文件替换线上文件（tenants.json 这类）。"""
+        import shutil
+
+        self._make_writable(dst.parent)
+        if dst.exists():
+            dst.unlink()
+        shutil.move(str(src), str(dst))
+
     # ────────────────────── 运维 ──────────────────────
+
 
     def stats(self, user_name: str, *, lib_id: str = "", with_commits: bool = False) -> dict[str, Any]:
         """库况。跨库时给出每个库的概要。

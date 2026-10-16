@@ -8,11 +8,20 @@ http 两个入口）只做参数透传。这样两个传输方式的行为**不�
 
 同理，git 提交策略也只在这里实现一次。
 
-━━━ 为什么提交要防抖 ━━━
+━━━ 提交策略（v2 · S-8 改过，别按旧模型读这段）━━━
 
-每次写都 commit 会产生大量噪音提交（一个 agent 连续记 5 条 = 5 个提交），
-日志很快变得不可读。这里用「静默 N 秒后提交」—— 与 dsh-tiddlywiki 的
-自动提交同一思路。
+v1 是"每次写都提交（防抖 N 秒）"。问题不是性能，是**语义**：
+一次提交本该对应一次有意义的版本，而绝大多数写入只是改个措辞 ——
+历史被噪音淹没，真想 diff 的那条反而找不到。
+
+v2 拆成三层：
+
+  · 普通写入 **不碰 git**；防手滑靠库内 `.history/` 改前快照
+  · ``versioned: true`` 的长文 → 随写进**共享**版本库 `_versioned/`
+  · 删除/恢复这类**破坏性**动作 → 立刻提交本库 git（审计兜底）
+
+防抖机制保留，但只服务剩下的两类改动（配置变更、批量导入）——
+它们成串发生，一起提交才合理。
 
 提交同样走队列：`git add` 会改 `.git/index`，与文件写入并发会互相干扰
 （`.git/index.lock` 冲突）。
@@ -57,19 +66,23 @@ class SharedMemoryService:
         vault: Vault,
         *,
         queue: WriteQueue | None = None,
-        commit_debounce: float = DEFAULT_COMMIT_DEBOUNCE,
+        commit_debounce: float | None = None,
         config: Config | None = None,
     ) -> None:
         """
         Args:
             vault: 存储层。
             queue: 写队列。默认新建一个（测试时可注入以便观测）。
-            commit_debounce: 自动提交的静默秒数；0 = 每次写都提交。
+            commit_debounce: 防抖提交的静默秒数；0 = 改动立刻提交。
+                ``None`` = 用默认值（调用方常是"有覆盖才传"的写法，
+                所以这里必须把 None 当"没传"，不能留到比较时炸）。
             config: 配置视图。默认基于 vault 根目录构造。
         """
         self.vault = vault
         self.queue = queue or WriteQueue()
-        self.commit_debounce = commit_debounce
+        self.commit_debounce = (
+            DEFAULT_COMMIT_DEBOUNCE if commit_debounce is None else commit_debounce
+        )
         self.config = config or Config(vault.root)
         #: 是否有未提交的改动。防抖提交靠它决定要不要真的跑 git。
         self._dirty = False
@@ -163,11 +176,19 @@ class SharedMemoryService:
             # 记日志即可，等下一次写入会再尝试。
             logger.warning("防抖提交失败: %s", exc)
 
-    async def _flush_commit(self, *, reason: str = "提交") -> dict[str, Any]:
+    async def _flush_commit(self, *, reason: str = "提交", force: bool = False) -> dict[str, Any]:
         """立即提交（排队执行，避免与文件写入抢 git index）。
 
         注意：提交**走同一个队列**。这是刻意的 —— 队列保证串行，
         也就保证了 `git add` 不会与正在进行的写入交错。
+
+        ━━━ `force`（v2 · S-8.2 之后必需）━━━
+
+        常态写入不再置脏标记（写入不碰 git 了），所以 ``_dirty`` 已经
+        不能代表"工作树有没有未提交改动"。手动提交与破坏性操作必须
+        ``force=True`` 直接问 git —— 否则会拿一个过时的内部标记
+        回答"无改动"，而库里其实躺着几百条没提交的写入。
+        ``force=False`` 只留给防抖路径：那是优化，不是判据。
 
         ━━━ 提交信息里带作者 ━━━
 
@@ -188,7 +209,7 @@ class SharedMemoryService:
         用一个显式字段更直接，也不会出现"同样的操作，走 HTTP 就有作者、
         走别的就没有"的不一致。
         """
-        if not self._dirty:
+        if not force and not self._dirty:
             return {"committed": False, "message": "无改动"}
 
         author = self._author
@@ -217,7 +238,7 @@ class SharedMemoryService:
         mode: str = "upsert",
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """写入一条记忆（排队 → 落盘 → 按需提交）。
+        """写入一条记忆（排队 → 落盘 → 按需进版本库）。
 
         ━━━ 这里体现「闭环」的两个要点 ━━━
 
@@ -236,8 +257,10 @@ class SharedMemoryService:
 
         Returns:
             结果字典，额外带：
-              · ``committed`` —— 本次是否触发了提交
-              · ``notes``     —— 规则补全/提醒列表（可能为空）
+              · ``committed`` —— 本次是否**进了版本库**（仅 ``versioned: true``
+                的条目可能是 True；普通条目恒为 False，那不是失败）
+              · ``snapshot``  —— 本次覆盖前存的改前快照路径（新建为 None）
+              · ``notes``     —— 规则补全/提醒列表（可能没有这个键）
         """
         if mode not in ("upsert", "create", "append"):
             raise ToolError(
@@ -315,21 +338,33 @@ class SharedMemoryService:
             )
 
         result = await self.queue.submit(_do)
-        self._touch_commit()
-        # 关闭防抖时，_touch_commit 不会安排任务，所以要立刻提交
-        if self.commit_debounce <= 0:
-            commit = await self._flush_commit(reason=f"写入：{title_fixed}")
-            result["committed"] = bool(commit.get("committed"))
-            result["commit_pending"] = False
-        else:
-            # ⚠️ 防抖模式下 committed=False 是**正常状态，不是失败**。
-            # 说清楚的必要性：agent 若以为失败就重试，会写出重复内容，
-            # 而每次重试都重置防抖计时 → 提交永远不发生。
-            # 所以额外给一个 commit_pending 标志把语义讲明。
-            result["committed"] = False
-            result["commit_pending"] = True
-        if rule_notes:
-            result["notes"] = rule_notes
+
+        # ━━━ v2 · S-8.2：写入**不再自动 git 提交** ━━━
+        #
+        # 为什么改：一次提交该对应一次有意义的版本，而绝大多数写入是
+        # "改个措辞"。旧模型每次写都提交，历史被噪音淹没，真想 diff 的
+        # 那条反而找不到（F-8 的抱怨）。
+        #
+        # 现在分成三层，各管各的：
+        #   · 防手滑 → `.history/` 改前快照（人人有，vault 内，不进 git）
+        #   · 版本控制 → 仅 `versioned: true` 的条目进共享 `_versioned` 库
+        #   · 审计兜底 → 删除/恢复等**破坏性**操作仍立刻提交本库 git
+        #
+        # `committed` 的语义因此变了：它现在指"这条 versioned 记忆
+        # 进版本库了没"。非 versioned 恒为 False，且**不是失败** ——
+        # 不再有 commit_pending，因为写入路径上没有待提交的东西。
+        ver = result.get("version") or {}
+        result["committed"] = bool(ver.get("committed"))
+        # 规则提示与版本提示共用一个 notes：只能追加，不能整块覆盖
+        notes = list(rule_notes)
+        if ver and not ver.get("committed"):
+            notes.append(
+                "正文已落盘，这条只是没进版本库（标了 versioned 但提交失败："
+                f"{ver.get('message', '未知')}）—— 不影响读取，"
+                "要补提交用 memory_history(commit=True)"
+            )
+        if notes:
+            result["notes"] = notes
 
         # ── 写时关联提示（方案 10）──
         # "先拉再推"不强制（决策 1），但服务端把"拉"的时机还给你：
@@ -377,32 +412,48 @@ class SharedMemoryService:
         return [{"id": n.id, "title": n.title} for _, n in scored[:limit]]
 
     async def delete(self, ident: str) -> dict[str, Any]:
-        """软删除一条记忆（排队）。"""
+        """软删除一条记忆（排队）→ **立刻**提交本库 git。
+
+        ━━━ 为什么删除还要提交，而写入不提交 ━━━
+
+        删除是**破坏性**操作，本库的 git 历史是它最后的审计兜底：
+        `.trash` 会被 ``gc_trash`` 物理清理，那个清理的安全性论证
+        靠的就是"trash 文件在 git 历史里还能捞回来"。
+        如果删除不立刻提交，这个前提就不成立（正文不再自动提交之后尤其如此）。
+        低频、且每次都该有一条记录 —— 正好是"提交该对应一次有意义版本"的那类。
+        """
 
         def _do() -> dict[str, Any]:
             return self.vault.delete(ident)
 
         result = await self.queue.submit(_do)
-        self._touch_commit()
-        if self.commit_debounce <= 0:
-            await self._flush_commit(reason=f"删除：{ident}")
+        commit = await self._flush_commit(reason=f"删除：{ident}", force=True)
+        result["committed"] = bool(commit.get("committed"))
+        vr = result.get("version") or {}
+        if vr and not vr.get("committed", True):
+            result.setdefault("notes", []).append(
+                f"已从版本库摘除但提交失败：{vr.get('message', '未知')}"
+            )
         return result
 
     async def restore(self, filename: str) -> dict[str, Any]:
-        """从回收站恢复（排队）。"""
+        """从回收站恢复（排队）→ 同 delete，立刻提交（破坏性动作要留痕）。"""
 
         def _do() -> dict[str, Any]:
             return self.vault.restore(filename)
 
         result = await self.queue.submit(_do)
-        self._touch_commit()
-        if self.commit_debounce <= 0:
-            await self._flush_commit(reason=f"恢复：{filename}")
+        commit = await self._flush_commit(reason=f"恢复：{filename}", force=True)
+        result["committed"] = bool(commit.get("committed"))
         return result
 
     async def commit_now(self, message: str = "手动提交") -> dict[str, Any]:
-        """立刻提交（不等防抖）。用于 `memory_stats commit_now=True`。"""
-        result = await self._flush_commit(reason=message)
+        """立刻把本库工作树提交进 git（S-8.2 之后这是**唯一**的常规入库通道）。
+
+        ``force=True``：常态写入不再置脏标记，所以不能用 ``_dirty`` 判断
+        "有没有东西要提交" —— 那样会对着几百条未提交的写入回答"无改动"。
+        """
+        result = await self._flush_commit(reason=message, force=True)
         return {"ok": True, **result}
 
     # ══════════════════════ 读（不排队）══════════════════════
