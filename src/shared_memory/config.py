@@ -106,12 +106,18 @@ DEFAULT_RULES: dict[str, Any] = {
     "max_title_chars": 120,
     # 正文长度上限（0 = 不限）。超长正文通常是 agent 把整段对话贴进来了
     "max_body_chars": 0,
-    # 自动推断规则：标题/正文命中这些词 → 推断 type
+    # 自动推断规则：标题命中这些词 → 推断 type（v2 六型，S-1）。
+    # 顺序即优先级：具体信号（约束/流程）优先于通用词（结论）——
+    # "部署流程（必须走队列）" 该判 workflow 而不是 fact。
+    # v1→v2 映射：decision→fact（明显约束被 constraint 优先接走）、
+    # lesson→lesson、todo→task、ref→fact。
     "infer_type": {
         "lesson": ["教训", "踩坑", "坑点", "别再", "不要再", "事故"],
-        "decision": ["决定", "决策", "口径", "约定", "规范", "定案"],
-        "todo": ["待办", "TODO", "待确认", "待补充"],
-        "ref": ["参考", "资料", "文档索引", "链接汇总"],
+        "constraint": ["必须", "一律", "禁止", "不得", "铁律", "红线", "硬约束"],
+        "workflow": ["流程", "步骤", "操作手册", "怎么做", "SOP"],
+        "habit": ["习惯", "偏好", "风格"],
+        "task": ["待办", "TODO", "待确认", "待补充", "进行中"],
+        "fact": ["决定", "决策", "口径", "约定", "规范", "定案", "参考", "资料"],
     },
     # 自动推断 claim：这些词出现 → 标为 inference（而不是默认的 fact）
     "infer_claim_inference": [

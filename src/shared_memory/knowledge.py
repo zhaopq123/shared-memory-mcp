@@ -33,7 +33,9 @@ CST = timezone(timedelta(hours=8))
 
 #: 记忆的类型（type 字段）。不做强校验 —— 允许用户自定义类型，
 #: 但内置的这几种在视图里有特殊待遇。
-KNOWN_TYPES = ("note", "decision", "lesson", "todo", "ref")
+KNOWN_TYPES = ("note", "decision", "lesson", "todo", "ref",
+               # v2 六型（S-1）；旧值保留可读
+               "workflow", "constraint", "habit", "fact", "task")
 
 #: 陈述性质（claim 字段）—— 这是"不幻觉"的**结构性**落点。
 #:
@@ -262,9 +264,9 @@ def build_backlinks(notes: list[Any]) -> dict[str, list[str]]:
 #: 内置视图定义。``kind`` 是机器名，``label`` 是给人看的。
 VIEWS: dict[str, dict[str, str]] = {
     "overview": {"label": "总览", "desc": "库的整体状况：条数、类型分布、时效告警"},
-    "decisions": {"label": "决策记录", "desc": "定过的口径与取舍（type=decision）"},
+    "decisions": {"label": "决策记录", "desc": "定过的口径与取舍（type=fact/constraint，兼容旧 decision）"},
     "lessons": {"label": "踩坑清单", "desc": "踩过的坑，避免重复（type=lesson）"},
-    "todos": {"label": "待办", "desc": "未完成的事（type=todo 或 status=todo）"},
+    "todos": {"label": "待办", "desc": "未完成的事（type=task，兼容旧 todo / status=todo）"},
     "expiring": {"label": "时效告警", "desc": "已过期 / 该复查 / 已被取代"},
     "inferences": {"label": "未核实的推断", "desc": "claim=inference 的条目 —— 引用前需当心"},
     "projects": {"label": "按项目", "desc": "每个工作区下的记忆"},
@@ -367,14 +369,20 @@ def build_view(
         ]
 
     if kind == "decisions":
-        items = type_filter("decision")
+        # v2（S-1）：新写入推六型后，口径类记忆落在 fact/constraint；
+        # 旧数据的 decision 仍要能读到（兼容不迁移）。
+        items = [
+            n for n in notes
+            if (getattr(n, "meta", {}) or {}).get("type") in
+            ("decision", "fact", "constraint")
+        ]
     elif kind == "lessons":
         items = type_filter("lesson")
     elif kind == "todos":
-        # 待办有两种写法：type=todo，或 status=todo（后者更通用）
+        # 待办写法：type=task（v2）/ type=todo（旧）/ status=todo（更通用）
         items = [
             n for n in notes
-            if (getattr(n, "meta", {}) or {}).get("type") == "todo"
+            if (getattr(n, "meta", {}) or {}).get("type") in ("todo", "task")
             or (getattr(n, "meta", {}) or {}).get("status") == "todo"
         ]
     elif kind == "expiring":

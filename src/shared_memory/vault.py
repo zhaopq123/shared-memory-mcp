@@ -86,6 +86,61 @@ _FM = "---"
 #: 避免超过 ext4(255) / NTFS(255) / Android 的路径长度限制。
 _MAX_SLUG = 80
 
+# ══════════════════ v2 概念字段（S-1 落地）══════════════════
+#: 记忆六型（v2 产品重构设计 §4.3）。type 缺省 fact。
+#: 与 v1 的 note/decision/lesson/todo/ref 的关系：
+#: decision→fact（或按内容判 constraint）、lesson→lesson、
+#: todo→task、ref→fact；旧值仍可读，新写入只认六型。
+NOTE_TYPES: tuple[str, ...] = (
+    "workflow", "constraint", "habit", "fact", "lesson", "task",
+)
+
+#: scope 三层（v2 防串台核心）：long-term 默认可见；
+#: task:<名> 仅当前会话；archived 默认不可见。
+SCOPE_LONG_TERM = "long-term"
+SCOPE_ARCHIVED = "archived"
+
+
+def valid_type(value: str) -> bool:
+    """type 是否是六型之一。"""
+    return value in NOTE_TYPES
+
+
+def valid_scope(value: str) -> bool:
+    """scope 是否是三层之一（task: 后必须跟非空任务名）。"""
+    if value in (SCOPE_LONG_TERM, SCOPE_ARCHIVED):
+        return True
+    return value.startswith("task:") and len(value) > len("task:")
+
+
+def validate_v2_fields(extra: dict[str, Any]) -> None:
+    """显式传入的 v2 概念字段必须合法（S-1.5）。
+
+    缺省值由 put() 保证合法，这里只拦"显式传错"——
+    传错不拦，脏数据会悄悄躺进 frontmatter，等检索时才对不上。
+    """
+    t = str(extra.get("type") or "").strip()
+    if t and not valid_type(t):
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"未知的记忆类型：{t}",
+            hint="合法类型（六型）：" + "、".join(NOTE_TYPES),
+        )
+    sc = str(extra.get("scope") or "").strip()
+    if sc and not valid_scope(sc):
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"scope 格式不对：{sc}",
+            hint="合法值：long-term / task:<任务名> / archived",
+        )
+    sh = str(extra.get("share") or "").strip()
+    if sh and sh not in ("mine", "space", "shared"):
+        raise ToolError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"share 格式不对：{sh}",
+            hint="合法值：mine / space / shared（留空 = 继承空间默认）",
+        )
+
 
 def now_iso() -> str:
     """当前时间，ISO 格式带 +08:00 偏移（人类可读且可排序）。"""
@@ -180,6 +235,10 @@ def dump_frontmatter(meta: dict[str, Any]) -> str:
         "review-after",
         "superseded-by",
         "related",
+        # v2 概念字段（S-1）：scope/versioned/share
+        "scope",
+        "versioned",
+        "share",
     )
     lines = [_FM]
 
@@ -258,6 +317,30 @@ class Note:
     path: str = ""
     #: 完整 frontmatter（含 type / status / claim / valid-until / related 等）
     meta: dict[str, Any] = field(default_factory=dict)
+
+    # ── v2 概念字段（S-1）──
+    # 都走 meta 不加 dataclass 字段：序列化/兼容旧文件的成本为零，
+    # 缺省值即默认语义（旧数据没标过的按"结论/长期/无版本/继承空间"读）。
+
+    @property
+    def type(self) -> str:
+        """记忆类型（六型之一）。缺省 ``fact``。"""
+        return str((self.meta or {}).get("type") or "fact")
+
+    @property
+    def scope(self) -> str:
+        """生效域：``long-term`` / ``task:<名>`` / ``archived``。缺省 long-term。"""
+        return str((self.meta or {}).get("scope") or SCOPE_LONG_TERM)
+
+    @property
+    def versioned(self) -> bool:
+        """是否进版本库。缺省 ``False``（默认无 git）。"""
+        return bool((self.meta or {}).get("versioned"))
+
+    @property
+    def share(self) -> str:
+        """共享档位：``mine`` / ``space`` / ``shared``。空 = 继承空间默认。"""
+        return str((self.meta or {}).get("share") or "")
 
     def to_dict(self, *, with_body: bool = True) -> dict[str, Any]:
         """转成可 JSON 序列化的字典。
@@ -968,6 +1051,12 @@ class Vault:
                 f"{old_body.rstrip()}\n\n{body}".strip() if mode == "append" else body
             )
             meta.update({"title": title, "updated": ts})
+            # v2（S-1）：缺省补值 + 显式值校验。
+            # setdefault 而非覆盖——更新时不能把显式标过的类型/域改掉。
+            if extra:
+                validate_v2_fields(extra)
+            meta.setdefault("type", "fact")
+            meta.setdefault("scope", SCOPE_LONG_TERM)
             # 保留 created：它记录的是这条记忆**最初**被写下的时间，
             # 更新时不该被覆盖（否则"最近创建"这类排序会失真）
             if "created" not in meta:
@@ -998,12 +1087,19 @@ class Vault:
 
         note_id = _new_id()
         path = self._unique_path(title, note_id)
+        if extra:
+            validate_v2_fields(extra)
         meta: dict[str, Any] = {
             "id": note_id,
             "title": title,
             "tags": tags,
             "created": ts,
             "updated": ts,
+            # v2（S-1）缺省：不填也有值——agent 赶时间不会记得传。
+            # versioned/share 刻意不写缺省：一个噪音字段换不来信息，
+            # 读取端按缺省语义处理（False / 继承空间）。
+            "type": "fact",
+            "scope": SCOPE_LONG_TERM,
         }
         if author:
             meta["author"] = author
@@ -1168,6 +1264,7 @@ class Vault:
         sort: str = "relevance",
         claim: str = "",
         status: str = "active",
+        scope: str = SCOPE_LONG_TERM,
     ) -> dict[str, Any]:
         """检索记忆。
 
@@ -1205,6 +1302,10 @@ class Vault:
             status: 时效状态过滤（**默认 ``active``**，见下方说明）。
                 ``active`` 排除 superseded/expired（review 仍算现行）；
                 ``all`` = 不过滤（考古模式）。
+            scope: 生效域过滤（v2 S-1，**默认 ``long-term``**——防串台的第一闸：
+                任务过程态根本不进默认检索）。``task:<名>`` 只要该任务域；
+                ``archived`` 只要归档区；``all`` 全都要（考古）；
+                传空串 = 不过滤（兼容旧调用的逃生门）。
 
         ━━━ 为什么 status 默认 active（2026-10-13 决策 7）━━━
 
@@ -1235,6 +1336,16 @@ class Vault:
                      "（考古）；review/expired/superseded=只要那一态",
             )
         only_active = want_status == "active"
+        # v2（S-1）：scope 生效域。默认 long-term（防串台第一闸）；
+        # 空串 = 不过滤（旧调用逃生门）；all = 考古。
+        want_scope = (scope or "").strip()
+        if want_scope and want_scope != "all" and not valid_scope(want_scope):
+            raise ToolError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"scope 格式不对：{scope!r}",
+                hint="long-term / task:<任务名> / archived / all"
+                     "（留空=不过滤）",
+            )
 
         scored: list[tuple[int, Note]] = []
         for note in self.all_notes():
@@ -1276,6 +1387,15 @@ class Vault:
                 # 单态检索：只要那一态（review=该复查的、expired=已过期的、
                 # superseded=已被取代的）。语义与 expiring 视图对齐。
                 if expiry_state(meta)["state"] != want_status:
+                    continue
+
+            # ④.5 scope 生效域过滤（v2 S-1：检索默认收窄的第一闸）。
+            #     任务过程态不进默认范围——b 会话搜天搜地也摸不到 ax。
+            if want_scope:
+                ns = note.scope
+                if want_scope == "all":
+                    pass
+                elif ns != want_scope:
                     continue
 
             # ⑤ 关键词打分

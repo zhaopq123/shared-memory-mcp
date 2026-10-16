@@ -1149,4 +1149,212 @@ def test_error_envelope_omits_empty_fields() -> None:
 #   test_tools_return_envelope_not_exception
 #   test_tools_write_search_export_roundtrip
 # 源文件 src/shared_memory/tools.py 已删（方案 7，2026-10-13）。
+
+
+# ═════════════════════  v2 概念字段（S-1）  ═════════════════════
+# 存储层落 v2 三件事：记忆六型（type）、生效域（scope）、共享档（share）。
+# 每条都对应一条对外承诺或一处兼容红线，不做无谓覆盖。
+
+
+def test_note_types_is_the_six_type_contract() -> None:
+    """六型是 v2 的公开契约，改名/增减都算破坏性变更。"""
+    from shared_memory.vault import NOTE_TYPES
+
+    assert NOTE_TYPES == (
+        "workflow", "constraint", "habit", "fact", "lesson", "task",
+    )
+
+
+def test_valid_type_accepts_six_rejects_unknown() -> None:
+    from shared_memory.vault import NOTE_TYPES, valid_type
+
+    assert all(valid_type(t) for t in NOTE_TYPES)
+    assert not valid_type("decision")  # 旧值可读，但不是合法的新写入
+    assert not valid_type("")
+    assert not valid_type("FACT")  # 大小写敏感，不给模糊地带
+
+
+def test_valid_scope_covers_three_layers() -> None:
+    from shared_memory.vault import valid_scope
+
+    assert valid_scope("long-term")
+    assert valid_scope("archived")
+    assert valid_scope("task:周报")
+    assert not valid_scope("task:")  # 有前缀无任务名 = 非法
+    assert not valid_scope("task")  # 少冒号
+    assert not valid_scope("forever")
+
+
+def test_put_defaults_type_fact_and_scope_long_term(vault: Vault) -> None:
+    """agent 赶时间不传字段时也要有合法缺省 —— 不能让脏值躺进文件。"""
+    vault.put(title="默认字段", body="什么都没标")
+
+    note = vault.get("默认字段")
+    assert note.type == "fact"
+    assert note.scope == "long-term"
+    assert note.versioned is False
+    assert note.share == ""
+
+
+def test_put_explicit_type_and_scope_land_in_frontmatter(vault: Vault) -> None:
+    vault.put(
+        title="部署铁律",
+        body="必须走队列",
+        extra={"type": "constraint", "scope": "long-term"},
+    )
+
+    note = vault.get("部署铁律")
+    assert note.type == "constraint"
+    raw = list(vault.notes_dir.glob("*.md"))[0].read_text(encoding="utf-8")
+    assert "type: constraint" in raw  # 真进了文件，不是只在内存 property
+
+
+def test_put_rejects_unknown_type(vault: Vault) -> None:
+    with pytest.raises(ToolError) as ei:
+        vault.put(title="坏类型", body="", extra={"type": "decision"})
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+def test_put_rejects_bad_scope(vault: Vault) -> None:
+    with pytest.raises(ToolError) as ei:
+        vault.put(title="坏域", body="", extra={"scope": "task:"})
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+def test_put_rejects_bad_share(vault: Vault) -> None:
+    with pytest.raises(ToolError) as ei:
+        vault.put(title="坏共享", body="", extra={"share": "public"})
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+def test_update_does_not_clobber_explicit_type(vault: Vault) -> None:
+    """更新正文时不能把显式标过的类型/域改回缺省（setdefault 的价值）。"""
+    vault.put(
+        title="流程A", body="v1",
+        extra={"type": "workflow", "scope": "long-term"},
+    )
+    vault.put(title="流程A", body="v2 只改正文")
+
+    note = vault.get("流程A")
+    assert note.type == "workflow"
+    assert note.scope == "long-term"
+
+
+def test_legacy_note_reads_as_fact_longterm_without_rewrite(vault: Vault) -> None:
+    """S-1.7 兼容红线：旧 note 按 fact/long-term 读，**文件一个字节都不动**。"""
+    legacy = (
+        "---\n"
+        "id: mem-20260101-000000-legacy\n"
+        "title: 上古条目\n"
+        "tags: [老数据]\n"
+        "created: 2026-01-01T00:00:00+08:00\n"
+        "updated: 2026-01-01T00:00:00+08:00\n"
+        "---\n\n"
+        "老格式正文，没有 type / scope。\n"
+    )
+    p = vault.notes_dir / "上古条目.md"
+    p.write_text(legacy, encoding="utf-8")
+    before = p.read_bytes()
+
+    note = vault.get("上古条目")
+    assert note.type == "fact"
+    assert note.scope == "long-term"
+
+    assert p.read_bytes() == before, "读取旧数据绝不能改写文件"
+
+
+def test_search_default_scope_hides_task_process_notes(vault: Vault) -> None:
+    """防串台第一闸：默认检索看不到 task: 过程态。"""
+    vault.put(title="长期口径 alpha", body="定下来的口径")
+    vault.put(
+        title="任务过程 alpha", body="过程中随手记的",
+        extra={"scope": "task:周报"},
+    )
+
+    titles = {r["title"] for r in vault.search("alpha")["results"]}
+    assert titles == {"长期口径 alpha"}
+
+
+def test_search_scope_task_returns_only_that_task(vault: Vault) -> None:
+    vault.put(title="任务A alpha", body="a", extra={"scope": "task:A"})
+    vault.put(title="任务B alpha", body="b", extra={"scope": "task:B"})
+    vault.put(title="长期 alpha", body="c")
+
+    titles = [r["title"] for r in vault.search("alpha", scope="task:A")["results"]]
+    assert titles == ["任务A alpha"]
+
+
+def test_search_scope_all_and_empty_are_escape_hatches(vault: Vault) -> None:
+    vault.put(title="任务A beta", body="a", extra={"scope": "task:A"})
+    vault.put(title="归档 beta", body="b", extra={"scope": "archived"})
+    vault.put(title="长期 beta", body="c")
+    everyone = {"任务A beta", "归档 beta", "长期 beta"}
+
+    got_all = {r["title"] for r in vault.search("beta", scope="all")["results"]}
+    assert got_all == everyone
+    # 空串 = 不过滤，给按旧签名调用的老客户端留的逃生门
+    got_esc = {r["title"] for r in vault.search("beta", scope="")["results"]}
+    assert got_esc == everyone
+    # 默认只 long-term
+    got_dflt = {r["title"] for r in vault.search("beta")["results"]}
+    assert got_dflt == {"长期 beta"}
+
+
+def test_search_rejects_bad_scope(vault: Vault) -> None:
+    with pytest.raises(ToolError) as ei:
+        vault.search("x", scope="nope")
+    assert ei.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+def test_share_and_versioned_roundtrip(vault: Vault) -> None:
+    """share/versioned 走 meta 且在白名单里 —— 写进去必须原样读回来。"""
+    vault.put(
+        title="可复用工作流", body="步骤 1/2/3",
+        extra={"type": "workflow", "share": "space", "versioned": True},
+    )
+
+    note = vault.get("可复用工作流")
+    assert note.share == "space"
+    assert note.versioned is True
+    # 再写一次（改正文）也不能丢
+    vault.put(title="可复用工作流", body="步骤 1/2/3/4")
+    note2 = vault.get("可复用工作流")
+    assert note2.share == "space"
+    assert note2.versioned is True
+
+
+def test_default_infer_rules_speak_six_types() -> None:
+    """v2 缺省推断规则只产出六型；约束/流程信号优先于通用词。"""
+    from shared_memory.config import DEFAULT_RULES, infer_meta
+
+    rules = {"auto_infer": True, **DEFAULT_RULES}
+    assert infer_meta(
+        title="部署必须走队列", body="", workspace="", rules=rules
+    )["type"] == "constraint"
+    assert infer_meta(
+        title="发布流程步骤", body="", workspace="", rules=rules
+    )["type"] == "workflow"
+    assert infer_meta(
+        title="口径约定：先冷启动", body="", workspace="", rules=rules
+    )["type"] == "fact"
+
+
+def test_views_see_legacy_decision_and_new_task(vault: Vault) -> None:
+    """视图兼容：旧 decision 与新 fact/constraint/task 都要能被视图捞到。"""
+    from shared_memory.knowledge import build_view
+
+    vault.put(title="新口径", body="", extra={"type": "fact"})
+    vault.put(title="新铁律", body="", extra={"type": "constraint"})
+    vault.put(title="新任务", body="", extra={"type": "task"})
+    # 直接塞一条老 decision（绕过 put 的校验）模拟历史数据
+    (vault.notes_dir / "旧决策.md").write_text(
+        "---\nid: mem-x\ntitle: 旧决策\ntype: decision\n---\n\n老决策正文\n",
+        encoding="utf-8",
+    )
+
+    notes = vault.all_notes()
+    dec = {i["title"] for i in build_view("decisions", notes)["items"]}
+    assert {"新口径", "新铁律", "旧决策"} <= dec
+    todo = {i["title"] for i in build_view("todos", notes)["items"]}
+    assert "新任务" in todo
 # ─────────────────────────────────────────────────────────────
