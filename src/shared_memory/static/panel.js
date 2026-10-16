@@ -1530,6 +1530,153 @@ function copyText(s, btn){
   } else fallback();
 }
 
+/** 接入与安全块（v2 · S-7.3 第②块「接入」）。
+ *
+ *  ━━━ 为什么先做这一块 ━━━
+ *
+ *  主密钥 / PIN / 接入码三个能力在后端已经齐了（S-6），但**面板里够不着** ——
+ *  等于只有 API，用户得去翻文档调 curl。这一块把它们变成"点一下就成"。
+ *
+ *  ⚠️ 主密钥明文**只在生成/轮换那一次出现**（盘上只有哈希）。所以：
+ *   · 生成后当场展示 + 一键复制，并明说"关掉就再也看不到"
+ *   · 接入码也**只在那一刻拼得出来**（它内含主密钥），平时显示占位说明
+ */
+function securityBlockHtml(){
+  const zh = LANG === 'zh';
+  return `
+    <h3 class="sechead">${zh ? '接入与安全' : 'Access & security'}</h3>
+    <p class="sectip">${zh
+      ? '两把钥匙各管一摊：<strong>主密钥</strong>给 agent（MCP），<strong>PIN</strong> 给人（面板）。两者都只存哈希 —— 忘了只能重置，找不回来。'
+      : 'A master key for agents, a PIN for humans. Only hashes are stored.'}</p>
+
+    <div class="tocwrap">
+      <div class="saverow" style="padding-top:0;border-top:none;flex-wrap:wrap">
+        <span class="badge" id="mk-state">…</span>
+        <button class="btn primary" id="mk-gen">${zh ? '生成主密钥' : 'Generate'}</button>
+        <button class="btn" id="mk-rotate">${zh ? '轮换' : 'Rotate'}</button>
+        <span class="sectip" style="margin:0;font-size:12px">${zh
+          ? '轮换后旧密钥有 60 秒宽限 —— 正在跑的任务不会被打断。'
+          : 'The old key stays valid for 60s after rotation.'}</span>
+      </div>
+      <pre id="mk-key" style="display:none;margin:10px 0 0;font-size:12px;white-space:pre-wrap"></pre>
+      <div id="mk-msg" style="font-size:12.5px;margin-top:8px"></div>
+    </div>
+
+    <div class="tocwrap" style="margin-top:12px">
+      <div class="saverow" style="padding-top:0;border-top:none;flex-wrap:wrap">
+        <span class="badge" id="pin-state">…</span>
+        <input type="password" id="pin-input" inputmode="numeric" maxlength="8"
+               autocomplete="new-password"
+               placeholder="${zh ? '4~8 位数字' : '4-8 digits'}"
+               style="width:150px;letter-spacing:.2em;text-align:center">
+        <button class="btn primary" id="pin-set">${zh ? '设置 PIN' : 'Set PIN'}</button>
+        <button class="btn" id="pin-off">${zh ? '关闭 PIN' : 'Disable PIN'}</button>
+      </div>
+      <div id="pin-msg" style="font-size:12.5px;margin-top:8px"></div>
+    </div>
+
+    <div class="tocwrap" style="margin-top:12px">
+      <div style="font-size:12.5px;color:var(--muted)">${zh
+        ? '接入码（新机器一条命令接上）：' : 'Connect code:'}</div>
+      <pre id="conn-code" style="margin:6px 0 0;font-size:12px;white-space:pre-wrap"></pre>
+      <div class="saverow" style="margin-top:8px;padding-top:0;border-top:none">
+        <button class="btn" id="conn-copy">${zh ? '复制接入码' : 'Copy code'}</button>
+        <button class="btn" id="conn-cmd">${zh ? '复制 connect 命令' : 'Copy command'}</button>
+      </div>
+      <div id="conn-msg" style="font-size:12.5px;margin-top:6px"></div>
+    </div>`;
+}
+
+/** 接线：主密钥 / PIN / 接入码。 */
+function wireSecurityBlock(){
+  const zh = LANG === 'zh';
+  const $ = (id) => document.getElementById(id);
+  /* 生成那一刻才拿得到明文；平时只显示占位（哈希存盘，拼不出完整码） */
+  let shownKey = '';
+
+  const connCode = (key) => {
+    const host = location.hostname || '127.0.0.1';
+    const port = location.port || '8200';
+    return `sm://${host}:${port}?k=${key || '<主密钥>'}`;
+  };
+  const connCmd = (key) =>
+    `npx shared-memory-connect "${connCode(key)}" --project-dir .`;
+
+  const refresh = async () => {
+    const mk = await api('/api/auth/master-key');
+    if (mk && mk.ok){
+      $('mk-state').textContent = mk.enabled
+        ? (zh ? `主密钥已启用（主人：${mk.owner}）` : `Master key on (owner: ${mk.owner})`)
+        : (zh ? '主密钥未设置 —— agent 目前用旧 token' : 'No master key yet');
+      $('mk-state').className = 'badge' + (mk.enabled ? ' claim-fact' : '');
+    }
+    const pin = await api('/api/auth/pin');
+    if (pin && pin.ok){
+      $('pin-state').textContent = pin.enabled
+        ? (zh ? '面板 PIN 已开' : 'Panel PIN on')
+        : (zh ? '面板 PIN 未设（用账号密码）' : 'No PIN (username/password)');
+      if (pin.locked) $('pin-state').textContent +=
+        zh ? `（锁 ${pin.wait_seconds}s）` : ` (locked ${pin.wait_seconds}s)`;
+    }
+    if (!shownKey){
+      $('conn-code').textContent = connCode('');
+      $('conn-msg').innerHTML = zh
+        ? '⚠️ 接入码里含主密钥，<strong>只在生成/轮换那一次能拿到完整的</strong>；平时这里只显示占位。'
+        : '⚠️ The code embeds the master key and is only complete right after generating.';
+    } else {
+      $('conn-code').textContent = connCode(shownKey);
+    }
+  };
+
+  const showKey = (key, action) => {
+    shownKey = key;
+    $('mk-key').style.display = '';
+    $('mk-key').textContent = key;
+    $('mk-msg').innerHTML = zh
+      ? `<strong>这是唯一一次显示明文</strong>（盘上只存哈希）：请立刻复制存进客户端配置。`
+      : 'Shown once only — copy it now.';
+    $('conn-code').textContent = connCode(key);
+    $('conn-msg').innerHTML = `<span style="color:var(--verdigris)">${
+      zh ? '接入码已可用（含新密钥）' : 'Connect code is ready'}</span>`;
+    refresh();
+  };
+
+  $('mk-gen').onclick = async () => {
+    if (!confirm(zh ? '生成主密钥？已接入的客户端需要把新密钥填进配置。'
+                    : 'Generate a master key?')) return;
+    const r = await apiPost('/api/auth/master-key', {action: 'generate'});
+    if (!r.ok){ $('mk-msg').textContent = r.message || 'fail'; return; }
+    showKey(r.key, 'generate');
+  };
+  $('mk-rotate').onclick = async () => {
+    if (!confirm(zh ? '轮换主密钥？旧密钥 60 秒后失效。' : 'Rotate the master key?')) return;
+    const r = await apiPost('/api/auth/master-key', {action: 'rotate'});
+    if (!r.ok){ $('mk-msg').textContent = r.message || 'fail'; return; }
+    showKey(r.key, 'rotate');
+  };
+  $('pin-set').onclick = async () => {
+    const pin = $('pin-input').value.trim();
+    const r = await apiPost('/api/auth/pin', {action: 'set', pin});
+    $('pin-msg').textContent = r.ok
+      ? (zh ? 'PIN 已设置（下次打开面板就要输它了）' : 'PIN set')
+      : (r.message || 'fail');
+    if (r.ok) $('pin-input').value = '';
+    refresh();
+  };
+  $('pin-off').onclick = async () => {
+    if (!confirm(zh ? '关闭面板 PIN？之后改用账号密码登录。' : 'Disable panel PIN?')) return;
+    const r = await apiPost('/api/auth/pin', {action: 'disable'});
+    $('pin-msg').textContent = r.ok ? (r.message || 'PIN 已关闭') : (r.message || 'fail');
+    refresh();
+  };
+  $('conn-copy').onclick = (e) =>
+    copyText(connCode(shownKey), e.target);
+  $('conn-cmd').onclick = (e) =>
+    copyText(connCmd(shownKey), e.target);
+
+  refresh();
+}
+
 async function loadSettings(){
   const holder = document.getElementById('sbody');
   holder.innerHTML = `<div class="empty">${t('common.loading')}</div>`;
@@ -1565,6 +1712,8 @@ async function loadSettings(){
       <div class="warnbox">${t('cfg.defaultInstructions')}</div>` : ''}
     ${r.instructions_disabled ? `
       <div class="errbox">${t('cfg.disabledInstructions')}</div>` : ''}
+
+    ${securityBlockHtml()}
 
     <h3 class="sechead">${t('cfg.instructions')}</h3>
     <p class="sectip">${t('cfg.instructionsHint')}</p>
@@ -1670,6 +1819,7 @@ async function loadSettings(){
         + '<code>./venv/bin/python scripts/set_password.py admin</code>'}</p>
   </div>`;
 
+  wireSecurityBlock();
   document.getElementById('cfg-save').onclick = saveSettings;
   document.getElementById('cfg-reload').onclick = () => { loadSettings(); };
   /* 「生成 token 并填进配置」—— 标准管理系统的「Generate API key」形态：

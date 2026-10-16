@@ -337,6 +337,10 @@ def test_js_uses_only_existing_element_ids() -> None:
         "access-gen", "access-gen-msg", "access-snippet", "nt-copy",
         # v2 S-7.1：PIN 六盒登录屏（动态构建，不在静态 HTML 里）
         "pinwrap", "pin-wait", "login-pw-link",
+        # v2 S-7.3①：接入与安全块（主密钥 / PIN / 接入码）
+        "mk-state", "mk-gen", "mk-rotate", "mk-key", "mk-msg",
+        "pin-state", "pin-input", "pin-set", "pin-off", "pin-msg",
+        "conn-code", "conn-copy", "conn-cmd", "conn-msg",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -520,3 +524,47 @@ def test_filtered_count_shows_denominator() -> None:
     assert "!== r.stats.notes" in seg, (
         "没有「只在两者不同时才显示分母」的判断 —— 无筛选时显示 4/4 是噪音"
     )
+
+# ── v2 S-7.3①：接入与安全块 ──
+
+
+def test_security_block_contract() -> None:
+    """主密钥 / PIN / 接入码必须在**面板里**可用，不是只有 API。
+
+    后端（S-6）早就齐了，但面板够不着 = 用户得去翻文档调 curl。
+    这一块的意义就是把"只有 API"变成"点一下就成"。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+
+    assert "function securityBlockHtml(" in js, "没有接入与安全块"
+    assert "function wireSecurityBlock(" in js, "接入与安全块没接线"
+    assert "securityBlockHtml()" in js, "块没被渲染进设置页"
+    assert "wireSecurityBlock();" in js, "块没被接线调用"
+    for eid in ("mk-gen", "mk-rotate", "pin-set", "pin-off", "conn-code"):
+        assert f"'{eid}'" in js, f"缺 {eid}"
+
+
+def test_master_key_plaintext_shown_once_only() -> None:
+    """主密钥明文**只在生成/轮换那一次**显示。
+
+    ⚠️ 盘上只存哈希，生成后如果界面不展示、不提供复制，
+    用户就永远拿不到这把钥匙了（那等于把自己锁在门外）。
+    反过来，把明文渲染到"随时可看"的地方也不行 —— 面板可能被人瞄一眼。
+
+    所以这条钉住三件事：
+      ① 生成/轮换的返回值里取 key 并**当场**展示
+      ② 用一个变量记住它，且**只有刷新页面就没了**（不落 localStorage）
+      ③ 接入码在没拿到明文时只显示占位（拼不出完整码）
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+    seg = js[js.index("function wireSecurityBlock("):]
+    seg = seg[:seg.index("async function loadSettings(")]
+
+    assert "showKey(r.key" in seg, "生成后没有当场展示明文"
+    assert "let shownKey = ''" in seg, "没有用局部变量持有明文"
+    assert "localStorage" not in seg, "明文不该进 localStorage（那会长期留在浏览器里）"
+    assert "shownKey = key" in seg
+    # 没拿到明文时接入码要是占位
+    assert "'<主密钥>'" in seg or "<主密钥>" in seg, "接入码缺占位说明"
