@@ -814,6 +814,24 @@ def _wrap_auth(app: Any, auth: Auth) -> Any:
             await app(scope, receive, send)
             return
 
+        # ── ②c 面板免登录直进（v2 · S-6.1）──
+        #
+        # 没设 PIN **且**绑定不可公开到达（loopback / 纯内网）时，面板直进 ——
+        # 这是单机自用的默认形态："图省事"不该变成"每开一次面板输一遍密码"。
+        #
+        # ⚠️ 两条边界，不可让步：
+        #   ① 公开绑定（``auth.required``）时**永远**要凭据 ——
+        #      关 PIN 不等于把面板敞给公网。
+        #   ② 只放行**面板与 /api**；``/mcp`` 仍要凭据 —— agent 的入口
+        #      不能因为"是本机"就变成匿名的（那等于把记忆库敞开给
+        #      这台机器上任何一个能起进程的东西）。
+        if auth.panel_open() and not path.startswith("/mcp"):
+            set_identity(
+                auth.master_key_user() or "admin", "readwrite", "panel-open"
+            )
+            await app(scope, receive, send)
+            return
+
         # ── 限速 ──
         throttled, wait = auth.throttled(source)
         if throttled:
@@ -1001,6 +1019,14 @@ def main() -> None:
         auth.attach_persistence(hub.home / "state" / "tokens.json")
     except RuntimeError as exc:
         raise SystemExit(f"\n[拒绝启动] {exc}\n") from exc
+
+    # v2（S-6）：主密钥与面板 PIN 的落盘位置。
+    # 只挂载、**不自动生成** —— 首次设置由面板「接入」页发起
+    # （自动生成的话没人看得到那串明文，等于把钥匙扔了）。
+    auth.attach_master_key(hub.home / "state" / "master-key.json")
+    auth.attach_pin(hub.home / "state" / "pin.json")
+    if auth.panel_open():
+        logger.info("面板免登录模式（未设 PIN 且绑定不可公开到达）")
 
     # 把 hub 里已登记的用户，各发一把 token（方便首次接入）
     for name, u in hub.store.users.items():

@@ -273,3 +273,181 @@ async def test_change_password_validates_length_and_match(hub: TenantHub) -> Non
     assert client.post("/api/auth/password",
                        json={"password": "new-pass-777", "confirm": "new-pass-777"}
                        ).status_code == 400
+
+
+# ══════════════════════ 主密钥 + PIN（v2 · S-6）══════════════════════
+#
+# 新模型两个凭据：**主密钥**给 agent（MCP），**PIN** 给人（面板）。
+# 旧 token 过渡期继续有效 —— 真正退役是 S-6.4 的迁移，那一步要用户确认。
+
+
+@pytest.fixture()
+def auth_with_secrets(hub: TenantHub, tmp_path: Path) -> Auth:
+    """挂了主密钥与 PIN 文件的 Auth（面板 API 测试用）。"""
+    a = Auth(bind_host="0.0.0.0", store=hub.store)
+    a.attach_master_key(tmp_path / "home" / "state" / "master-key.json")
+    a.attach_pin(tmp_path / "home" / "state" / "pin.json")
+    return a
+
+
+def test_master_key_generate_verify_and_resolve(auth_with_secrets: Auth) -> None:
+    """主密钥：生成 → 校验 → **解析出主人身份**（这是它能替代 token 的原因）。"""
+    a = auth_with_secrets
+    assert a.master_key_enabled() is False, "没设置前不该启用"
+
+    key = a.set_master_key()
+    assert a.master_key_enabled() is True
+    assert a.verify_master(key) is True
+    assert a.verify_master("wrong") is False
+    assert a.resolve(key) == ("alice", "readwrite"), "主密钥该解析成 owner"
+
+
+def test_master_key_rotate_has_grace_window(auth_with_secrets: Auth) -> None:
+    """轮换：新密钥立即可用；旧密钥在宽限内仍可用，宽限过后失效。
+
+    ━━━ 为什么必须有宽限 ━━━
+
+    轮换那一刻，正在跑的请求可能还攥着旧密钥（重试 / 长连接 / 多进程 agent）。
+    一刀切会让它们集体 401 —— 用户看到的是"刚点轮换，agent 全掉线"。
+    """
+    import json
+
+    a = auth_with_secrets
+    old = a.set_master_key()
+    new = a.rotate_master_key()
+
+    assert a.verify_master(new) is True, "新密钥必须立即可用"
+    assert a.verify_master(old) is True, "旧密钥在宽限内仍该可用"
+
+    # 把宽限窗口改成"已经过期"，旧密钥就该失效
+    p = a._master_path
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["prev"]["until"] = 0
+    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert a.verify_master(old) is False, "宽限过后旧密钥必须失效"
+    assert a.verify_master(new) is True
+
+
+def test_secrets_are_hashed_on_disk(auth_with_secrets: Auth) -> None:
+    """盘上**只许有哈希** —— 明文出现在任何文件里都是事故。"""
+    a = auth_with_secrets
+    key = a.set_master_key()
+    a.set_pin("246813")
+
+    mk = (a._master_path).read_text(encoding="utf-8")
+    pin = (a._pin_path).read_text(encoding="utf-8")
+    assert key not in mk and "hash" in mk
+    assert "246813" not in pin and "hash" in pin
+
+
+def test_pin_lockout_after_five_failures_then_auto_unlock(
+    auth_with_secrets: Auth,
+) -> None:
+    """错 5 次第 6 次被锁；**正确 PIN 在锁定期也被拒**；到时自解。"""
+    a = auth_with_secrets
+    a.set_pin("123456")
+
+    for _ in range(5):
+        assert a.verify_pin("000000") is False
+    locked, wait = a.pin_locked()
+    assert locked is True and wait > 0, "错 5 次后必须锁"
+    assert a.verify_pin("123456") is False, "锁定期连正确 PIN 也该拒（否则锁形同虚设）"
+
+    # 把失败时间戳推到窗口之外 → 自动解锁
+    a._pin_failures = [t - 601 for t in a._pin_failures]
+    assert a.pin_locked() == (False, 0.0), "到时该自解，不需要管理员介入"
+    assert a.verify_pin("123456") is True
+
+
+def test_pin_validation_rejects_weak_shapes(auth_with_secrets: Auth) -> None:
+    """PIN 必须 4~8 位纯数字（报错要说清要求，别让人猜）。"""
+    a = auth_with_secrets
+    for bad in ("", "12", "123456789", "abcdef"):
+        with pytest.raises(ValueError) as ei:
+            a.set_pin(bad)
+        assert "4~8" in str(ei.value)
+    a.set_pin("1234")      # 边界：4 位可以
+    a.set_pin("12345678")  # 边界：8 位可以
+
+
+def test_panel_open_only_when_not_publicly_reachable(
+    hub: TenantHub, tmp_path: Path,
+) -> None:
+    """面板免登录**只在**非公开绑定 + 没设 PIN 时成立。
+
+    安全底线：绑到公网可达地址时，关 PIN 也不能把面板敞开。
+    """
+    for bind, expect_without_pin in (("127.0.0.1", True), ("0.0.0.0", False)):
+        a = Auth(bind_host=bind, store=hub.store)
+        a.attach_pin(tmp_path / f"state-{bind}" / "pin.json")
+        assert a.panel_open() is expect_without_pin, bind
+        a.set_pin("1234")
+        assert a.panel_open() is False, "设了 PIN 就不该免登录"
+
+
+@pytest.mark.asyncio
+async def test_login_api_accepts_pin(hub: TenantHub, tmp_path: Path) -> None:
+    """面板登录收 PIN（人的入口），返回换 cookie 的一次性票据。"""
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    from shared_memory.dashboard import make_routes
+
+    a = Auth(bind_host="0.0.0.0", store=hub.store)
+    a.attach_pin(tmp_path / "home" / "state" / "pin.json")
+    a.set_pin("135790")
+
+    app = Starlette(routes=make_routes(hub, auth=a))
+    client = TestClient(app)
+
+    r = client.post("/api/auth/login", json={"pin": "135790"})
+    assert r.status_code == 200, f"PIN 登录失败：{r.status_code} {r.text[:200]}"
+    assert "login=" in r.json().get("login_url", "")
+
+    r2 = client.post("/api/auth/login", json={"pin": "000000"})
+    assert r2.status_code == 401, "错误 PIN 必须 401"
+
+
+@pytest.mark.asyncio
+async def test_login_api_pin_lockout_returns_429(
+    hub: TenantHub, tmp_path: Path,
+) -> None:
+    """锁定期返回 429 + 剩余秒数（让用户知道等多久，而不是干等）。"""
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    from shared_memory.dashboard import make_routes
+
+    a = Auth(bind_host="0.0.0.0", store=hub.store)
+    a.attach_pin(tmp_path / "home" / "state" / "pin.json")
+    a.set_pin("135790")
+
+    app = Starlette(routes=make_routes(hub, auth=a))
+    client = TestClient(app)
+
+    for _ in range(5):
+        client.post("/api/auth/login", json={"pin": "000000"})
+    r = client.post("/api/auth/login", json={"pin": "135790"})
+    assert r.status_code == 429, f"锁定期该 429，实际 {r.status_code}"
+    assert int(r.headers.get("Retry-After", "0")) > 0
+
+
+@pytest.mark.asyncio
+async def test_pin_status_endpoint(hub: TenantHub, tmp_path: Path) -> None:
+    """PIN 状态端点：前端靠它决定显示 PIN 盒 / 用户名密码 / 直进。"""
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    from shared_memory.dashboard import make_routes
+
+    a = Auth(bind_host="0.0.0.0", store=hub.store)
+    a.attach_pin(tmp_path / "home" / "state" / "pin.json")
+    app = Starlette(routes=make_routes(hub, auth=a))
+    client = TestClient(app)
+
+    d = client.get("/api/auth/pin").json()
+    assert d["enabled"] is False and d["panel_open"] is False and d["locked"] is False
+
+    a.set_pin("4321")
+    d2 = client.get("/api/auth/pin").json()
+    assert d2["enabled"] is True

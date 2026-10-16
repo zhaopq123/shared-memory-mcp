@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -63,6 +64,14 @@ FAIL_WINDOW_SECONDS = 300
 #: 而 50 次/5 分钟 ≈ 每秒 0.17 次，早在那之前就被挡下。
 FAIL_MAX_ATTEMPTS = 50
 FAIL_BACKOFF_SECONDS = 30
+
+#: 主密钥轮换的**宽限窗口**（秒）：旧密钥在这段时间内仍可用 ——
+#: 让正在跑的请求把手上的活干完，而不是集体 401（见 rotate_master_key）。
+MASTER_KEY_GRACE_SECONDS = 60
+#: PIN 连续错几次锁（第 6 次被拒）。
+PIN_MAX_ATTEMPTS = 5
+#: PIN 锁定时长（秒）：到时**自动解除**，不需要管理员解锁。
+PIN_LOCK_SECONDS = 600
 
 
 # ══════════════════════ 绑定地址 ══════════════════════
@@ -184,6 +193,15 @@ class Auth:
         #: 外部注入 token 的持久化吊销墓碑：删掉环境配置后不再保留 active token，
         #: 但若同一 token 后续重新注入，也不能因重启而复活。
         self._revoked_external: dict[str, dict[str, Any]] = {}
+        #: v2（S-6）：主密钥与 PIN 的落盘位置（由 attach_* 挂载）。
+        self._master_path: Path | None = None
+        self._pin_path: Path | None = None
+        #: PIN 失败时间戳（内存态）。**不落盘**是有意的：重启即解锁，
+        #: 而重启服务需要主机权限 —— 那把钥匙比 PIN 强得多。
+        self._pin_failures: list[float] = []
+        #: 两个 state 文件的 mtime 缓存（见 _load_state_file）。
+        self._master_cache: tuple[Any, dict[str, Any]] | None = None
+        self._pin_cache: tuple[Any, dict[str, Any]] | None = None
 
     # ────────────────────── token 持久化 ──────────────────────
 
@@ -592,6 +610,12 @@ class Auth:
         """
         if not candidate:
             return "", ""
+        # v2（S-6.2）：先试**主密钥**（单密钥模型）。
+        # 放在 token 循环之前 —— 主人那把钥匙最常用，且它不该被
+        # 任何 token 的优先级遮住。旧 token 仍然有效（过渡期），
+        # 直到 S-6.4 的迁移把它们退役。
+        if self.master_key_enabled() and self.verify_master(candidate):
+            return self.master_key_user(), "readwrite"
         with self._token_lock:
             for t in self._tokens:
                 if t.active and t.matches(candidate):
@@ -701,3 +725,263 @@ class Auth:
         """从凭据值反查用户名（面板用于显示当前登录者）。"""
         user, _ = self.resolve(token_value)
         return user
+
+    # ══════════════════════ 主密钥 + PIN（v2 · S-6）══════════════════════
+    #
+    # ━━━ 为什么从"每设备一把 token"简化为"一把主密钥 + 一个面板 PIN" ━━━
+    #
+    # 旧模型的问题不是不安全，是**用不起来**：每接一台设备要签发一把 token、
+    # 起个 label、记住哪把是哪台；换机器要重新签发；忘了哪把泄露还得翻列表。
+    # 实测里用户的原话是"mcp 为什么要手动配置？？"—— **门槛本身就是缺陷**。
+    #
+    # 新模型两个凭据，各管一摊：
+    #   · **主密钥**（MCP / agent）—— 一把，只存哈希，可轮换（旧的有宽限）
+    #   · **PIN**（面板 / 人）—— 4~8 位数字，错 5 次锁 10 分钟，可关
+    #
+    # 旧 token **过渡期继续有效**（S-6.2 要求保留 Token 类一版兼容）；
+    # 把 admin token 真正退役是 S-6.4 的迁移，那一步要用户确认。
+    #
+    # ━━━ 三条不可让步 ━━━
+    #
+    # 1. **只存哈希**：盘上从不出现明文（`state/` 已是非 git 目录，仍只存哈希）。
+    # 2. **hmac.compare_digest**：定时安全比较，不泄露前缀匹配信息。
+    # 3. **轮换有宽限**：正在跑的请求不该因为一次轮换集体掉线。
+
+    # ────────── 主密钥 ──────────
+
+    def attach_master_key(self, path: str | Path) -> bool:
+        """挂上主密钥文件（``<home>/state/master-key.json``）。
+
+        Returns:
+            是否**已存在**主密钥（服务启动时用它决定要不要打印"首次设置"提示）。
+        """
+        self._master_path = Path(path)
+        self._master_cache = None      # 换路径 → 旧缓存作废
+        return self.master_key_enabled()
+
+    def master_key_enabled(self) -> bool:
+        return bool(self._load_master().get("hash"))
+
+    def master_key_user(self) -> str:
+        """主密钥**代表谁** —— 文件里记的 owner；缺省退回第一个 admin。"""
+        owner = str(self._load_master().get("owner", "") or "")
+        if owner:
+            return owner
+        store = self.store
+        if store is not None:
+            users = getattr(store, "users", {}) or {}
+            if "admin" in users:
+                return "admin"
+            for name, u in users.items():
+                if getattr(u, "is_admin", False):
+                    return name
+        return ""
+
+    @staticmethod
+    def _hash_secret(plain: str) -> str:
+        """凭据哈希（带域前缀，避免和别处的 sha256 撞语义）。"""
+        return hashlib.sha256(("shm-v2:" + (plain or "")).encode("utf-8")).hexdigest()
+
+    def set_master_key(self, plain: str = "") -> str:
+        """设置主密钥（``plain`` 留空则**生成**一把）。返回明文。
+
+        ⚠️ 明文只在返回值里出现**这一次** —— 盘上只有哈希，丢了只能轮换。
+        """
+        key = (plain or "").strip() or secrets.token_urlsafe(32)
+        data = self._load_master()
+        data.update({
+            "hash": self._hash_secret(key),
+            "owner": str(data.get("owner", "") or "") or self.master_key_user(),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+        data.pop("prev", None)
+        self._write_master(data)
+        return key
+
+    def verify_master(self, candidate: str) -> bool:
+        """校验主密钥（**含轮换宽限期内的旧密钥**）。"""
+        if not candidate:
+            return False
+        data = self._load_master()
+        got = self._hash_secret(candidate)
+        want = str(data.get("hash", "") or "")
+        if want and hmac.compare_digest(want, got):
+            return True
+        prev = data.get("prev") or {}
+        prev_hash = str(prev.get("hash", "") or "")
+        if prev_hash and float(prev.get("until", 0) or 0) > time.time():
+            return hmac.compare_digest(prev_hash, got)
+        return False
+
+    def rotate_master_key(self) -> str:
+        """轮换主密钥：返回新密钥明文；旧密钥在**宽限期**内仍可用。
+
+        ━━━ 为什么要宽限 ━━━
+
+        轮换的那一刻，**正在跑**的请求可能还攥着旧密钥（重试、长连接、
+        多进程 agent）。一刀切会让它们全部 401 —— 用户看到的是
+        "刚点了轮换，agent 全掉线"。宽限窗口让它们把手上这步干完。
+        """
+        old = self._load_master()
+        new_key = secrets.token_urlsafe(32)
+        data: dict[str, Any] = {
+            "hash": self._hash_secret(new_key),
+            "owner": str(old.get("owner", "") or "") or self.master_key_user(),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if old.get("hash"):
+            data["prev"] = {
+                "hash": old["hash"],
+                "until": time.time() + MASTER_KEY_GRACE_SECONDS,
+            }
+        self._write_master(data)
+        return new_key
+
+    def revoke_master_key(self) -> bool:
+        """退役主密钥（迁移收尾 / 关停用）。返回是否真有东西被删。"""
+        p = self._master_path
+        if p is None or not p.exists():
+            return False
+        p.unlink()
+        self._master_cache = None      # 删了文件就必须清缓存，否则"还以为有密钥"
+        return True
+
+    def _load_state_file(self, path: Path | None, cache_attr: str) -> dict[str, Any]:
+        """读一个小 state 文件，带 **mtime 缓存**。
+
+        ━━━ 为什么需要缓存 ━━━
+
+        ``resolve()`` 每次凭据解析都要问一次主密钥（enabled / verify / owner
+        各一次）。服务跑在**手机**上，每个 MCP 请求多三次 read+parse 是白花的。
+        用 mtime 判定：文件没动就用内存里的那份；我们自己的写操作会顺手
+        更新缓存（见 ``_write_state_file``），所以缓存在单写者模型下恒新鲜。
+
+        外部手工编辑文件也能被 mtime 变化发现 —— 这正是用 mtime 而不是
+        纯内存标志的原因。
+        """
+        if path is None:
+            return {}
+        try:
+            st = path.stat()
+        except OSError:
+            return {}
+        key = (str(path), st.st_mtime_ns, st.st_size)
+        cache = getattr(self, cache_attr, None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        setattr(self, cache_attr, (key, data))
+        return data
+
+    def _load_master(self) -> dict[str, Any]:
+        return self._load_state_file(self._master_path, "_master_cache")
+
+    def _write_master(self, data: dict[str, Any]) -> None:
+        self._write_state_file(self._master_path, data)
+
+    # ────────── 面板 PIN ──────────
+
+    def attach_pin(self, path: str | Path) -> bool:
+        """挂上 PIN 文件（``<home>/state/pin.json``）。返回是否已设 PIN。"""
+        self._pin_path = Path(path)
+        self._pin_cache = None         # 换路径 → 旧缓存作废
+        return self.pin_enabled()
+
+    def pin_enabled(self) -> bool:
+        return bool(self._load_pin().get("hash"))
+
+    def set_pin(self, pin: str) -> None:
+        """设置 PIN（4~8 位数字）。
+
+        Raises:
+            ValueError: 位数/字符不合法（消息直说要求，别让人猜）。
+        """
+        p = (pin or "").strip()
+        if not p.isdigit() or not (4 <= len(p) <= 8):
+            raise ValueError("PIN 必须是 4~8 位数字")
+        self._write_pin({
+            "hash": self._hash_secret(p),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+        self._pin_failures.clear()
+
+    def disable_pin(self) -> bool:
+        """关掉 PIN（面板免登录）。返回是否真有 PIN 被关。
+
+        ⚠️ 服务绑定在**公开可达**地址时，``panel_open()`` 仍然为假 ——
+        关 PIN 不等于把面板敞开给公网（见 ``panel_open``）。
+        """
+        p = self._pin_path
+        if p is None or not p.exists():
+            return False
+        p.unlink()
+        self._pin_cache = None         # 同上：删了文件必须清缓存
+        self._pin_failures.clear()
+        return True
+
+    def verify_pin(self, pin: str) -> bool:
+        """校验 PIN。**错 5 次锁 10 分钟**，到时自解（内存态，重启解除）。"""
+        locked, _ = self.pin_locked()
+        if locked:
+            return False
+        want = str(self._load_pin().get("hash", "") or "")
+        if not want:
+            return False
+        if hmac.compare_digest(want, self._hash_secret(pin or "")):
+            self._pin_failures.clear()
+            return True
+        self._pin_failures.append(time.time())
+        return False
+
+    def pin_locked(self) -> tuple[bool, float]:
+        """``(是否锁定, 还需等几秒)``。窗口外的旧失败自动过期。"""
+        now = time.time()
+        self._pin_failures = [
+            t for t in self._pin_failures if now - t < PIN_LOCK_SECONDS
+        ]
+        if len(self._pin_failures) < PIN_MAX_ATTEMPTS:
+            return False, 0.0
+        wait = PIN_LOCK_SECONDS - (now - self._pin_failures[0])
+        return True, max(0.0, wait)
+
+    def panel_open(self) -> bool:
+        """面板是否**免登录直进**。
+
+        ⚠️ 只在**未公开可达**（loopback / 纯内网绑定）**且**没设 PIN 时为真。
+        公开绑定时永远要凭据 —— "图省事关掉 PIN" 不能变成
+        "把面板敞给公网"。这条是安全底线，不提供开关。
+        """
+        return (not self.required) and (not self.pin_enabled())
+
+    def _load_pin(self) -> dict[str, Any]:
+        return self._load_state_file(self._pin_path, "_pin_cache")
+
+    def _write_pin(self, data: dict[str, Any]) -> None:
+        self._write_state_file(self._pin_path, data)
+
+    def _write_state_file(self, path: Path | None, data: dict[str, Any]) -> None:
+        """原子写一个 state 文件（tmp 带 pid + os.replace），并**刷新缓存**。
+
+        与 token 持久化同款：崩溃/并发下不留半个 JSON。
+        写完就更新 mtime 缓存 —— 否则下一次读会白跑一趟 stat+read
+        （我们刚写的内容本来就是最新的）。
+        """
+        if path is None:
+            raise RuntimeError("未挂载状态文件（先调 attach_master_key / attach_pin）")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+        cache_attr = "_master_cache" if path is self._master_path else "_pin_cache"
+        try:
+            st = path.stat()
+            setattr(self, cache_attr, ((str(path), st.st_mtime_ns, st.st_size), data))
+        except OSError:  # pragma: no cover - 刚写完就 stat 不到属异常
+            setattr(self, cache_attr, None)

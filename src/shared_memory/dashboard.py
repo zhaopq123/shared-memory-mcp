@@ -193,7 +193,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
 
     # COOKIE_NAME / User 在这里 import：dashboard 被 http_server 导入，
     # 而 auth/tenant 不依赖 dashboard —— 放函数内可避免任何循环导入风险。
-    from .auth import COOKIE_NAME
+    from .auth import COOKIE_NAME, MASTER_KEY_GRACE_SECONDS
     from .request_ctx import current_user, require_user
     from .tenant import User
 
@@ -459,6 +459,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         username = str((body or {}).get("username", "")).strip()
         password = str((body or {}).get("password", ""))
         token = str((body or {}).get("token", "")).strip()
+        pin = str((body or {}).get("pin", "")).strip()
 
         user = ""
 
@@ -467,6 +468,24 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             user, _scope = auth.resolve(token) if auth else ("", "")
             if not user:
                 auth.note_failure(client) if auth else None
+
+        # ①b PIN（面板主人用；v2 · S-6.1）
+        #
+        # 锁定期间**连正确 PIN 也拒绝** —— 否则"锁"只是延迟一次尝试，
+        # 挡不住穷举。剩余秒数回给前端，让用户知道等多久（不是干等）。
+        elif pin and auth and auth.pin_enabled():
+            locked, wait = auth.pin_locked()
+            if locked:
+                return JSONResponse(
+                    {"ok": False, "error": "pin_locked",
+                     "message": f"PIN 连续输错，已锁定，请 {int(wait)} 秒后再试"},
+                    status_code=429, headers={"Retry-After": str(int(wait))},
+                )
+            if auth.verify_pin(pin):
+                user = auth.master_key_user() or "admin"
+            else:
+                auth.note_failure(client)
+                logger.warning("PIN 错误（来源 %s）", client)
 
         # ② 用户名 + 密码
         elif username and password:
@@ -489,6 +508,89 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             "user": user,
             "login_url": f"/?login={ticket}",
             "expires_in": 120,
+        })
+
+    # ────────── 主密钥与 PIN（v2 · S-6）──────────
+
+    async def pin_status(request: Any) -> Any:
+        """PIN 状态（登录屏据此决定显示 PIN 盒、还是用户名密码、还是直进）。"""
+        locked, wait = auth.pin_locked() if auth else (False, 0.0)
+        return JSONResponse({
+            "ok": True,
+            "enabled": bool(auth and auth.pin_enabled()),
+            "locked": locked,
+            "wait_seconds": int(wait),
+            "panel_open": bool(auth and auth.panel_open()),
+        })
+
+    async def pin_set(request: Any) -> Any:
+        """设置 / 关闭面板 PIN（**仅 admin** —— 它决定谁能进面板）。"""
+        user = require_user()
+        if not hub.whoami(user)["user"]["is_admin"]:
+            return JSONResponse({"ok": False, "message": "只有管理员能改 PIN"},
+                                status_code=403)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"ok": False, "message": "请求体不是合法 JSON"},
+                                status_code=400)
+        action = str((body or {}).get("action", "set")).strip()
+        if action == "disable":
+            changed = auth.disable_pin() if auth else False
+            return JSONResponse({
+                "ok": True, "changed": changed, "enabled": False,
+                "message": "PIN 已关闭" + (
+                    "" if (auth and auth.panel_open()) else
+                    "；但服务绑定可公开到达，面板仍需凭据"
+                ),
+            })
+        try:
+            auth.set_pin(str((body or {}).get("pin", "")))
+        except ValueError as exc:
+            # 直说要求（4~8 位数字），别让用户猜
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "enabled": True})
+
+    async def master_status(request: Any) -> Any:
+        return JSONResponse({
+            "ok": True,
+            "enabled": bool(auth and auth.master_key_enabled()),
+            "owner": auth.master_key_user() if auth else "",
+        })
+
+    async def master_post(request: Any) -> Any:
+        """生成 / 轮换主密钥（**仅 admin**）。
+
+        ⚠️ 明文**只在这一次响应里**出现 —— 盘上只存哈希，丢了只能轮换。
+        """
+        user = require_user()
+        if not hub.whoami(user)["user"]["is_admin"]:
+            return JSONResponse({"ok": False, "message": "只有管理员能改主密钥"},
+                                status_code=403)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"ok": False, "message": "请求体不是合法 JSON"},
+                                status_code=400)
+        action = str((body or {}).get("action", "generate")).strip()
+        if action == "rotate":
+            key = auth.rotate_master_key()
+        elif action == "set":
+            given = str((body or {}).get("key", "")).strip()
+            if len(given) < 8:
+                return JSONResponse(
+                    {"ok": False, "message": "主密钥至少 8 个字符（太短挡不住枚举）"},
+                    status_code=400,
+                )
+            key = auth.set_master_key(given)
+        else:
+            key = auth.set_master_key()
+        return JSONResponse({
+            "ok": True,
+            "action": action,
+            "key": key,
+            "grace_seconds": MASTER_KEY_GRACE_SECONDS if action == "rotate" else 0,
+            "message": "明文只出现这一次：请立即存进客户端凭据管理器。盘上只存哈希。",
         })
 
     # ────────── 凭据管理 ──────────
@@ -921,6 +1023,10 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         Route("/api/auth/logout", logout, methods=["POST"]),
         Route("/api/auth/password", change_password, methods=["POST"]),
         Route("/api/auth/tokens", tokens_list, methods=["GET"]),
+        Route("/api/auth/pin", pin_status, methods=["GET"]),
+        Route("/api/auth/pin", pin_set, methods=["POST"]),
+        Route("/api/auth/master-key", master_status, methods=["GET"]),
+        Route("/api/auth/master-key", master_post, methods=["POST"]),
         Route("/api/auth/token/create", token_create, methods=["POST"]),
         Route("/api/auth/token/revoke", token_revoke, methods=["POST"]),
         Route("/api/admin/users", users_list, methods=["GET"]),
