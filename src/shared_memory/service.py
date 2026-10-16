@@ -423,12 +423,19 @@ class SharedMemoryService:
         claim: str = "",
         status: str = "",
         scope: str = SCOPE_LONG_TERM,
+        viewer: str = "",
+        cross_space: bool = False,
     ) -> dict[str, Any]:
         """检索记忆。逻辑全在 vault.search（见那里的详细说明）。
 
-        相比 vault.search 只多一件事：调用方没显式传 ``status`` 时，
-        读配置里的 ``search_default_status``（默认 ``active``，见决策 7）——
-        老部署想恢复"含过期"的行为，改配置即可，不用改客户端。
+        相比 vault.search 只多两件事：
+
+        1. 调用方没显式传 ``status`` 时，读配置里的 ``search_default_status``
+           （默认 ``active``，见决策 7）—— 老部署想恢复"含过期"的行为，
+           改配置即可，不用改客户端。
+        2. ``viewer`` 空时**不做共享过滤**（v2 S-10.2）。身份由上层
+           （:meth:`tenancy.TenantHub.search`）从鉴权结果注入，
+           这一层不自己猜 —— 猜错的方向是"把别人的私密捞出来"。
         """
         status_eff = (status or "").strip() or str(
             self.config.settings().get("search_default_status", "active") or "active"
@@ -445,6 +452,8 @@ class SharedMemoryService:
             claim=claim,
             status=status_eff,
             scope=scope,
+            viewer=viewer,
+            cross_space=cross_space,
         )
         out["hint"] = "用 memory_get 按 title 或 id 读全文"
         return out
@@ -452,16 +461,42 @@ class SharedMemoryService:
     def get(self, ident: str) -> dict[str, Any]:
         """读一条记忆全文。"""
         note: Note = self.vault.get(ident)
-        return {"ok": True, "note": note.to_dict()}
+        return {"ok": True, "note": note.to_dict(
+            share_default=self.config.default_share())}
+
+    def visible_notes(self, viewer: str = "") -> list[Note]:
+        """该身份能看到的条目（v2 S-10.2 的唯一读端闸）。
+
+        ``viewer`` 为空 = **内部通道**（面板治理、迁移、导出），看全量。
+
+        所有"取一批条目"的读路径都从这里拿 —— 检索、列举、视图各自实现
+        一份过滤，是这类系统最常见的漏法：加了闸的入口看起来都正常，
+        没加的那个（视图/统计）把「仅自己」的条目原样端出去。
+        """
+        notes = self.vault.all_notes()
+        if not viewer:
+            return notes
+        from .vault import share_visible
+
+        sd = self.config.default_share()
+        return [
+            n for n in notes
+            if share_visible(n.share, n.author, viewer, space_default=sd)
+        ]
 
     def list_notes(
-        self, *, limit: int = 50, tag: str = "", workspace: str = ""
+        self, *, limit: int = 50, tag: str = "", workspace: str = "",
+        viewer: str = "",
     ) -> dict[str, Any]:
         """列举记忆（最近更新的在前），可按标签或工作区过滤。
 
         与 search 的区别：**不过滤关键词**，用于"看看库里都有什么"。
+
+        ``viewer``（v2 S-10.2）：面板左栏走的就是这条路，所以共享档位
+        在这里同样要生效 —— 否则「仅自己」的条目会出现在别人的列表里，
+        哪怕检索已经把它挡住了。**列表与检索必须同一套判定**。
         """
-        notes = self.vault.all_notes()
+        notes = self.visible_notes(viewer)
         if tag:
             want = tag.strip().lower()
             notes = [n for n in notes if want in {t.lower() for t in n.tags}]
@@ -479,7 +514,10 @@ class SharedMemoryService:
             "ok": True,
             "total": total,
             "showing": min(total, lim),
-            "notes": [n.to_dict(with_body=False) for n in notes[:lim]],
+            "notes": [
+                n.to_dict(with_body=False, share_default=self.config.default_share())
+                for n in notes[:lim]
+            ],
         }
 
     def stats(self) -> dict[str, Any]:
@@ -585,12 +623,16 @@ class SharedMemoryService:
 
     # ══════════════════════ 体系层：视图 / 引用 / 配置 ══════════════════════
 
-    def view(self, kind: str, **params: Any) -> dict[str, Any]:
+    def view(self, kind: str, *, viewer: str = "", **params: Any) -> dict[str, Any]:
         """算一个视图（决策记录/踩坑/待办/时效告警/...）。
 
         **实时计算，不查索引** —— 索引会过时，过时的索引比没有索引更糟。
+
+        ``viewer``：视图里的 ``stats`` 是**从条目算出来的**，所以过滤必须
+        发生在算之前。先算全量统计再藏条目，"共 42 条"这个数字本身
+        就把别人私密条目的规模泄露了（与跨库搜索同一个坑）。
         """
-        return build_view(kind, self.vault.all_notes(), params=params)
+        return build_view(kind, self.visible_notes(viewer), params=params)
 
     def views(self) -> dict[str, Any]:
         """列出全部可用视图（目录）。"""
@@ -633,6 +675,7 @@ class SharedMemoryService:
         instructions: str | None = None,
         rules: dict[str, Any] | None = None,
         settings: dict[str, Any] | None = None,
+        space: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """改配置（面板用）—— **走同一个写队列**。
 
@@ -681,6 +724,23 @@ class SharedMemoryService:
 
         if instructions is not None:
             writes.append(("instructions.md", instructions, "指令"))
+
+        if space is not None:
+            problems = self.config.validate_space(space)
+            if problems:
+                raise ToolError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    "空间共享属性不合法：" + "；".join(problems),
+                    hint="default_share 取 mine/space/shared；"
+                         "accept_shared_from 是空间 id 数组",
+                )
+            writes.append(
+                (
+                    "space.json",
+                    json.dumps(space, ensure_ascii=False, indent=2),
+                    "空间",
+                )
+            )
 
         if not writes:
             return {"ok": True, "changed": []}

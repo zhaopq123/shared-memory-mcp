@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from .cache import NoteCache, TTLCache
+from .config import SHARE_LEVELS, Config
 from .errors import ErrorCode, ToolError
 from .knowledge import expiry_state
 
@@ -113,6 +114,61 @@ def valid_scope(value: str) -> bool:
     return value.startswith("task:") and len(value) > len("task:")
 
 
+# ══════════════════ 共享档位可见性（v2 · S-10.2，决策 D-3）══════════════════
+
+
+def effective_share(share: str, space_default: str = "space") -> str:
+    """条目档位：显式值优先，空则继承空间默认。
+
+    继承发生在**读侧**而不是写侧，是刻意的：存量条目没有 share 字段，
+    写侧继承要给几千条历史数据补 frontmatter（一次大 diff、git 历史噪音），
+    而读侧继承零成本、改空间默认值还能立刻作用到全部存量。
+    """
+    s = (share or "").strip()
+    return s if s in SHARE_LEVELS else (space_default or "space")
+
+
+def share_visible(
+    share: str,
+    author: str,
+    viewer: str,
+    *,
+    space_default: str = "space",
+    cross_space: bool = False,
+) -> bool:
+    """这条记忆对这个身份可见吗。
+
+    ━━━ 三档语义 ━━━
+
+    · ``mine``   仅作者。**无作者的存量条目按 space 处理** ——
+      把"不知道谁写的"判成"谁都看不见"，会让作者自己点开一条他刚设成
+      私密的记忆却发现它消失了，那是 bug 级困惑；
+      而这批条目本来就在同空间里躺了很久，突然全隐藏反而是行为回退。
+    · ``space``  同空间（同库）可见 —— 库的读权限就是这道闸，
+      由 :mod:`tenancy` 把守，这里不再判第二遍。
+    · ``shared`` 跨空间可见，但**只在目标空间授权后**才进入跨空间检索面
+      （``cross_space=True`` 的那条路）。同空间内它与 space 等价。
+
+    Args:
+        share: 条目上的显式档位（可为空 = 继承）。
+        author: 条目作者。
+        viewer: 当前身份；**空串 = 不做共享过滤**（内部通道：面板治理、
+            迁移脚本、管理员导出 —— 它们本来就该看全貌）。
+        space_default: 所在空间缺省档位。
+        cross_space: 这次访问是不是"经授权跨空间捞进来的"。
+            True 时**只放行 ``shared``**，其它一概不看 ——
+            这是跨空间通道的唯一存在理由，别让它变成第二个全库入口。
+    """
+    if not viewer:
+        return True
+    eff = effective_share(share, space_default)
+    if cross_space:
+        return eff == "shared"
+    if eff == "mine":
+        return (not author) or author == viewer
+    return True
+
+
 def validate_v2_fields(extra: dict[str, Any]) -> None:
     """显式传入的 v2 概念字段必须合法（S-1.5）。
 
@@ -134,7 +190,7 @@ def validate_v2_fields(extra: dict[str, Any]) -> None:
             hint="合法值：long-term / task:<任务名> / archived",
         )
     sh = str(extra.get("share") or "").strip()
-    if sh and sh not in ("mine", "space", "shared"):
+    if sh and sh not in SHARE_LEVELS:
         raise ToolError(
             ErrorCode.INVALID_ARGUMENT,
             f"share 格式不对：{sh}",
@@ -342,12 +398,17 @@ class Note:
         """共享档位：``mine`` / ``space`` / ``shared``。空 = 继承空间默认。"""
         return str((self.meta or {}).get("share") or "")
 
-    def to_dict(self, *, with_body: bool = True) -> dict[str, Any]:
+    def to_dict(self, *, with_body: bool = True, share_default: str = "") -> dict[str, Any]:
         """转成可 JSON 序列化的字典。
 
         ``with_body=False`` 用于列表/搜索结果 —— **正文可能很长**，
         列 200 条时全带上会把返回体撑爆（也会浪费 agent 的上下文预算）。
         只给摘要，要全文再调 memory_get。
+
+        ``share_default`` 给了（非空）就额外输出 ``share_effective``：
+        面板徽标要显示**实际生效档位**，而条目的 ``share`` 可能是空的
+        （继承空间默认）。让前端再解析一遍继承规则等于把口径抄第二遍 ——
+        继承只有一处定义（:func:`effective_share`）。
 
         体系字段（type/status/claim/时效/引用）会被提升到顶层 ——
         agent 读摘要时就能看到"这是推断"、"这条已过期"，
@@ -390,6 +451,8 @@ class Note:
         sh = self.share
         if sh:
             d["share"] = sh
+        if share_default:
+            d["share_effective"] = effective_share(sh, share_default)
         if self.versioned:
             d["versioned"] = True
 
@@ -1278,6 +1341,8 @@ class Vault:
         claim: str = "",
         status: str = "active",
         scope: str = SCOPE_LONG_TERM,
+        viewer: str = "",
+        cross_space: bool = False,
     ) -> dict[str, Any]:
         """检索记忆。
 
@@ -1319,6 +1384,13 @@ class Vault:
                 任务过程态根本不进默认检索）。``task:<名>`` 只要该任务域；
                 ``archived`` 只要归档区；``all`` 全都要（考古）；
                 传空串 = 不过滤（兼容旧调用的逃生门）。
+            viewer: 当前身份（v2 S-10.2）。**空 = 不做共享档位过滤**
+                （内部通道）。给了身份就按 ``share`` 三档筛：
+                ``mine`` 只给作者、``space``/``shared`` 给同空间全部读者。
+                筛选发生在**打分与 total 之前** —— 否则"共 N 条"会把
+                看不见的条目数也报出去，那个数字本身就是泄露。
+            cross_space: 经目标空间授权、从**别的空间**捞进来的那次调用。
+                True 时只放行 ``shared`` 档位（见 :func:`share_visible`）。
 
         ━━━ 为什么 status 默认 active（2026-10-13 决策 7）━━━
 
@@ -1359,6 +1431,10 @@ class Vault:
                 hint="long-term / task:<任务名> / archived / all"
                      "（留空=不过滤）",
             )
+        # v2（S-10.2）：共享档位。没给身份 = 不过滤（内部通道），
+        # 给了才去读空间默认档 —— 不筛选时连配置文件都不碰。
+        want_viewer = (viewer or "").strip()
+        space_default = Config(self.root).default_share()
 
         scored: list[tuple[int, Note]] = []
         for note in self.all_notes():
@@ -1411,6 +1487,14 @@ class Vault:
                 elif ns != want_scope:
                     continue
 
+            # ⑥ 共享档位过滤（v2 S-10.2）。同样**在打分与 total 之前**：
+            #     看不见的条目不该贡献总数，也不该贡献排序。
+            if want_viewer and not share_visible(
+                note.share, note.author, want_viewer,
+                space_default=space_default, cross_space=cross_space,
+            ):
+                continue
+
             # ⑤ 关键词打分
             if not words:
                 scored.append((0, note))
@@ -1460,7 +1544,10 @@ class Vault:
             "total": total,
             "count": len(page),
             "offset": off,
-            "results": [n.to_dict(with_body=False) for n in page],
+            "results": [
+                n.to_dict(with_body=False, share_default=space_default)
+                for n in page
+            ],
         }
 
     # ══════════════════════ 统计 / 导出 ══════════════════════

@@ -198,20 +198,69 @@ class TenantTools:
         except ToolError:
             return ""
 
+    def _open_tasks(self, user_name: str) -> list[str]:
+        """别人显式开放给这个身份的会话任务名（v2 S-10.3）。
+
+        "同空间"由会话登记的 ``space`` 判定 —— 判不出就不开放（收紧方向
+        必须显式）。库里那些**没开会话**的 ``task:`` 存量条目不受这里影响，
+        它们没有会话档位可依，仍按 share 档位与库权限决定可见性。
+        """
+        return _session.open_tasks(
+            self.hub.home,
+            user_name,
+            same_space=lambda s: bool(self._space_lib_id(user_name, s)),
+        )
+
+    def _task_claimed_by_other(self, user_name: str, task: str) -> bool:
+        """这个任务域正被**别人的 private 会话**占着吗。"""
+        for entry in _session.load(self.hub.home).values():
+            if entry.get("status") != "active":
+                continue
+            if str(entry.get("task", "")) != task:
+                continue
+            if entry.get("user") == user_name:
+                return False          # 自己的会话，永远能读写自己的过程态
+            if str(entry.get("visibility") or "private") != "private":
+                return False          # 已开放
+            return True
+        return False
+
+    def _scope_readable(self, user_name: str, sc: str) -> bool:
+        """显式指定的 scope 允不允许读（v2 S-10.5：越权读**返回空**）。
+
+        不回 SCOPE_DENIED 是刻意的：报错会告诉调用方"这个任务域存在、
+        里面有东西不给你"，而存在性本身就是串台要防的东西。
+        写侧才用 SCOPE_DENIED（写失败必须说清原因，见
+        :meth:`_resolve_write_scope`）。
+        """
+        s = (sc or "").strip()
+        if not s.startswith("task:") or len(s) <= len("task:"):
+            return True
+        task = s[len("task:"):]
+        if task in _session.active_tasks(self.hub.home, user_name):
+            return True
+        return not self._task_claimed_by_other(user_name, task)
+
     def _effective_scopes(self, user_name: str, scope: str) -> list[str]:
         """把 memory_search 的 scope 参数解析成**实际要检索的 scope 列表**。
 
-        · 显式传了 → 就那一个（``all`` / ``long-term`` / ``task:xx`` / ``archived``）
-        · 没传（默认）→ ``long-term`` + **当前活跃会话绑定的任务域**。
-          这是防串台的核心：任务过程态只在"正在做这个任务的人"的默认
-          范围里，别人的会话摸不到。
+        · 显式传了 → 就那一个（``all`` / ``long-term`` / ``task:xx`` / ``archived``），
+          但别人的 private 任务域会被**剔掉**（返回空结果，不报错）
+        · 没传（默认）→ ``long-term`` + 当前活跃会话绑定的任务域
+          + **别人显式开放（visibility=space/shared）的进行中会话任务域**。
+          这是防串台的核心：private 的过程态只在"正在做这个任务的人"的
+          默认范围里，别人的会话摸不到。
         """
         s = (scope or "").strip()
         if s:
-            return [s]
+            return [s] if self._scope_readable(user_name, s) else []
         out: list[str] = [SCOPE_LONG_TERM]
         for t in _session.active_tasks(self.hub.home, user_name):
             out.append(_session.task_scope(t))
+        for t in self._open_tasks(user_name):
+            sc = _session.task_scope(t)
+            if sc not in out:
+                out.append(sc)
         return out
 
     def _resolve_write_scope(self, user_name: str, scope: str) -> str:
@@ -233,6 +282,18 @@ class TenantTools:
                     hint="先调 memory_session_start(task=...) 再写过程态记忆",
                 )
             return _session.task_scope(tasks[0])
+        if s.startswith("task:") and len(s) > len("task:"):
+            # 写别人的任务域 = 往别人的工作上下文里塞东西，必须显式授权。
+            # 这里用 SCOPE_DENIED 而不是静默丢弃：写操作失败了调用方
+            # 一定要知道是"没权限"而不是"参数错"，否则它会改参数重试。
+            task = s[len("task:"):]
+            if self._task_claimed_by_other(user_name, task):
+                raise ToolError(
+                    ErrorCode.SCOPE_DENIED,
+                    f"任务域「{task}」属于别人的会话，且未开放",
+                    hint="要让别人写，请对方 memory_session_start 时把 "
+                         "visibility 切成 space/shared；否则写自己的任务域或 long-term",
+                )
         return s
 
     async def memory_session_start(
@@ -591,6 +652,7 @@ class TenantTools:
         review_after: str = "",
         superseded_by: str = "",
         scope: str = "",
+        share: str = "",
     ) -> dict[str, Any]:
         """写入一条共享记忆（**有结论 / 踩坑 / 口径就该写回**）。
 
@@ -627,6 +689,12 @@ class TenantTools:
         · **superseded_by**  本记忆被哪条取代了（填**新记忆的标题**）。
                               "取代而非删除"的抓手：旧条标上它即退出现行口径，
                               但原文仍在，后人知道"这条路走过、不通"
+        · **share**   共享档位（v2 S-10）：``mine`` 仅自己 / ``space`` 同空间
+                      / ``shared`` 已授权跨空间。不传 = 继承空间默认档
+                      （``_config/space.json`` 的 ``default_share``）。
+                      ``mine`` 会**用鉴权身份填 author**，因此不接受
+                      代录（填了别人的 author 直接报错）—— 否则写出的
+                      条目对写者自己不可见。
 
         ━━━ 时效字段的覆盖规则 ━━━
 
@@ -659,6 +727,23 @@ class TenantTools:
             resolved_scope = self._resolve_write_scope(user_name, scope)
             if resolved_scope:
                 extra["scope"] = resolved_scope
+
+            # v2（S-10.2）share：空 = 继承空间默认档（读侧解析，不落盘）。
+            # 非法值由 vault.validate_v2_fields 拦下（INVALID_ARGUMENT）。
+            sh = (share or "").strip()
+            if sh:
+                extra["share"] = sh
+            if sh == "mine":
+                if author and author != user_name:
+                    # 「仅自己」+ 作者填别人 = 写出一条**你自己再也读不到**的条目。
+                    # 不拦的话它写得成功、搜不到、列不出，只剩一个 git 提交当证据 ——
+                    # 这种"成功的黑洞"比报错难查十倍。
+                    raise ToolError(
+                        ErrorCode.INVALID_ARGUMENT,
+                        "share=mine 的条目作者必须是调用者本人",
+                        hint="代录别人的口径请改用 share=space（或留空继承空间默认档）",
+                    )
+                author = user_name
             return await self.hub.write(
                 user_name,
                 title=title, body=body, tags=tags, workspace=workspace,

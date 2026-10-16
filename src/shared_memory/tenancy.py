@@ -225,7 +225,7 @@ class TenantHub:
         """
         if lib_id:
             self.tenant.vault_for(user_name, lib_id)      # 无权限会抛
-            r = self.service_for(lib_id).search(query, **kwargs)
+            r = self.service_for(lib_id).search(query, viewer=user_name, **kwargs)
             for item in r.get("results", []):
                 lib = self.store.lib(lib_id)
                 item["_lib"] = lib_id
@@ -233,28 +233,90 @@ class TenantHub:
             return r
         return self.tenant.search_all(user_name, query, **kwargs)
 
+    def _note_visible(self, user_name: str, note: dict, lib_id: str,
+                      *, cross_space: bool = False) -> bool:
+        """这条记忆对该身份可见吗（v2 S-10.2 的读端闸）。
+
+        ``note`` 是 ``Note.to_dict()`` 的产物 —— ``share``/``author``
+        为空时不输出，所以这里一律 ``.get(...) or ""``。
+        """
+        from .vault import share_visible
+
+        svc = self.service_for(lib_id)
+        return share_visible(
+            str(note.get("share") or ""),
+            str(note.get("author") or ""),
+            user_name,
+            space_default=svc.config.default_share(),
+            cross_space=cross_space,
+        )
+
+    @staticmethod
+    def _not_found(ident: str) -> ToolError:
+        """与 :meth:`vault.Vault.resolve` 的 NOT_FOUND 逐字一致的构造器。
+
+        两处文案必须由同一个函数产生 —— 抄两遍必然漂移，而漂移的后果
+        不是"文案不好看"，是**错误体变成存在性探针**。
+        """
+        return ToolError(
+            ErrorCode.NOT_FOUND,
+            f"找不到记忆：{ident}",
+            hint="用 memory_list 或 memory_search 查看现有记忆的标题",
+        )
+
     def get(self, user_name: str, ident: str, *, lib_id: str = "") -> dict[str, Any]:
         """读一条记忆全文。
 
         没给库时**只在该用户可读的库里找** —— 找不到也没关系，
         关键是**不会去读无权限的库**（那是越权）。
+
+        ━━━ 越权读的统一口径（v2 S-10.5）━━━
+
+        档位不允许（别人的 ``mine``）与"根本没这条"**返回同一个
+        NOT_FOUND**。不能回 FORBIDDEN —— 那等于告诉调用方
+        "这个标题存在、内容不给你"，把存在性泄露出去了。
         """
         if lib_id:
             self.tenant.vault_for(user_name, lib_id)
+            # 库里真没有这条 → vault 抛 NOT_FOUND，原样透出去（不要包装：
+            # 包装出来的文案与下面"被档位挡住"的那份不一致就会变成探针）
             r = self.service_for(lib_id).get(ident)
+            if not self._note_visible(user_name, r["note"], lib_id):
+                # ⚠️ 必须与"库里真没有这条"**逐字一样**（含 hint）。
+                # 写一句"这条被共享档位挡住了"看起来更贴心，实际是把
+                # 错误体变成了存在性探针：调用方换个标题一比就分出两种情况。
+                raise self._not_found(ident)
             r["note"]["_lib"] = lib_id
             return r
 
         for lib in self.tenant.readable(user_name):
             try:
                 r = self.service_for(lib.id).get(ident)
-                r["note"]["_lib"] = lib.id
-                r["note"]["_lib_label"] = lib.label or lib.id
-                return r
             except ToolError as exc:
                 if exc.code != ErrorCode.NOT_FOUND:
                     raise
                 continue
+            if not self._note_visible(user_name, r["note"], lib.id):
+                continue
+            r["note"]["_lib"] = lib.id
+            r["note"]["_lib_label"] = lib.label or lib.id
+            return r
+
+        # 经目标空间授权的跨空间共享面：只放行 shared 档位
+        for lib in self.tenant.shared_incoming(user_name):
+            try:
+                r = self.service_for(lib.id).get(ident)
+            except ToolError as exc:
+                if exc.code != ErrorCode.NOT_FOUND:
+                    raise
+                continue
+            if not self._note_visible(user_name, r["note"], lib.id, cross_space=True):
+                continue
+            r["note"]["_lib"] = lib.id
+            r["note"]["_lib_label"] = lib.label or lib.id
+            r["note"]["_shared_incoming"] = True
+            return r
+
         raise ToolError(
             ErrorCode.NOT_FOUND,
             f"在你可读的库里找不到：{ident}",
@@ -264,14 +326,20 @@ class TenantHub:
     def list_notes(
         self, user_name: str, *, limit: int = 50, lib_id: str = "", **kwargs: Any
     ) -> dict[str, Any]:
-        """列举。跨库时合并并按时间排序。"""
+        """列举。跨库时合并并按时间排序。
+
+        ``viewer`` 与检索同闸（v2 S-10.2）：面板左栏与 agent 列举
+        走这条路，档位判定必须在同一处生效，不能只给检索加闸。
+        """
         if lib_id:
             self.tenant.vault_for(user_name, lib_id)
-            return self.service_for(lib_id).list_notes(limit=limit, **kwargs)
+            return self.service_for(lib_id).list_notes(
+                limit=limit, viewer=user_name, **kwargs
+            )
 
         merged: list[dict[str, Any]] = []
         for lib in self.tenant.readable(user_name):
-            r = self.service_for(lib.id).list_notes(limit=200, **kwargs)
+            r = self.service_for(lib.id).list_notes(limit=200, viewer=user_name, **kwargs)
             for item in r.get("notes", []):
                 item["_lib"] = lib.id
                 item["_lib_label"] = lib.label or lib.id
@@ -294,7 +362,7 @@ class TenantHub:
         """
         if lib_id:
             self.tenant.vault_for(user_name, lib_id)
-            return self.service_for(lib_id).view(kind, **params)
+            return self.service_for(lib_id).view(kind, viewer=user_name, **params)
 
         libs = self.tenant.readable(user_name)
         if not libs:
@@ -309,7 +377,7 @@ class TenantHub:
         ws_counts: dict[str, int] = {}
 
         for lib in libs:
-            r = self.service_for(lib.id).view(kind, **params)
+            r = self.service_for(lib.id).view(kind, viewer=user_name, **params)
             merged_total += r.get("total", 0)
             for item in r.get("items", []):
                 item["_lib"] = lib.id

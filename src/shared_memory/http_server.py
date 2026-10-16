@@ -480,6 +480,7 @@ def build_app(hub: TenantHub) -> Any:
         review_after: str = "",
         superseded_by: str = "",
         scope: str = "",
+        share: str = "",
     ) -> dict:
         """写入一条共享记忆（**有结论 / 踩坑 / 口径就该写回**）。
 
@@ -520,6 +521,10 @@ def build_app(hub: TenantHub) -> Any:
                     ``"task"`` = 绑到当前会话的任务域（**任务过程态用这个**，
                     收工后自动归档，不污染别人的检索）；也接受
                     ``"task:名字"`` / ``"archived"``
+        · **share** 共享档位（v2 S-10）：``mine`` 仅自己 / ``space`` 同空间 /
+                    ``shared`` 已授权跨空间。不传 = 继承空间默认档。
+                    传 ``mine`` 时服务端把**当前身份**记为 author
+                    （身份来自凭据，不接受现编）
 
         upsert 更新已有记忆时，三个时效字段**显式传才覆盖**，
         不传保留原值 —— 避免"只想改正文"却把有效期信息清掉。
@@ -543,7 +548,7 @@ def build_app(hub: TenantHub) -> Any:
         require_write_scope("memory_remember")
         return await t.memory_write(
             require_user(), title, body, tags, workspace, lib, mode, author,
-            claim, valid_until, review_after, superseded_by, scope,
+            claim, valid_until, review_after, superseded_by, scope, share,
         )
 
     @mcp.tool(output_schema=None)
@@ -662,11 +667,12 @@ def build_app(hub: TenantHub) -> Any:
         review_after: str = "",
         superseded_by: str = "",
         scope: str = "",
+        share: str = "",
     ) -> dict:
         """【已废弃 → 用 ``memory_remember``】参数与行为完全等价。"""
         return await memory_remember(
             title, body, tags, workspace, lib, mode, author, claim,
-            valid_until, review_after, superseded_by, scope,
+            valid_until, review_after, superseded_by, scope, share,
         )
 
     @mcp.tool(output_schema=None)

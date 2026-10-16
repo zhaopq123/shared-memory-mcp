@@ -30,9 +30,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .config import Config
 from .errors import ErrorCode, ToolError
 from .tenant import Library, TenantStore, User, can_write, visible_libraries
-from .vault import Vault, now_iso
+from .vault import Vault, now_iso, share_visible
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,39 @@ class Tenant:
 
     # ────────────────────── 跨库操作 ──────────────────────
 
+    def shared_incoming(self, user_name: str) -> list[Library]:
+        """经**目标空间授权**可以跨空间读取的源库（v2 S-10.2）。
+
+        ━━━ 规则 ━━━
+
+        我可读的每个库，其 ``_config/space.json`` 的
+        ``accept_shared_from`` 列出的**源库** —— 源库里档位为 ``shared``
+        的条目，才允许进入我的检索面。
+
+        方向是**接收方 opt-in**（决策 D-2 的"目标空间授权"）：
+        如果我可读的库里没人写"我接受某某空间的共享"，那这里就是空的，
+        任何别的库都不会被打开。反过来，源空间单方面把条目设成
+        ``shared`` **不构成**我能读到它的理由。
+
+        ⚠️ 这是系统里**唯一**一条"打开我没有读权限的库"的路径，
+        而且打开时固定 ``cross_space=True`` —— 该模式下只可能返回
+        ``shared`` 档位的条目，``mine``/``space`` 在 vault 层就被挡。
+        权限判定仍然只有一处（这里 + :meth:`vault.share_visible`），
+        新增跨库入口时**必须**带上 cross_space，别调 ``vault()`` 后裸搜。
+        """
+        mine = {lib.id for lib in self.readable(user_name)}
+        wanted: set[str] = set()
+        for lib in self.readable(user_name):
+            # 只读我**有权限**的库的配置，不去碰别人空间目录里的文件
+            wanted.update(Config(self.libs.path_of(lib)).accept_shared_from())
+
+        out: list[Library] = []
+        for lib_id in sorted(wanted - mine):
+            lib = self.store.lib(lib_id)
+            if lib is not None:
+                out.append(lib)
+        return out
+
     def search_all(
         self,
         user_name: str,
@@ -217,13 +251,24 @@ class Tenant:
         ━━━ 安全要点（这是整个系统最容易出漏洞的地方）━━━
 
         1. **调用方不能指定要搜哪些库** —— 没有任何参数能影响这个集合
-        2. **逐库搜，没权限的库根本不打开**（不是"搜了再过滤"）
+        2. **逐库搜，没权限的库根本不打开**（不是"搜了再过滤"）。
+           v2 有一个**受控例外**：:meth:`shared_incoming` —— 我可读的库
+           显式 ``accept_shared_from`` 过的源库会以 ``cross_space=True``
+           打开，那个模式下 vault 只可能返回 ``shared`` 档位条目。
+           除这条之外，新增跨库入口都不得绕过 :meth:`readable`。
         3. **计数只算有权限的** —— 否则"共 42 条"会泄露无权库的规模
         4. 结果**标上来库** —— 让用户能判断该采信哪个
+        5. **``viewer`` 由鉴权结果注入，不接受调用方传**（v2 S-10.2）——
+           能自己填身份就等于没有共享档位
 
         第 3 条容易被忽略：如果先全搜再过滤，"总数"往往已经算错了，
         而那个数字本身就是信息泄露。
         """
+        # 身份覆盖而不是 setdefault：调用方（含测试与内部通道）传进来的
+        # viewer 一律作废 —— 它是权限判定，不是检索偏好。
+        kw = dict(kwargs)
+        kw["viewer"] = user_name
+
         libs = self.readable(user_name)
         merged: list[dict[str, Any]] = []
         total = 0
@@ -232,7 +277,7 @@ class Tenant:
         for lib in libs:
             try:
                 v = self.libs.vault(lib)
-                r = v.search(query, **kwargs)
+                r = v.search(query, **kw)
             except Exception as exc:  # noqa: BLE001
                 # 单个库出问题不该让整个搜索失败 —— 但要说出来
                 logger.warning("库 %s 搜索失败: %s", lib.id, exc)
@@ -247,6 +292,27 @@ class Tenant:
             total += r.get("total", 0)
             per_lib.append({"lib": lib.id, "label": lib.label or lib.id,
                             "count": r.get("total", 0)})
+
+        # 经目标空间授权的跨空间共享面（v2 S-10.2）：只可能出 shared 条目。
+        for lib in self.shared_incoming(user_name):
+            try:
+                v = self.libs.vault(lib)
+                r = v.search(query, cross_space=True, **kw)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("共享源库 %s 搜索失败: %s", lib.id, exc)
+                continue
+
+            items = r.get("results", [])
+            for item in items:
+                item["_lib"] = lib.id
+                item["_lib_label"] = lib.label or lib.id
+                item["_lib_owner"] = lib.owner
+                item["_shared_incoming"] = True   # 告诉调用方"这是跨空间捞来的"
+                merged.append(item)
+            total += r.get("total", 0)
+            if items:
+                per_lib.append({"lib": lib.id, "label": lib.label or lib.id,
+                                "count": r.get("total", 0), "shared": True})
 
         # 按相关度（vault.search 已排序，但跨库需要重新合并排序）：
         # 用"最近更新"作次级键，保证结果稳定

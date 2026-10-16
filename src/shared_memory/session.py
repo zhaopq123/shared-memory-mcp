@@ -58,7 +58,9 @@ from .vault import now_iso
 
 logger = logging.getLogger(__name__)
 
-#: 会话可见性三档（v2 D-2）。S-2 只登记不强制，S-10 才接可见性强制。
+#: 会话可见性三档（v2 D-2）。S-2 只登记，S-10.3 起**强制**：
+#: 读侧见 ``tools_tenant._effective_scopes`` / ``open_tasks``，
+#: 写侧见 ``tools_tenant._resolve_write_scope``（SCOPE_DENIED）。
 VISIBILITIES: tuple[str, ...] = ("private", "space", "shared")
 #: 会话状态
 STATUS_ACTIVE = "active"
@@ -235,7 +237,6 @@ def end(
 def touch(
     home: Path | str, user: str, task: str, *, cursor: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
-    """刷新 updated（可顺带更新 cursor 进度标记）。找不到返回 ``None``。"""
     sid = session_id(user, task)
     now = now_iso()
     with _FILE_LOCK:
@@ -252,6 +253,78 @@ def touch(
 
 
 # ══════════════════════ 查询 ══════════════════════
+
+
+def set_visibility(
+    home: Path | str, user: str, task: str, visibility: str
+) -> dict[str, Any] | None:
+    """只改可见性档位（v2 S-10.3）。找不到返回 ``None``。
+
+    ━━━ 为什么不用 ``start`` 顺手改 ━━━
+
+    ``start`` 的语义是"开工"：它会把 ``ended`` 的会话**重开**、
+    给不存在的会话**新建一条**。用在面板的"改档位"按钮上就是
+    两个副作用：收工的任务被偷偷复活、凭空多出一个会话。
+    改档位是纯属性写入，只碰 ``visibility`` 与 ``updated``。
+
+    生效时机：**读侧即时**。检索时按当前档位判定（见
+    :func:`tools_tenant` 的开放范围计算），所以切 ``private``
+    立刻收回、切 ``space``/``shared`` 立刻开放 —— 不需要动任何
+    记忆条目（这正是把档位放在会话层而不是逐条改写的原因）。
+    """
+    t = _check_task(task)
+    v = _check_visibility(visibility)
+    sid = session_id(user, t)
+    now = now_iso()
+    with _FILE_LOCK:
+        data = _read_file(home)
+        entry = data.get(sid)
+        if entry is None:
+            return None
+        entry["visibility"] = v
+        entry["updated"] = now
+        data[sid] = entry
+        _write_file(home, data)
+    return dict(entry)
+
+
+def open_tasks(home: Path | str, viewer: str, *, same_space) -> list[str]:
+    """别人**显式开放**给这个观看者的任务名列表（v2 S-10.3）。
+
+    Args:
+        home: 租户中枢目录。
+        viewer: 当前身份（自己的会话不从这里出，见下）。
+        same_space: 判定函数 ``space -> bool``；``space`` 档只在同空间开放。
+            用回调而不是传空间列表：会话表在 tenant 层之外，
+            它不该知道"谁能读哪些库"。
+
+    档位规则（决策 D-2）：
+
+    · ``private``（默认）→ 不开放，连任务名都不出现；
+    · ``space`` → 同空间开放；**会话没登记 space 时不开放**
+      （判不出"同空间"就当作没授权 —— 放宽的方向必须是显式的）；
+    · ``shared`` → 对所有已鉴权身份开放（仍受库权限闸约束）。
+
+    只算 ``active`` 会话：已收工的任务其过程态本该标 archived，
+    不该因为档位还挂着 space 就一直对外。
+    """
+    out: list[str] = []
+    for entry in load(home).values():
+        if entry.get("status") != STATUS_ACTIVE:
+            continue
+        task = str(entry.get("task", ""))
+        if not task or entry.get("user") == viewer:
+            continue
+        vis = str(entry.get("visibility") or "private")
+        if vis == "private":
+            continue
+        if vis == "space":
+            space = str(entry.get("space") or "").strip()
+            if not space or not same_space(space):
+                continue
+        if task not in out:
+            out.append(task)
+    return out
 
 
 def get(home: Path | str, user: str, task: str) -> dict[str, Any] | None:

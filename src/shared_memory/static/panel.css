@@ -380,6 +380,13 @@ input#q:focus{border-color:var(--brass-dim);
 .badge.claim-inference{color:var(--brass);border-color:color-mix(in srgb,var(--brass) 45%,transparent);
                        background:color-mix(in srgb,var(--brass) 12%,transparent)}
 .badge.claim-proposal{color:var(--ink2);border-color:var(--line)}
+/* 共享档位（v2 S-10.4）：隐私信号要**一眼分得开**，但又不该跟时效/
+   可信度徽标抢注意力 —— 所以只用边框样式区分，不加底色。
+   仅自己=虚线（最封闭），本空间=实线中性，已共享=实线高亮（往外开了）。 */
+.badge.share-mine{color:var(--muted);border:1px dashed var(--line)}
+.badge.share-space{color:var(--ink2);border-color:var(--line)}
+.badge.share-shared{color:var(--brass);
+                    border-color:color-mix(in srgb,var(--brass) 45%,transparent)}
 .mk{background:color-mix(in srgb,var(--brass) 26%,transparent);color:var(--ink);
     border-radius:2px;padding:0 1px}
 /* 搜索命中说明：标题不含关键词时，告诉用户"为什么这条出现了"。

@@ -188,6 +188,29 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+# ══════════════════ 空间共享属性（v2 · S-10.1，决策 D-2/D-3）══════════════════
+
+#: ``_config/space.json`` 的默认值。
+#:
+#: ━━━ 两个键分别管什么 ━━━
+#:
+#: · ``default_share`` —— 条目**没显式标 share** 时继承的档位（D-3）。
+#:   默认 ``space``：自己的空间本来就只有自己，标不标都只有同空间可见；
+#:   要"仅自己"的私密条目由写入方显式传 ``mine``。
+#: · ``accept_shared_from`` —— **目标空间授权**（D-2 的原话）。
+#:   列在这里的空间 id，其 ``shared`` 条目才会进入本空间的跨空间检索面。
+#:   方向是**接收方主动拉**，不是发送方硬塞 —— 否则别人改一下档位
+#:   就能把内容推到我的检索结果里，那不算授权。
+DEFAULT_SPACE: dict[str, Any] = {
+    "version": 1,
+    "default_share": "space",
+    "accept_shared_from": [],
+}
+
+#: 条目共享档位（与 :mod:`shared_memory.vault` 的 ``SHARE_LEVELS`` 同源）。
+SHARE_LEVELS: tuple[str, ...] = ("mine", "space", "shared")
+
+
 #: 接入码默认端口（与 start-mcp.sh 的 PORT 默认值一致）。
 DEFAULT_PORT = 8200
 
@@ -460,6 +483,11 @@ class Config:
         """运行参数（JSON）。"""
         return self.dir / "settings.json"
 
+    @property
+    def space_path(self) -> Path:
+        """空间共享属性（JSON，v2 S-10.1）。"""
+        return self.dir / "space.json"
+
     # ────────────────────── 读 ──────────────────────
 
     def instructions(self) -> str:
@@ -519,6 +547,27 @@ class Config:
         """当前生效的运行参数。"""
         return _read_json(self.settings_path, DEFAULT_SETTINGS)
 
+    def space(self) -> dict[str, Any]:
+        """当前生效的空间共享属性（v2 S-10.1）。"""
+        return _read_json(self.space_path, DEFAULT_SPACE)
+
+    def default_share(self) -> str:
+        """条目未标 ``share`` 时继承的档位；非法值退回 ``space``。
+
+        这里**不抛**：读侧每次检索都会走，一条写坏的空间配置不该让
+        整个检索失败（与 ``_read_json`` 损坏回落同一套取舍）。
+        写侧另有 :meth:`validate_space` 拦在落盘之前。
+        """
+        v = str(self.space().get("default_share") or "").strip()
+        return v if v in SHARE_LEVELS else "space"
+
+    def accept_shared_from(self) -> list[str]:
+        """本空间授权接收哪些其它空间的 ``shared`` 条目（目标空间授权）。"""
+        raw = self.space().get("accept_shared_from")
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if str(x).strip()]
+
     def snapshot(self) -> dict[str, Any]:
         """给面板看的一份完整配置快照。
 
@@ -539,10 +588,13 @@ class Config:
             "rules_is_default": self.rules_path.exists() is False,
             "settings": self.settings(),
             "settings_is_default": self.settings_path.exists() is False,
+            "space": self.space(),
+            "space_is_default": self.space_path.exists() is False,
             "defaults": {
                 "instructions": DEFAULT_INSTRUCTIONS,
                 "rules": DEFAULT_RULES,
                 "settings": DEFAULT_SETTINGS,
+                "space": DEFAULT_SPACE,
             },
             "dir": str(self.dir),
         }
@@ -623,6 +675,32 @@ class Config:
                 "search_default_status 只能是 active / all，"
                 f"收到 {settings.get('search_default_status')!r}"
             )
+
+        return problems
+
+    def validate_space(self, space: dict[str, Any]) -> list[str]:
+        """校验空间共享属性，返回问题列表（空 = 合法）。
+
+        ⚠️ ``default_share`` 必须逐值校验，不接受"猜"：档位写错
+        （``"mine "` 多个空格、``"Space"`` 大写、``"all"``）会让
+        **本该私密的东西变公开**或反过来 —— 后者只是看不见，前者是事故。
+        """
+        problems: list[str] = []
+
+        ds = space.get("default_share")
+        if ds not in SHARE_LEVELS:
+            problems.append(
+                f"default_share 只能是 {' / '.join(SHARE_LEVELS)}，收到 {ds!r}"
+            )
+
+        aw = space.get("accept_shared_from")
+        if aw is not None:
+            if not isinstance(aw, list):
+                problems.append(
+                    f"accept_shared_from 必须是空间 id 数组，收到 {aw!r}"
+                )
+            elif not all(isinstance(x, str) and x.strip() for x in aw):
+                problems.append("accept_shared_from 的每一项都要是非空字符串")
 
         return problems
 

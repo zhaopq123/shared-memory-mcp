@@ -746,9 +746,17 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             return JSONResponse({"ok": False, "message": "要指定会话（task）"},
                                 status_code=400)
         try:
-            entry = _session.start(hub.home, user, task, visibility=v)
+            entry = _session.set_visibility(hub.home, user, task, v)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+        if entry is None:
+            # 不新建、不重开：改档位这个动作只应该作用在真实存在的会话上
+            return JSONResponse(
+                {"ok": False, "code": "NOT_FOUND",
+                 "message": f"没有这个会话：{task}",
+                 "hint": "先 memory_session_start 开会议，再改可见性"},
+                status_code=404,
+            )
         return JSONResponse({"ok": True, "visibility": entry.get("visibility", v)})
 
     # ────────── 主密钥与 PIN（v2 · S-6）──────────
@@ -1234,6 +1242,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                 instructions=body.get("instructions"),
                 rules=body.get("rules"),
                 settings=body.get("settings"),
+                space=body.get("space"),
             )
             return JSONResponse(result)
         except Exception as exc:  # noqa: BLE001

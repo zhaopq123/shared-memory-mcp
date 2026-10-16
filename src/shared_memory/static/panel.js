@@ -689,6 +689,26 @@ function itemHtml(n, indent){
   else if (n.claim === 'fact') badges.push('<span class="badge claim-fact">事实</span>');
   if (n.type && n.type !== 'note') badges.push('<span class="badge">' + esc(n.type) + '</span>');
 
+  /* ── 共享档位徽标（v2 · S-10.4）──
+     显示的是**生效档位**：条目没显式标 share 时后端已经按空间默认档
+     解析好放在 share_effective 里了。前端不再自己判一遍继承 ——
+     同一件事的口径只允许有一处（后端 effective_share）。
+     没有档位（旧后端 / 内部视图没给）就不显示，不猜。 */
+  const share = n.share_effective || n.share || '';
+  if (share){
+    const zh2 = LANG === 'zh';
+    const SH = {
+      mine:   [zh2 ? '仅自己' : 'Private',  'badge share-mine',
+               zh2 ? '只有你（作者）能看见这条' : 'Visible to the author only'],
+      space:  [zh2 ? '本空间' : 'Space',    'badge share-space',
+               zh2 ? '同空间（同库）的读者都能看见' : 'Visible to readers of this space'],
+      shared: [zh2 ? '已共享' : 'Shared',   'badge share-shared',
+               zh2 ? '已授权的空间可跨空间检索到它' : 'Authorized spaces may retrieve it'],
+    }[share];
+    if (SH) badges.push('<span class="' + SH[1] + '" data-share="' + esc(share) +
+                        '" title="' + esc(SH[2]) + '">' + esc(SH[0]) + '</span>');
+  }
+
   /* 按工作区分组时不重复显示工作区标签（组名已经说明了）；
      按时间分组时要显示，否则看不出这条属于哪个项目。 */
   const showWs = STATE.groupBy === 'time' && n.workspace;
@@ -1435,6 +1455,17 @@ function render(n){
   if (n['valid-until']) metaBadges.push(`<span class="badge">有效期至 ${esc(n['valid-until'])}</span>`);
   if (n['review-after']) metaBadges.push(`<span class="badge review">复查：${esc(n['review-after'])}</span>`);
   if (n.workspace) metaBadges.push(`<span class="wstag">${esc(n.workspace)}</span>`);
+  /* 共享档位（v2 S-10.4）：读单条时必须看到"这条能被谁看到" ——
+     它决定这条能不能直接引用给别人。取后端算好的生效档位。 */
+  const dShare = n.share_effective || n.share || '';
+  if (dShare){
+    const dZh = LANG === 'zh';
+    const dLabel = {mine: dZh ? '仅自己' : 'Private',
+                    space: dZh ? '本空间' : 'Space',
+                    shared: dZh ? '已共享' : 'Shared'}[dShare];
+    if (dLabel) metaBadges.push(`<span class="badge share-${esc(dShare)}" data-share="${
+        esc(dShare)}">${esc(dLabel)}</span>`);
+  }
   /* 来源库：读单条时也要显示 —— 用户需要知道"这条属于哪个库"，
      因为它决定了这条能被谁看到、以及是否权威（见 dashboard 的来源标注设计）。 */
   if (n._lib_label) metaBadges.push(`<span class="libtag">${esc(n._lib_label)}</span>`);
