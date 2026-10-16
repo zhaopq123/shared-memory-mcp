@@ -33,6 +33,8 @@ sys.path.insert(0, str(_HERE / "src") if (_HERE / "src").is_dir() else "/opt/sha
 
 URL = os.environ.get("SHARED_MEMORY_E2E_URL", "http://127.0.0.1:8200/mcp")
 PREFIX = "E2E自检·"
+#: 专用自检沙箱库（admin 自有可写）—— 不往个人库里灌测试数据。
+SANDBOX = "ws-e2e自检"
 
 #: 期望的工具面：9 个新名 + 7 个旧名别名（过渡期）。
 CANON = {
@@ -100,13 +102,13 @@ async def main() -> int:
         # ── 3. 会话生命周期（防串台三闸）──
         print("3. 会话生命周期")
         st = await call(c, "memory_session_start",
-                        {"task": "e2e自检", "space": "user-admin"})
+                        {"task": "e2e自检", "space": SANDBOX})
         check("开工返回三段上下文包",
               all(k in st for k in ("constraints", "task_notes", "space_brief")))
 
         await call(c, "memory_remember", {
             "title": PREFIX + "过程态", "body": "关键词 自检词A",
-            "lib": "user-admin", "scope": "task",
+            "lib": SANDBOX, "scope": "task",
         })
         got = await call(c, "memory_recall", {"query": "自检词A"})
         check("本会话任务域默认可召回",
@@ -124,13 +126,13 @@ async def main() -> int:
         print("4. 长期记忆链路")
         await call(c, "memory_remember", {
             "title": PREFIX + "长期条", "body": "关键词 自检词B。依据：e2e。",
-            "lib": "user-admin", "claim": "fact",
+            "lib": SANDBOX, "claim": "fact",
         })
         hit = await call(c, "memory_recall", {"query": "自检词B"})
         check("长期条可召回",
               any(i["title"] == PREFIX + "长期条" for i in hit.get("results", [])))
         full = await call(c, "memory_get",
-                          {"ident": PREFIX + "长期条", "lib": "user-admin"})
+                          {"ident": PREFIX + "长期条", "lib": SANDBOX})
         check("memory_get 取到全文", "自检词B" in (full.get("note", {}).get("body", "")))
 
         # ── 5. 旧名别名行为等价 ──
@@ -143,7 +145,7 @@ async def main() -> int:
 
         # ── 6. 提交（history 合一）──
         print("6. 提交")
-        cm = await call(c, "memory_history", {"lib": "user-admin", "commit": True})
+        cm = await call(c, "memory_history", {"lib": SANDBOX, "commit": True})
         check("memory_history(commit=True) 成功", cm.get("ok") is True,
               str(cm.get("changed", ""))[:60])
 
@@ -154,21 +156,23 @@ async def main() -> int:
               bad.get("code") == "FORBIDDEN" or bad.get("ok") is False,
               str(bad.get("code", "")))
 
-        # ── 8. 公司库只读保护 ──
-        print("8. 只读保护")
+        # ── 8. 写保护（关键：**不能静默成功**）──
+        print("8. 写保护")
         ro = await call(c, "memory_remember", {
-            "title": PREFIX + "越权写", "body": "x", "lib": "company",
+            "title": PREFIX + "越权写", "body": "x", "lib": "lib-不存在",
         })
-        check("写只读库被拒", ro.get("ok") is False, str(ro.get("code", "")))
+        check("写不存在的库被拒（不是静默落别处）",
+              ro.get("ok") is False, str(ro.get("code", "")))
 
         # ── 9. 备份：导出 → 导入（幂等）──
         print("9. 备份（导出 / 导入合一）")
-        ex = await call(c, "memory_backup", {"action": "export", "lib": "user-admin"})
+        ex = await call(c, "memory_backup", {"action": "export", "lib": SANDBOX})
         check("导出成功", ex.get("ok") is True)
         if ex.get("ok"):
+            # 返回里 bundle 是**导出目录**（键名就是 bundle，不是 out_dir）
             im = await call(c, "memory_backup", {
-                "action": "import", "bundle": ex.get("out_dir") or ex.get("path", ""),
-                "target_lib": "user-admin", "on_conflict": "skip",
+                "action": "import", "bundle": ex.get("bundle", ""),
+                "target_lib": SANDBOX, "on_conflict": "skip",
             })
             check("导入成功（skip 幂等）", im.get("ok") is True,
                   f"skipped={im.get('skipped')}")
@@ -176,11 +180,11 @@ async def main() -> int:
         # ── 10. 软删除（预览 → 确认）──
         print("10. 软删除")
         prev = await call(c, "memory_forget",
-                          {"ident": PREFIX + "长期条", "lib": "user-admin"})
+                          {"ident": PREFIX + "长期条", "lib": SANDBOX})
         check("不传 confirm 只预览（不删）", "confirm=True" in str(prev.get("message", "")),
               str(prev.get("code", "")))
         de = await call(c, "memory_forget",
-                        {"ident": PREFIX + "长期条", "confirm": True, "lib": "user-admin"})
+                        {"ident": PREFIX + "长期条", "confirm": True, "lib": SANDBOX})
         check("confirm 后软删", de.get("ok") is True)
         gone = await call(c, "memory_recall", {"query": "自检词B"})
         check("删后不再召回",
