@@ -125,38 +125,6 @@ const apiPost = (p, body) => fetch(p, {
  */
 let refreshTimer = null;
 
-/** 合并连续相同的提交 + 去掉重复的作者。
- *
- *  ━━━ 为什么（用户实测原话："这个历史提交是个什么几把东西"）━━━
- *
- *  原来的实现对 git 的原始 subject 直接铺 20 行：
- *      memory: 自动提交 — admin     ← 重复 20 次，看不出任何信息
- *      memory: 手动提交: admin — admin  ← subject 里已含作者，模板又补一次
- *
- *  这里只改**呈现**（不动数据）：
- *    · 连续相同 subject 合并成一条，尾巴标 ×N
- *    · subject 结尾已经带作者名时不再重复追加
- */
-function groupCommits(commits){
-  const stripAuthor = (c) => {
-    let s = String(c.subject || '').trim();
-    const a = String(c.author || '').trim();
-    if (!a || !s.includes(a)) return s;
-    const escA = a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    s = s.replace(new RegExp('\\s*[\u2014\u2013-]\\s*' + escA + '\\s*$'), '').trim();
-    if (s.endsWith(': ' + a)) s = s.slice(0, -(': ' + a).length).trim();
-    return s;
-  };
-  const out = [];
-  for (const c of commits){
-    const s = stripAuthor(c);
-    const last = out[out.length - 1];
-    if (last && last.subject === s){ last.n++; continue; }
-    out.push({commit: c.commit, date: c.date, subject: s, n: 1});
-  }
-  return out;
-}
-
 /** 401 的统一处理 —— **不要**无条件糊上全屏登录遮罩。
  *
  *  ━━━ 为什么（2026-10-15 用户实测暴案）━━━
@@ -580,7 +548,7 @@ const STATE = {
   groupBy: 'workspace',        // workspace（默认）| time | type
   //: 生效域（v2 · S-7.2）：long-term（默认，与 agent 的闸一致）| task | all
   scope: 'long-term',
-  notes: [], tags: [], workspaces: [], commits: [],
+  notes: [], tags: [], workspaces: [],
   activeTag: '', activeWs: '', q: '', cur: null,
   view: 'overview', viewData: null,
   config: null, cfgDirty: false,
@@ -705,8 +673,16 @@ function itemHtml(n, indent){
       shared: [zh2 ? '已共享' : 'Shared',   'badge share-shared',
                zh2 ? '已授权的空间可跨空间检索到它' : 'Authorized spaces may retrieve it'],
     }[share];
-    if (SH) badges.push('<span class="' + SH[1] + '" data-share="' + esc(share) +
-                        '" title="' + esc(SH[2]) + '">' + esc(SH[0]) + '</span>');
+    /* ── 徽标可点改档（v2 · S-7.5）──
+       面板是阅览室，正文/标题/标签不能在这里改 —— 但**档位是权限**，
+       "这条给不给人看"恰好是看完之后马上想做的事。
+       点下去走 /api/share/set → TenantHub.set_share，
+       与 agent 调 memory_remember 是同一条写通道（队列 + 校验 + 快照）。 */
+    if (SH) badges.push('<span class="' + SH[1] + ' share-edit" data-share="' + esc(share) +
+                        '" data-ident="' + esc(n.title || n.id || '') +
+                        '" data-lib="' + esc(n._lib || STATE.activeLib || '') +
+                        '" role="button" tabindex="0" title="' + esc(SH[2]) +
+                        (zh2 ? '（点击改档位）' : '') + '">' + esc(SH[0]) + '</span>');
   }
 
   /* 按工作区分组时不重复显示工作区标签（组名已经说明了）；
@@ -950,10 +926,18 @@ function renderByType(){
 function wireListEvents(box){
   box.querySelectorAll('.item').forEach(el => el.onclick = (e) => {
     if (e.target.classList.contains('tag')) return;   // 标签自己处理
+    if (e.target.classList.contains('share-edit')) {   // 徽标改档，不打开阅读器
+      openShareMenu(e.target, () => load());
+      return;
+    }
     select(el.dataset.id);
   });
   box.querySelectorAll('.tag').forEach(el => el.onclick = (e) => {
     e.stopPropagation(); toggleTag(el.dataset.tag);
+  });
+  box.querySelectorAll('.share-edit').forEach(el => el.onclick = (e) => {
+    e.stopPropagation();
+    openShareMenu(el, () => load());
   });
   // 折叠：点组头
   box.querySelectorAll('.wshead, .daylabel').forEach(el => el.onclick = (e) => {
@@ -963,6 +947,79 @@ function wireListEvents(box){
     renderList();
   });
 }
+
+/* ── 档位改档菜单（v2 · S-7.5）──
+ *
+ * 这是整个面板**唯一**能写记忆的入口，而且只写一个字段：档位。
+ * 说清楚它为什么算例外：正文/标题/标签由 agent 写，人在阅读器里改
+ * 会把并发覆盖的门推开；而"这条给不给别人看"是权限，看完就想点，
+ * 并且它走的仍是后端那条写通道（/api/share/set → TenantHub.set_share：
+ * 过读闸、过写闸、进写队列、存改前快照），**不是**面板直改文件。
+ *
+ * ⚠️ 看不见就改不了：菜单只出现在已经渲染出来的条目上，而后端
+ * set_share 会再判一次 —— 别人的「仅自己」条目对它来说就是不存在。
+ */
+let SHARE_MENU = null;
+
+function closeShareMenu(){
+  if (SHARE_MENU){ SHARE_MENU.remove(); SHARE_MENU = null; }
+}
+
+function openShareMenu(anchor, onDone){
+  closeShareMenu();
+  const zh = LANG === 'zh';
+  const cur = anchor.dataset.share || '';
+  const ident = anchor.dataset.ident || '';
+  const lib = anchor.dataset.lib || '';
+  if (!ident) return;
+  const opts = [
+    ['mine',   zh ? '仅自己' : 'Private',
+     zh ? '只有作者能看见' : 'Author only'],
+    ['space',  zh ? '本空间' : 'Space',
+     zh ? '同库读者都能看见' : 'Readers of this space'],
+    ['shared', zh ? '已共享' : 'Shared',
+     zh ? '授权过的空间可跨空间检索' : 'Authorized spaces may search it'],
+    ['',       zh ? '跟随空间默认' : 'Follow space default',
+     zh ? '撤掉这条的显式档位，回到空间设的默认档' : 'Clear this note’s tier and inherit the space default'],
+  ];
+  const m = document.createElement('div');
+  m.className = 'share-menu';
+  m.innerHTML = `<div class="sm-head">${zh ? '谁能看见这条' : 'Who can see this note'}</div>` +
+    opts.map(([v, l, d]) =>
+      `<button class="sm-opt${cur === v ? ' on' : ''}" data-v="${esc(v)}">` +
+      `<span>${esc(l)}</span><em>${esc(d)}</em></button>`).join('') +
+    `<div class="sm-hint">${zh
+      ? '只改可见范围，正文一字不动。改动仍走写队列 —— 与 agent 写记忆同一条路。'
+      : 'Only the tier changes; the body stays byte-identical. Goes through the same write queue as the agent.'}</div>`;
+  document.body.appendChild(m);
+  const r = anchor.getBoundingClientRect();
+  const w = m.offsetWidth || 230;
+  m.style.top = (r.bottom + window.scrollY + 4) + 'px';
+  m.style.left = Math.max(6, Math.min(r.left + window.scrollX, window.innerWidth - w - 10)) + 'px';
+  SHARE_MENU = m;
+
+  m.querySelectorAll('.sm-opt').forEach(btn => btn.onclick = async (e) => {
+    e.stopPropagation();
+    const v = btn.dataset.v;
+    if (v === cur) { closeShareMenu(); return; }
+    btn.disabled = true;
+    const res = await apiPost('/api/share/set', {ident, lib, share: v});
+    closeShareMenu();
+    if (!res || res.ok === false){
+      alert((res && (res.message || res.code)) || (zh ? '改档失败' : 'Failed'));
+      return;
+    }
+    if (onDone) onDone();
+  });
+}
+
+/* 点别处 / Esc 就收起来 —— 菜单浮在内容上，不关掉会挡住下一条 */
+document.addEventListener('click', (e) => {
+  if (SHARE_MENU && !SHARE_MENU.contains(e.target)) closeShareMenu();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeShareMenu();
+});
 
 function renderChips(){
   /* 分组方式切换（工作区 / 时间）。
@@ -1201,7 +1258,6 @@ async function load(){
   STATE.notes = r.notes || [];
   STATE.tags = r.tags || [];
   STATE.workspaces = r.workspaces || [];
-  STATE.commits = r.commits || [];
   STATE.stats = r.stats || {};
   /* 身份与库列表：后端已返回，前端用来做库筛选与权限提示。
      注意 me/libs 是**服务端按你的权限算出来的**，前端只负责显示。 */
@@ -1463,8 +1519,10 @@ function render(n){
     const dLabel = {mine: dZh ? '仅自己' : 'Private',
                     space: dZh ? '本空间' : 'Space',
                     shared: dZh ? '已共享' : 'Shared'}[dShare];
-    if (dLabel) metaBadges.push(`<span class="badge share-${esc(dShare)}" data-share="${
-        esc(dShare)}">${esc(dLabel)}</span>`);
+    if (dLabel) metaBadges.push(`<span class="badge share-${esc(dShare)} share-edit" data-share="${
+        esc(dShare)}" data-ident="${esc(n.title || n.id || '')}" data-lib="${
+        esc(n._lib || STATE.activeLib || '')}" role="button" tabindex="0" title="${
+        esc(dZh ? '点击改档位' : 'Click to change tier')}">${esc(dLabel)}</span>`);
   }
   /* 来源库：读单条时也要显示 —— 用户需要知道"这条属于哪个库"，
      因为它决定了这条能被谁看到、以及是否权威（见 dashboard 的来源标注设计）。 */
@@ -1497,21 +1555,19 @@ function render(n){
         <span>${esc(x.title)}</span>
         <span class="n">${(x.tags||[]).filter(t => (n.tags||[]).includes(t)).join(' · ')}</span>
       </div>`).join('') + '</div></div>' : ''}
-    ${STATE.commits.length ? `
-    <div class="sect"><h3>${t('doc.history', {n: STATE.commits.length})}</h3>
-      <p class="sectip" style="margin:0 0 12px">${LANG === 'zh'
-        ? '这是<strong>整个库</strong>的 git 历史，不是这一条记忆的改动。'
-        : 'This is the git log of the whole library, not this note.'}</p>
-      <div class="hist">${groupCommits(STATE.commits).map(c =>
-        `<div class="c"><span class="h">${esc(c.commit)}</span>
-         <span class="d">${esc((c.date||'').slice(5,16))}</span>
-         <span class="s">${esc(c.subject)}${c.n > 1
-            ? ` <span style="color:var(--muted)">×${c.n}</span>` : ''}</span></div>`
-      ).join('')}</div>
-    </div>` : ''}
+    <div class="sect" id="verwrap">
+      <h3>${t('doc.verhistory')}</h3>
+      <div id="ver-body"><p class="sectip" style="margin:0">${t('doc.verloading')}</p></div>
+    </div>
   </div>`;
 
   reader.querySelectorAll('.tag').forEach(el => el.onclick = () => toggleTag(el.dataset.tag));
+  /* 阅读器里的档位徽标同样可点（v2 · S-7.5）—— 改完重读这一条，
+     否则徽标还停在旧档位，用户会以为没生效。 */
+  reader.querySelectorAll('.share-edit').forEach(el => el.onclick = (e) => {
+    e.stopPropagation();
+    openShareMenu(el, () => select(el.dataset.ident));
+  });
   reader.querySelectorAll('a[data-goto]').forEach(el => el.onclick = () => {
     const t = document.getElementById(el.dataset.goto);
     if (t) t.scrollIntoView({behavior:'smooth', block:'start'});
@@ -1522,6 +1578,55 @@ function render(n){
   linkBtn.onclick = () => copyText(shareUrl, linkBtn, '🔗 复制链接');
   const mdBtn = reader.querySelector('#cp-md');
   mdBtn.onclick = () => copyText(n.body || '', mdBtn, '⧉ 复制原文');
+  loadVersions(n);
+}
+
+/** 版本历史（v2 · S-7.8）：打开哪条才查哪条，不阻塞正文。
+ *
+ *  ━━━ 为什么不再是"整库 git log" ━━━
+ *
+ *  S-8 之后普通写入不进版本库（只有标了 versioned 的条目镜像进共享版本库、
+ *  破坏性动作才提库）。原来那种"每条都铺同一份整库日志"的区块，
+ *  既看不出**这条**改过几次，又要在每次 /api/state 里 fork 一次 git。
+ *  现在按条取：git 版本序列（有则列）+ `.history/` 改前快照（人人有）。
+ *
+ *  ⚠️ 只列不写：退回某一版是写动作，走 agent 的 memory_restore，
+ *  这里一个按钮都不放 —— "面板是阅览室"那条契约就靠这个守住。
+ */
+async function loadVersions(n){
+  const ident = n.title || n.id || '';
+  const lib = n._lib || STATE.activeLib || '';
+  const r = await api('/api/versions', {ident, lib});
+  /* 异步回来时用户可能已经切到另一条了。往"当前 id 固定的容器"里填
+     异步结果的串条 bug 实测踩过（反向引用那处同类），所以先验身份。 */
+  if (STATE.cur !== ident) return;
+  const box = document.getElementById('ver-body');
+  if (!box) return;
+  if (!r.ok){
+    box.innerHTML = `<p class="sectip" style="margin:0">${
+      esc(r.message || t('doc.verFail'))}</p>`;
+    return;
+  }
+  const vs = r.versions || [], sn = r.snapshots || [];
+  const parts = [];
+  if (vs.length){
+    parts.push(`<p class="sectip" style="margin:0 0 10px">${t('doc.verRepoOn')}</p>`);
+    parts.push('<div class="hist">' + vs.map(v => `<div class="c">
+        <span class="h">${esc(v.short || (v.sha || '').slice(0, 7))}</span>
+        <span class="d">${esc(String(v.when || '').slice(0, 16).replace('T', ' '))}</span>
+        <span class="s">${esc(v.subject || '')}</span></div>`).join('') + '</div>');
+  } else {
+    parts.push(`<p class="sectip" style="margin:0 0 10px">${t('doc.verRepoOff')}</p>`);
+  }
+  parts.push(sn.length
+    ? `<h4 class="versub">${t('doc.verSnapshots', {n: sn.length})}</h4>
+       <div class="hist">` + sn.map(s => `<div class="c">
+        <span class="d">${esc(String(s.when || '').slice(0, 19).replace('T', ' '))}</span>
+        <span class="s">${esc(s.path || '')}</span>
+        <span class="n">${(s.bytes || 0)} B</span></div>`).join('') + '</div>'
+    : `<p class="sectip" style="margin:0">${t('doc.verNone')}</p>`);
+  parts.push(`<p class="vershint">${t('doc.verRestoreHint')}</p>`);
+  box.innerHTML = parts.join('');
 }
 
 async function copyText(text, btn, label){
@@ -2027,7 +2132,11 @@ async function loadSettings(){
         + '<code>./venv/bin/python scripts/set_password.py admin</code>'}</p>
   </div>`;
 
-  wireSecurityBlock();
+  /* ⚠️ 这里**不能**调 wireSecurityBlock()：接入与安全块 S-7.3 已搬到
+     「管理 → 接入」，设置页里没有 mk-*、pin-*、conn-* 这些元素，
+     调用会在 `$('mk-gen').onclick` 上抛 TypeError，把紧随其后的
+     `cfg-save` 接线一起打断 —— 症状是设置页照常渲染、
+     「保存配置」按钮点不动（静默失效，静态检查看不出来）。 */
   document.getElementById('cfg-save').onclick = saveSettings;
   document.getElementById('cfg-reload').onclick = () => { loadSettings(); };
   /* 「生成 token 并填进配置」—— 标准管理系统的「Generate API key」形态：
@@ -2767,7 +2876,59 @@ if (langSel) {
   langSel.onchange = () => {
     setLang(langSel.value);
     document.documentElement.lang = (LANG === 'zh' ? 'zh-CN' : LANG);
+    paintThemeBtn();          // 按钮文案是这里拼的，切语言要重画
   };
+}
+
+/* ── 主题开关（v2 · S-7.7）──
+   三档循环：跟随系统 → 深色 → 浅色。
+
+   分工要说清楚：**CSS 只认 `<html data-theme>`**（深浅各一处，见 panel.css
+   顶部注释），"跟随系统"由这里翻译成具体值。而**首帧**的颜色不由这里管 ——
+   那是 dashboard.py 里那段内联脚本的活（panel.js 在 body 末尾，等它跑起来
+   再设色，浅色用户会先看到一帧深色）。这里只做"与首帧对齐 + 接开关"。
+
+   手动选定后就不再跟系统走：用户显式点了深色，操作系统到点切浅色
+   不该把他的选择改掉。 */
+const THEME_MODES = ['auto', 'dark', 'light'];
+
+function themeMode(){
+  try { return localStorage.getItem('shm-theme') || 'auto'; } catch { return 'auto'; }
+}
+
+function applyTheme(mode){
+  const light = mode === 'light' ||
+    (mode !== 'dark' && matchMedia('(prefers-color-scheme: light)').matches);
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  paintThemeBtn(mode);
+}
+
+function paintThemeBtn(mode){
+  const btn = document.getElementById('theme-btn');
+  if (!btn) return;
+  const zh = LANG === 'zh';
+  const m = mode || themeMode();
+  const L = {auto: zh ? '自动' : 'Auto', dark: zh ? '深色' : 'Dark',
+             light: zh ? '浅色' : 'Light'}[m] || m;
+  const I = {auto: '◐', dark: '☾', light: '☀'}[m] || '◐';
+  btn.textContent = I + ' ' + L;
+  btn.title = zh ? '主题：跟随系统 → 深色 → 浅色（点击循环）'
+                 : 'Theme: auto → dark → light (click to cycle)';
+}
+
+const themeBtn = document.getElementById('theme-btn');
+if (themeBtn) {
+  applyTheme(themeMode());    // 与首帧对齐，并把按钮文案画出来
+  themeBtn.onclick = () => {
+    const next = THEME_MODES[(THEME_MODES.indexOf(themeMode()) + 1) % THEME_MODES.length];
+    try { localStorage.setItem('shm-theme', next); } catch {}
+    applyTheme(next);
+  };
+  const mq = matchMedia('(prefers-color-scheme: light)');
+  // 只有"跟随系统"档才跟着系统动
+  if (mq.addEventListener) mq.addEventListener('change', () => {
+    if (themeMode() === 'auto') applyTheme('auto');
+  });
 }
 
 let searchTimer;

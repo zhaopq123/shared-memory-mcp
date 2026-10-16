@@ -155,8 +155,9 @@ def test_data_paths_are_not_exempt() -> None:
     豁免数据接口就是漏洞。
     """
     exempt = _exempt_paths()
-    for p in ("/api/state", "/api/note", "/api/config", "/api/whoami",
-              "/api/admin/users", "/api/auth/tokens", "/mcp", "/health"):
+    for p in ("/api/state", "/api/note", "/api/versions", "/api/config",
+              "/api/whoami", "/api/admin/users", "/api/auth/tokens",
+              "/mcp", "/health"):
         assert p not in exempt, f"{p} 被豁免了 —— 它会泄露数据！"
 
 
@@ -182,6 +183,49 @@ def test_html_does_not_inline_data() -> None:
     # 骨架里不该有 JSON 数据块
     assert "const DATA" not in PANEL_HTML
     assert "__INITIAL_STATE__" not in PANEL_HTML
+
+
+# ══════════════════════ v2 S-7.8：阅读器的版本历史（按条取） ══════════════════════
+
+
+def test_reader_version_history_is_per_note_and_read_only() -> None:
+    """阅读器必须显示**这一条**的版本历史，而且只列不写。
+
+    ━━━ 为什么要换掉"整库 git log" ━━━
+
+    原型（v4）的这个区块就是按条的：`版本历史` + 一列 sha/时间/说明，
+    未标 versioned 时明说"没有版本控制"。生产原来铺的是整库日志，
+    还自带一句"这是整个库的历史，不是这一条" —— 那句话本身就承认了
+    它没回答用户点开这条时想问的问题（"这条被我改过几次"）。
+    S-8 之后普通写入不进版本库，那份日志更是绝大多数时候空着。
+
+    所以钉四件事：
+      ① 有区块、有载入占位（缺占位 = 静默空着，老 bug 的形态）
+      ② 数据来自 `/api/versions`（后端复用 get() 的可见性闸，见 tenancy.versions）
+      ③ 异步回来要验身份 —— 用户已切走时不能把上一条的历史画进当前这条
+      ④ **没有任何写入口**（退回某一版走 agent 的工具面，面板是阅览室）
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+    py = (root / "dashboard.py").read_text(encoding="utf-8")
+
+    assert 'id="verwrap"' in js and 'id="ver-body"' in js, "区块或载入占位没了"
+    assert "function loadVersions(" in js, "没有按条取版本历史的函数"
+    assert "loadVersions(n);" in js, "渲染正文时没调用 —— 区块会永远停在「载入中」"
+    assert "api('/api/versions'" in js, "没接 /api/versions"
+    # ③ 串条护栏
+    assert "STATE.cur !== ident" in js, "异步结果没验当前条目（会把上一条的历史画进来）"
+    # ② 后端那一端确实挂在 hub.versions 上，不是自己去摸文件
+    assert 'Route("/api/versions", note_versions, methods=["GET"])' in py
+    seg = py[py.index("async def note_versions("):]
+    seg = seg[:seg.index("async def view(")]
+    assert "hub.versions(" in seg, "没走 hub.versions（可见性闸就被绕过）"
+    for bad in ("vault", "write_text", ".put("):
+        assert bad not in seg, f"版本历史接口里出现了 {bad} —— 它必须纯读"
+    # ④ 前端也不许在这里写
+    vseg = js[js.index("async function loadVersions("):]
+    vseg = vseg[:vseg.index("/* ═══════════════ 标签页 2")]
+    assert "apiPost" not in vseg, "版本历史区块里有写调用（阅览室原则破口）"
 
 
 # ══════════════════════ 中间件行为（真跑一遍） ══════════════════════
@@ -349,6 +393,8 @@ def test_js_uses_only_existing_element_ids() -> None:
         "ctxbar", "scopechips", "sesscard",
         # v2 S-7.4：治理抽屉
         "gov-close",
+        # v2 S-7.8：阅读器的版本历史区块（随正文动态渲染）
+        "ver-body",
     }
     used = set(re.findall(r"getElementById\('([^']+)'\)", js))
     missing = used - dynamic
@@ -547,10 +593,24 @@ def test_security_block_contract() -> None:
 
     assert "function securityBlockHtml(" in js, "没有接入与安全块"
     assert "function wireSecurityBlock(" in js, "接入与安全块没接线"
-    assert "securityBlockHtml()" in js, "块没被渲染进设置页"
+    assert "securityBlockHtml()" in js, "块没被渲染进「管理 → 接入」"
     assert "wireSecurityBlock();" in js, "块没被接线调用"
     for eid in ("mk-gen", "mk-rotate", "pin-set", "pin-off", "conn-code"):
         assert f"'{eid}'" in js, f"缺 {eid}"
+
+    # ⚠️ 接线只能有一处，而且不能在设置页里
+    assert js.count("wireSecurityBlock();") == 1, (
+        "wireSecurityBlock() 被调了多次 —— 设置页没有 mk-*、pin-*、conn-* 这些元素，"
+        "多调一次会在 `$('mk-gen').onclick` 上抛 TypeError，"
+        "把紧随其后的 cfg-save 接线一起打断（实测过的静默失效：设置页照常渲染、"
+        "「保存配置」点不动）"
+    )
+    settings_seg = js[js.index("async function loadSettings("):]
+    settings_seg = settings_seg[:settings_seg.index("\n}\n")]
+    # 查的是"调用"（带分号），不是标识符 —— 那里留了一段解释为什么不能调的注释
+    assert "wireSecurityBlock();" not in settings_seg, (
+        "设置页又去接安全块了（那块在「管理 → 接入」）"
+    )
 
 
 def test_master_key_plaintext_shown_once_only() -> None:
@@ -741,6 +801,13 @@ def test_panel_has_no_direct_memory_write_entry() -> None:
 
     这条不是洁癖：面板直写会绕过 write 队列、绕过校验、绕过审计，
     等于在服务端开一个没有守卫的旁门。要改记忆就走 agent（MCP 工具面）。
+
+    ━━━ 唯一的例外（S-7.5）及其边界 ━━━
+
+    档位（share）可以点徽标改 —— 因为它是**权限**不是内容，而且它不直写：
+    `/api/share/set` → ``TenantHub.set_share`` → 与 ``memory_remember``
+    同一条通道（读闸 + 写闸 + 写队列 + 改前快照）。
+    正文/标题/标签仍然一个口子都不开 —— 所以下面禁的仍是那三个入口。
     """
     root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
     js = (root / "static" / "panel.js").read_text(encoding="utf-8")
@@ -753,3 +820,67 @@ def test_panel_has_no_direct_memory_write_entry() -> None:
     assert 'Route("/api/note", note, methods=["GET"])' in html, (
         "/api/note 不是只读路由 —— 面板可能被改成能写"
     )
+    # 例外只有一个，而且只写档位这一个字段
+    assert js.count("apiPost('/api/share/set'") == 1, (
+        "改档入口不止一处 —— 面板写记忆的口子在扩散"
+    )
+    assert "share: v" in js or "{ident, lib, share" in js
+
+
+def test_share_badge_is_clickable_and_reloads() -> None:
+    """S-7.5：徽标是**可点**的，且点完必须重画 —— 不然用户以为没生效。
+
+    渲染出徽标但没接线是这类 UI 最常见的半成品形态
+    （CSS/HTML 都在、点了没反应，而静态检查看不出来）。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+
+    assert "share-edit" in js, "徽标没有可点标记"
+    assert "function openShareMenu" in js
+    # 列表与阅读器两处都接了线
+    assert js.count("openShareMenu(el") + js.count("openShareMenu(e.target") >= 2, (
+        "只有列表徽标能点，阅读器里的档位徽标还是死的"
+    )
+    # 改完刷新：列表走 load()，阅读器走 select()
+    assert "openShareMenu(el, () => load())" in js
+    assert "openShareMenu(el, () => select(" in js
+    # 点徽标不能顺手打开阅读器（两个动作会互相取消）
+    assert "e.stopPropagation()" in js
+
+
+def test_theme_is_single_source_and_set_before_first_paint() -> None:
+    """S-7.7：深浅两套色**各只写一处**，且首帧前就定下来。
+
+    ━━━ 为什么钉这两点 ━━━
+
+    ① 用 `@media (prefers-color-scheme)` 再叠一个手动开关，同一套色值
+      必然写两遍（跟随系统一遍、手动一遍）—— 漂移只是时间问题。
+      所以约定：**CSS 只认 `data-theme`**，"跟随系统"由 JS 翻译成属性值。
+    ② 属性由 panel.js 设的话，panel.js 在 body 末尾 ——
+      浅色用户会先看到**一帧深色**再翻白。所以首帧必须由 head 里的
+      内联引导脚本决定（这是 HTML 里唯一允许的内联脚本，且不含任何数据）。
+    """
+    root = Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+    css = (root / "static" / "panel.css").read_text(encoding="utf-8")
+    js = (root / "static" / "panel.js").read_text(encoding="utf-8")
+    # 注释里写着"为什么不用 @media"，所以判断前先把注释剥掉 ——
+    # 不剥的话这条测试会在**解释自己为什么存在**的那句话上失败。
+    import re as _re
+    css_code = _re.sub(r"/\*.*?\*/", "", css, flags=_re.S)
+
+    # ① 只有一套 light 定义，且不靠媒体查询
+    assert css_code.count('[data-theme="light"]') == 1, "浅色板被抄了两遍"
+    assert "@media (prefers-color-scheme" not in css_code, (
+        "又用回媒体查询了 —— 手动开关与系统偏好会变成两处维护"
+    )
+    # 全部走变量：开关只改一个属性，不碰任何具体颜色
+    assert "documentElement.dataset.theme" in js
+    assert "localStorage.getItem('shm-theme')" in js
+    # 三档循环在位（跟随系统 / 深 / 浅），不是硬两态
+    assert "'auto'" in js and "THEME_MODES" in js
+    # ② 首帧前的内联引导
+    assert "matchMedia('(prefers-color-scheme: light)')" in PANEL_HTML, (
+        "首帧主题没在 head 里定下来 —— 浅色用户会闪一下深色"
+    )
+    assert 'id="theme-btn"' in PANEL_HTML

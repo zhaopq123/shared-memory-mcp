@@ -1518,8 +1518,12 @@ class Vault:
                 meta["workspace"] = workspace
             if extra:
                 meta.update(extra)
+            # ⚠️ 结尾**只留一个换行**：读回来的 body 是带结尾换行的，
+            # 而这里又会补一个 —— 于是"读出来改个字段再写回去"每跑一次
+            # 正文就多一个空行。面板改档位、S-12 的自动补字段都走这条路，
+            # 不归一化就是**每改一次档长一行**（实测到的）。
             existing.write_text(
-                f"{dump_frontmatter(meta)}\n\n{new_body}\n", encoding="utf-8"
+                f"{dump_frontmatter(meta)}\n\n{new_body.rstrip()}\n", encoding="utf-8"
             )
             # 写后必须立刻可读 —— read-your-writes 是硬要求
             self.invalidate_cache(existing)
@@ -1556,7 +1560,7 @@ class Vault:
             meta["workspace"] = workspace
         if extra:
             meta.update(extra)
-        path.write_text(f"{dump_frontmatter(meta)}\n\n{body}\n", encoding="utf-8")
+        path.write_text(f"{dump_frontmatter(meta)}\n\n{body.rstrip()}\n", encoding="utf-8")
         self.invalidate_cache(path)
         return {
             "ok": True,

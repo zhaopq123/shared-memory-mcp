@@ -215,6 +215,33 @@ class TenantHub:
         self.tenant.vault_for(user_name, lib_id, need_write=True)
         return await self.service_for(lib_id).restore(filename)
 
+    async def set_share(self, user_name: str, ident: str, share: str,
+                        *, lib_id: str = "") -> dict[str, Any]:
+        """改一条记忆的共享档位 —— **走 write 同一条内部通道**，不是直改文件。
+
+        ━━━ 为什么绕这一大圈 ━━━
+
+        最省事的做法是"读出来、改一个字段、写回去"的三段式手工补丁。
+        但那条路绕过写队列（并发覆盖）、绕过字段校验（坏档位进库）、
+        绕过改前快照与版本库 —— 而档位是**权限字段**，恰恰最不能走旁门。
+        面板上的徽标点击就走这里，和 agent 调 ``memory_remember`` 是同一条路。
+
+        两道闸都在，且都不是这里新发明的：
+          · 读闸 ``get()``：**看不见的条目也改不了**，别人的 ``mine`` 与
+            "根本没这条"同样是 NOT_FOUND（不因为"只是改个档位"就放水）
+          · 写闸 ``write()`` → ``vault_for(need_write=True)``：能读不能写的库
+            （比如成员眼中的公司库）改档位会被拒 —— 该拒，档位改了就是改内容
+        """
+        r = self.get(user_name, ident, lib_id=lib_id)
+        note = r["note"]
+        return await self.write(
+            user_name,
+            title=str(note.get("title") or ""),
+            body=str(note.get("body") or ""),
+            lib_id=lib_id or str(note.get("_lib") or ""),
+            extra={"share": share},
+        )
+
     # ────────────────────── 读 ──────────────────────
 
     def search(

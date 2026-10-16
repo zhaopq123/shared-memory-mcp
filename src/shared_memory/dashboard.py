@@ -30,10 +30,23 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .errors import ErrorCode, ToolError
+
 logger = logging.getLogger(__name__)
 
 #: 静态资源目录（panel.css / panel.js）
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+#: 错误码 → HTTP 状态（面板据此决定是"报错弹一下"还是"这就是没权限"）
+_HTTP_BY_CODE = {
+    ErrorCode.NOT_FOUND: 404,
+    ErrorCode.FORBIDDEN: 403,
+    ErrorCode.SCOPE_DENIED: 403,
+    ErrorCode.CONFLICT: 409,
+    ErrorCode.QUEUE_FULL: 429,
+    ErrorCode.STORAGE_ERROR: 500,
+    ErrorCode.INTERNAL_ERROR: 500,
+}
 
 
 def _static_ver() -> str:
@@ -78,6 +91,21 @@ PANEL_HTML = """<!DOCTYPE html>
      需要它已就绪（否则 ReferenceError，页面全白）。
      用同步 <script> 而不是 defer —— 保证顺序。 -->
 <script src="i18n.js?v=__PANEL_VER__"></script>
+<!-- 主题引导脚本（v2 · S-7.7）：**必须在首帧之前**把 data-theme 定下来。
+     CSS 只认 data-theme（深浅各一处，见 panel.css），"跟随系统"这件事
+     在这里翻译成属性值。放在 head 里同步执行，否则浅色用户会先看到
+     一帧深色再翻白 —— 那个闪一下比没有开关更难受。
+     内联是刻意的：它要在 panel.js（defer 到 body 末尾）之前跑。 -->
+<script>
+(function(){
+  try{
+    var mode = localStorage.getItem('shm-theme') || 'auto';
+    var light = mode === 'light' ||
+      (mode !== 'dark' && matchMedia('(prefers-color-scheme: light)').matches);
+    document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  }catch(e){}
+})();
+</script>
 </head>
 <body>
 <header>
@@ -90,6 +118,9 @@ PANEL_HTML = """<!DOCTYPE html>
       <button class="navtab" data-tab="settings" data-i18n="nav.settings">设置</button>
     </nav>
     <div class="spacer"></div>
+    <!-- 主题开关（v2 · S-7.7）：三档循环 跟随系统 → 深色 → 浅色。
+         选择记进 localStorage（shm-theme），head 里的引导脚本据此定首帧。 -->
+    <button class="btn" id="theme-btn" title="主题 / Theme" aria-label="Theme">◐ 自动</button>
     <!-- 语言切换器。放在顶栏右侧（不占主流程），下拉即改。
          默认中文；切换后记住选择（localStorage）。 -->
     <select id="lang-select" title="Language / 语言"
@@ -393,24 +424,15 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                     hub.list_notes(user, limit=300).get("notes") or []
                 )
 
-            # ── git 提交历史（版本历史区块用）──
+            # ⚠️ 这里**不再**取整库 git 历史（v2 · S-7.8）。
             #
-            # ⚠️ 必须显式 with_commits=True：另一个 agent 做过性能优化，
-            # stats 默认**不再返回** commits（每次 git log 要 fork 子进程
-            # 约 60ms，而 stats 的核心用途不依赖它）。
+            # 原来每次 /api/state 都 fork 一次 git log（约 60ms）给阅读器
+            # 底部的「版本历史」区块。S-8 之后普通写入不进 git（只有标了
+            # versioned 的条目镜像进共享版本库、破坏性动作才提库），
+            # 于是这份"整库日志"绝大多数时候是空的或有误导 ——
+            # 花成本取一个不再有意义的数据。
             #
-            # 但那次的优化**漏了面板**：这里读 `r.commits` 的旧契约，
-            # 结果详情页的「版本历史」永远显示「最近 0 次提交」。
-            # 这就是接口变更没同步调用方的典型断点。
-            commits: list[dict] = []
-            commit_lib = lib or (libs[0]["id"] if libs else "")
-            if commit_lib:
-                try:
-                    commits = hub.stats(
-                        user, lib_id=commit_lib, with_commits=True
-                    ).get("commits") or []
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("取 git 历史失败（%s）: %s", commit_lib, exc)
+            # 版本历史改成**按条取**：打开哪条才查哪条，见 ``/api/versions``。
 
             return {
                 "ok": True,
@@ -419,7 +441,6 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                 "tags": sorted(tag_counts.items(), key=lambda kv: -kv[1])[:20],
                 "workspaces": sorted(ws_counts.items(), key=lambda kv: -kv[1]),
                 "libs": libs,
-                "commits": commits,
                 "stats": {
                     "notes": total,
                     "notes_all": notes_all,
@@ -453,6 +474,31 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                 r["_lib_label"] = (lib_obj.label if lib_obj else lib_id)
             return r
         return _envelope(build)
+
+    async def note_versions(request: Any) -> Any:
+        """一条记忆的版本历史（v2 · S-7.8，阅读器「版本历史」区块的数据源）。
+
+        ━━━ 为什么这仍然是"阅览室"，不算开写口 ━━━
+
+        请求直接交给 :meth:`TenantHub.versions`：那里**先走 get()**
+        （档位闸与"找不到"的口径与读一条记忆完全同源），再取 git 版本序列
+        和 ``.history/`` 改前快照。这里不复制任何可见性判断 ——
+        复制一份就可能把"有但看不到"和"没有"写成两句不同的话，
+        那两句差异就是存在性探针（S-10.5 踩过的坑）。
+
+        只给清单，**不放恢复按钮**：退回某一版是写动作，走 agent 的工具面。
+        """
+        user = require_user()
+        ident = request.query_params.get("ident", "").strip()
+        lib = request.query_params.get("lib", "").strip()
+        if not ident:
+            return JSONResponse({"ok": False, "message": "要查哪条（ident）"},
+                                status_code=400)
+        try:
+            return JSONResponse(hub.versions(user, ident, lib_id=lib))
+        except ToolError as exc:
+            return JSONResponse(exc.to_dict(),
+                                status_code=_HTTP_BY_CODE.get(exc.code, 400))
 
     async def view(request: Any) -> Any:
         user = require_user()
@@ -758,6 +804,43 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
                 status_code=404,
             )
         return JSONResponse({"ok": True, "visibility": entry.get("visibility", v)})
+
+    async def share_set(request: Any) -> Any:
+        """改一条记忆的共享档位（v2 · S-7.5）。
+
+        ━━━ 这是"面板是阅览室"唯一的例外，也是它成立的条件 ━━━
+
+        它**不碰文件系统**：请求交给 :meth:`TenantHub.set_share`，
+        由那里过读闸（看不见就改不了）+ 写闸（只读库被拒）、进写队列、
+        过字段校验 —— 与 agent 调 ``memory_remember`` 是**同一条代码路径**。
+
+        为什么只放开这一个字段：档位是**权限**，人在面板上看完一条记忆
+        想"这条给不给同事看"，是这一件事最适合点一下的场景；
+        而正文/标题/标签仍然只能由 agent 走工具面写。
+        """
+        user = require_user()
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"ok": False, "message": "请求体不是合法 JSON"},
+                                status_code=400)
+        ident = str((body or {}).get("ident", "")).strip()
+        tier = str((body or {}).get("share", "")).strip()
+        lib = str((body or {}).get("lib", "")).strip()
+        if not ident:
+            return JSONResponse({"ok": False, "message": "要说改哪条（ident）"},
+                                status_code=400)
+        if tier not in ("", "mine", "space", "shared"):
+            return JSONResponse(
+                {"ok": False,
+                 "message": "档位只能是 mine / space / shared（空 = 跟随空间默认）"},
+                status_code=400)
+        try:
+            r = await hub.set_share(user, ident, tier, lib_id=lib)
+        except ToolError as exc:
+            return JSONResponse(exc.to_dict(),
+                                status_code=_HTTP_BY_CODE.get(exc.code, 400))
+        return JSONResponse(r)
 
     # ────────── 主密钥与 PIN（v2 · S-6）──────────
 
@@ -1259,6 +1342,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         Route("/i18n.js", static_i18n, methods=["GET"]),
         Route("/api/state", state, methods=["GET"]),
         Route("/api/note", note, methods=["GET"]),
+        Route("/api/versions", note_versions, methods=["GET"]),
         Route("/api/view", view, methods=["GET"]),
         Route("/api/views", views, methods=["GET"]),
         Route("/api/backlinks", backlinks, methods=["GET"]),
@@ -1286,6 +1370,7 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         # v2 S-7.4/S-11.5：治理体检
         Route("/api/governance", governance_view, methods=["GET"]),
         Route("/api/session/visibility", session_visibility, methods=["POST"]),
+        Route("/api/share/set", share_set, methods=["POST"]),
         Route("/api/auth/token/create", token_create, methods=["POST"]),
         Route("/api/auth/token/revoke", token_revoke, methods=["POST"]),
         Route("/api/admin/users", users_list, methods=["GET"]),

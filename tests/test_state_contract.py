@@ -15,8 +15,9 @@
   · 前端：静默失效（没有异常，只是没数据）
   · 单测：全绿（没人测过这条链路）
 
-所以这里钉住：``/api/state`` 必须真的返回 commits，
-且 stats 的 with_commits 参数必须真的生效。
+当时钉住的是"`/api/state` 必须返回 commits"。v2 · S-8/S-7.8 之后这条
+换了方向：版本历史改成**按条取**（`/api/versions`），整库 git log 不再
+随每次刷新去 fork。这个文件仍然守同一件事 —— **这条链路两端都得有人管**。
 """
 
 from __future__ import annotations
@@ -90,74 +91,69 @@ async def test_stats_cross_lib_with_commits(hub: TenantHub) -> None:
     assert company.get("commits"), "跨库统计的 with_commits 没生效"
 
 
-# ══════════════════════ /api/state 必须返回 commits ══════════════════════
+# ══════════════════════ /api/state 不再带 commits（v2 · S-7.8）══════════════════════
 
 
 @pytest.mark.asyncio
-async def test_api_state_includes_commits(hub: TenantHub) -> None:
-    """⚠️ 面板的 `/api/state` 契约：必须返回 commits。
+async def test_api_state_has_no_commits(hub: TenantHub) -> None:
+    """面板的 `/api/state` **不返回** commits —— 每次刷新都 fork git 的成本取消。
 
-    这是那个 bug 的直接回归测试。面板详情页的「版本历史」
-    区块完全依赖这个字段 —— 缺了它界面就永远显示
-    「最近 0 次提交」，而且**不报错**。
+    ━━━ 这条与上面那条"必须返回 commits"的关系 ━━━
+
+    那个 bug 是真的（stats 默认不给 commits，面板还在读，区块静默空着），
+    修法当时是"在 /api/state 里显式 with_commits=True"。
+    S-8 之后模型变了：普通写入**不进版本库**，整库 git log 绝大多数时候
+    只剩破坏性动作的审计提交 —— 每次刷新花 60ms 取一份没有内容的日志，
+    而阅读器要的是"**这一条**改过几次"。
+
+    所以区块改成按条取（``/api/versions``），整库那份直接不取了。
+    教训仍然有效：**接口改默认值时必须把所有调用方一起过一遍** ——
+    这次的"调用方"就是同一条链路上的前端，所以放在同一个文件里改。
     """
     from starlette.applications import Starlette
     from starlette.testclient import TestClient
 
     from shared_memory.dashboard import make_routes
-    from shared_memory.http_server import _build_auth
-    from shared_memory.request_ctx import current_user
+    from shared_memory.request_ctx import set_identity
 
     await hub.write("admin", title="面板条目", body="x", lib_id="company")
     await hub.service_for("company").commit_now("面板测试提交")
 
     routes = make_routes(hub, auth=None)
 
-    # 造一个"已登录"的 app：绕过中间件，直接注入身份
-    from starlette.middleware.base import BaseHTTPMiddleware
-
-    class FakeAuth:
-        def __init__(self) -> None:
-            self.required = False
-
     class InjectUser:
         def __init__(self, app):
             self.app = app
 
         async def __call__(self, scope, receive, send):
-            from shared_memory.request_ctx import set_identity
             set_identity("admin", "readwrite", "test")
             await self.app(scope, receive, send)
 
     app = Starlette(routes=routes)
     app.add_middleware(InjectUser)
 
-    client = TestClient(app)
-    r = client.get("/api/state")
-    assert r.status_code == 200, f"/api/state 返回 {r.status_code}"
-    d = r.json()
+    d = TestClient(app).get("/api/state").json()
     assert d.get("ok") is True
-
-    commits = d.get("commits")
-    assert commits, (
-        "/api/state 没返回 commits —— 面板的「版本历史」会永远空着"
-        "（这正是实测踩过的静默断点）"
-    )
-    assert any("面板测试提交" in c.get("subject", "") for c in commits), (
-        f"commits 里没有预期的提交：{[c.get('subject') for c in commits]}"
+    assert "commits" not in d, (
+        "/api/state 又带 commits 了 —— 每次刷新都会多 fork 一次 git log"
     )
 
 
-# ══════════════════════ 前端也依赖这个契约 ══════════════════════
+# ══════════════════════ 前端那一端：按条取版本历史 ══════════════════════
 
 
-def test_panel_js_reads_commits_from_state() -> None:
-    """⚠️ 面板必须从 /api/state 读 commits（契约的另一端）。
+def test_panel_reads_per_note_versions() -> None:
+    """⚠️ 阅读器的版本历史区块必须读 `/api/versions`（契约的前端一侧）。
 
-    如果前端改成读别的地方而后端没跟上，就又是同一个断点。
+    这个文件存在的意义就是"链路的另一端"：后端给了接口、前端没接上，
+    界面不报错、只是永远空着。所以两端各钉一条。
     """
     js = (Path(__file__).resolve().parent.parent
           / "src" / "shared_memory" / "static" / "panel.js").read_text(encoding="utf-8")
-    assert "STATE.commits = r.commits" in js, (
-        "panel.js 不再从 /api/state 读 commits —— 版本历史区块会没数据"
-    )
+    assert "api('/api/versions'" in js, "面板没接 /api/versions —— 区块会永远显示载入中"
+    assert "STATE.commits" not in js, "还在用整库 git log（S-7.8 已取消这个字段）"
+    assert "groupCommits" not in js, "整库日志的合并函数还在（已无调用方）"
+    # 退回某一版是写动作，面板不放按钮（"阅览室"契约）
+    seg = js[js.index("async function loadVersions("):]
+    seg = seg[:seg.index("/* ═══════════════ 标签页 2")]
+    assert "apiPost" not in seg, "版本历史区块里出现了写调用"

@@ -10,7 +10,16 @@
    目标机在局域网里且可能没外网 —— 任何外部资源都会让页面变白屏。
    ══════════════════════════════════════════════════════════════ */
 
-/* ─────────────── 主题变量 ─────────────── */
+/* ─────────────── 主题变量 ───────────────
+   v2 · S-7.7：深浅两套**各只写一处**，由 `<html data-theme>` 决定用哪套。
+
+   ⚠️ 为什么不用 `@media (prefers-color-scheme)`：那样同一套色值要写两遍
+   （一份跟系统、一份跟手动开关），手动覆盖系统还得再加一层否定条件 ——
+   两处必然漂移。现在的分工是：
+     · CSS 只认 `data-theme`（唯一入口）
+     · "跟随系统"由 JS 在首帧前把系统偏好**翻译成** data-theme
+       （见 dashboard.py 的内联引导脚本），并监听系统变化
+   没有 JS 时落到 `:root` 的缺省（深色），页面照样可读。 */
 :root{
   --bg:#14120f; --panel:#1b1815; --panel2:#221e19; --line:#2e2822;
   --ink:#efe9df; --ink2:#c9c0b3; --muted:#8f8577;
@@ -24,14 +33,16 @@
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
 }
-@media (prefers-color-scheme: light){
-  :root{
-    --bg:#faf7f1; --panel:#fdfbf7; --panel2:#f3ede2; --line:#e3dacb;
-    --ink:#221d17; --ink2:#4a4238; --muted:#877d6d;
-    --brass:#a0721a; --brass-dim:#c9a35c;
-    --verdigris:#4e7a5f; --rust:#a84d3f;
-    --shadow:0 1px 2px rgba(60,45,20,.06),0 10px 28px -14px rgba(60,45,20,.18);
-  }
+[data-theme="light"]{
+  --bg:#faf7f1; --panel:#fdfbf7; --panel2:#f3ede2; --line:#e3dacb;
+  --ink:#221d17; --ink2:#4a4238; --muted:#877d6d;
+  --brass:#a0721a; --brass-dim:#c9a35c;
+  --verdigris:#4e7a5f; --rust:#a84d3f;
+  --shadow:0 1px 2px rgba(60,45,20,.06),0 10px 28px -14px rgba(60,45,20,.18);
+}
+/* 换主题时不闪一下（只在用户点开关那一刻过渡，不影响首帧） */
+@media (prefers-reduced-motion: no-preference){
+  body{transition:background-color .18s ease, color .18s ease}
 }
 
 *{box-sizing:border-box}
@@ -387,6 +398,26 @@ input#q:focus{border-color:var(--brass-dim);
 .badge.share-space{color:var(--ink2);border-color:var(--line)}
 .badge.share-shared{color:var(--brass);
                     border-color:color-mix(in srgb,var(--brass) 45%,transparent)}
+/* 档位徽标可点改档（v2 · S-7.5）—— 看得出"能点"，不然只是个标签。
+   键盘可达：panel.js 给它加了 tabindex/role=button，:focus-visible 全局已有 */
+.badge.share-edit{cursor:pointer}
+.badge.share-edit:hover{background:color-mix(in srgb,var(--brass) 14%,transparent)}
+.share-menu{position:absolute;z-index:60;min-width:230px;padding:8px;
+            background:var(--panel);border:1px solid var(--line);
+            border-radius:10px;box-shadow:var(--shadow);font-size:12.5px}
+.share-menu .sm-head{font-family:var(--serif);font-size:12px;color:var(--muted);
+                     padding:2px 6px 7px;letter-spacing:.02em}
+.share-menu .sm-opt{display:flex;flex-direction:column;align-items:flex-start;gap:1px;
+                    width:100%;padding:6px 8px;margin-top:2px;text-align:left;
+                    background:transparent;border:1px solid transparent;
+                    border-radius:7px;color:var(--ink)}
+.share-menu .sm-opt:hover{background:var(--panel2);border-color:var(--line)}
+.share-menu .sm-opt.on{border-color:var(--brass);
+                       background:color-mix(in srgb,var(--brass) 12%,transparent)}
+.share-menu .sm-opt:disabled{opacity:.5;cursor:progress}
+.share-menu .sm-opt em{font-style:normal;font-size:11px;color:var(--muted)}
+.share-menu .sm-hint{margin-top:7px;padding:6px 8px 2px;border-top:1px solid var(--line);
+                     font-size:11px;line-height:1.5;color:var(--muted)}
 .mk{background:color-mix(in srgb,var(--brass) 26%,transparent);color:var(--ink);
     border-radius:2px;padding:0 1px}
 /* 搜索命中说明：标题不含关键词时，告诉用户"为什么这条出现了"。
@@ -522,6 +553,11 @@ input#q:focus{border-color:var(--brass-dim);
 .c .h{color:var(--verdigris);flex:0 0 auto}
 .c .d{color:var(--muted);flex:0 0 auto;font-size:11.5px}
 .c .s{word-break:break-word;color:var(--ink2);font-family:var(--sans)}
+/* 版本历史里的快照路径尾巴带字节数（v2 · S-7.8），靠右不抢主体 */
+.c .n{margin-left:auto;flex:0 0 auto;font-size:11px;color:var(--muted)}
+.versub{font-size:12px;color:var(--muted);margin:14px 0 8px;font-weight:600}
+.vershint{margin:12px 0 0;font-size:11.5px;color:var(--muted);
+          border-top:1px dashed var(--line);padding-top:9px}
 
 /* ─────────────── 体系视图 ─────────────── */
 .viewbar{display:flex;gap:6px;flex-wrap:wrap;padding:13px 15px;

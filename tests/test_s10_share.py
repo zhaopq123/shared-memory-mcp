@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from shared_memory import session as _session  # noqa: E402
 from shared_memory.config import Config, DEFAULT_SPACE  # noqa: E402
-from shared_memory.errors import ErrorCode  # noqa: E402
+from shared_memory.errors import ErrorCode, ToolError  # noqa: E402
 from shared_memory.tenancy import TenantHub  # noqa: E402
 from shared_memory.tenant import Library, User  # noqa: E402
 from shared_memory.tools_tenant import TenantTools  # noqa: E402
@@ -655,3 +655,109 @@ def test_panel_js_renders_share_badge() -> None:
           / "static" / "panel.js").read_text(encoding="utf-8")
     assert "share_effective" in js
     assert "share-mine" in js and "share-space" in js and "share-shared" in js
+
+
+# ══════════════════════ S-7.5 面板改档（走同一条写通道）══════════════════════
+
+
+@pytest.mark.asyncio
+async def test_set_share_changes_only_the_tier(hub: TenantHub) -> None:
+    """改档位只动 ``share``：正文、标题、作者、标签、工作区都原样保留。
+
+    ━━━ 为什么钉这一条 ━━━
+
+    面板上点一下徽标就改了权限，用户绝不会想到"这一改把正文重写了一遍"。
+    实现走的是 remember 同一条通道（读出来再写回去），
+    所以**必须**证明写回去的内容与读出来的一致 —— 否则"改个档位"
+    会把 agent 写的长文连同格式一起换掉。
+    """
+    tools = TenantTools(hub)
+    await tools.memory_write("alice", "改档不动正文", "原正文\n\n第二段",
+                             tags=["重要", "运维"], lib="group-研发",
+                             workspace="乱七八糟", author="alice")
+    before = (await tools.memory_get("alice", "改档不动正文", "group-研发"))["note"]
+
+    r = await hub.set_share("alice", "改档不动正文", "mine", lib_id="group-研发")
+    assert r["ok"] is True
+    after = (await tools.memory_get("alice", "改档不动正文", "group-研发"))["note"]
+
+    assert after["body"] == before["body"], "正文被重写过了"
+    assert after["title"] == before["title"]
+    assert after["author"] == before["author"], "作者丢了 —— 溯源断掉比没改还糟"
+    assert sorted(after["tags"]) == sorted(before["tags"])
+    assert after.get("workspace") == before.get("workspace")
+    assert after["share"] == "mine"
+
+
+@pytest.mark.asyncio
+async def test_repeated_tier_changes_do_not_grow_the_body(hub: TenantHub) -> None:
+    """⚠️ 读出来再写回去这条路**不能每次多一个空行**。
+
+    写盘是 ``正文 + "\\n"``，而读回来的 body 结尾本来就带换行 ——
+    不归一化的话"改一次档长一行"，改二十次正文后面全是空行。
+    任何"读-改-写"的路径（面板改档、S-12 自动补字段）都吃这个亏。
+    """
+    await hub.write("alice", title="反复改档", body="就这一句", lib_id="group-研发",
+                    author="alice")
+    tools = TenantTools(hub)
+    first = (await tools.memory_get("alice", "反复改档", "group-研发"))["note"]["body"]
+    for tier in ("mine", "space", "shared", "mine"):
+        await hub.set_share("alice", "反复改档", tier, lib_id="group-研发")
+    now = (await tools.memory_get("alice", "反复改档", "group-研发"))["note"]["body"]
+    assert now == first, f"正文被改档撑长了：{first!r} → {now!r}"
+
+
+@pytest.mark.asyncio
+async def test_set_share_on_invisible_note_is_not_found(hub: TenantHub) -> None:
+    """⚠️ 别人的 ``mine`` 条目：改档也报 NOT_FOUND，与"没这条"不可分辨。
+
+    "只是改个档位"不是放水理由 —— 能改就等于能确认存在。
+    """
+    await hub.write("alice", title="alice 的私密", body="x", lib_id="group-研发",
+                    author="alice", extra={"share": "mine"})
+    with pytest.raises(ToolError) as exc:
+        await hub.set_share("bob", "alice 的私密", "shared", lib_id="group-研发")
+    assert exc.value.code == ErrorCode.NOT_FOUND
+
+    # 内容一个字没变
+    n = (await TenantTools(hub).memory_get("alice", "alice 的私密", "group-研发"))["note"]
+    assert n["share"] == "mine"
+
+
+@pytest.mark.asyncio
+async def test_set_share_requires_write_permission(hub: TenantHub) -> None:
+    """⚠️ 只读库里的条目能看不能改档（不能绕过库的写权限）。"""
+    await hub.write("alice", title="公司口径", body="x", lib_id="company", author="alice")
+    with pytest.raises(ToolError) as exc:
+        await hub.set_share("bob", "公司口径", "mine", lib_id="company")
+    assert exc.value.code == ErrorCode.FORBIDDEN, (
+        "bob 对 company 只读，却能改里面条目的档位 —— 写权限闸没生效"
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_share_empty_follows_space_default(hub: TenantHub) -> None:
+    """传空 = 撤掉显式档位、回到跟随空间默认（面板的"跟随默认"就是这个）。"""
+    await hub.write("alice", title="跟着默认", body="x", lib_id="group-研发",
+                    author="alice", extra={"share": "mine"})
+    await hub.set_share("alice", "跟着默认", "", lib_id="group-研发")
+    n = (await TenantTools(hub).memory_get("alice", "跟着默认", "group-研发"))["note"]
+    # 空档位在 to_dict 里**不输出** share（空 = 继承，不是值）
+    assert "share" not in n, f"档位没撤掉：{n.get('share')!r}"
+    assert n["share_effective"] == hub.service_for("group-研发").config.default_share()
+
+
+def test_panel_share_endpoint_goes_through_the_write_channel() -> None:
+    """⚠️ 面板的改档接口必须走 ``set_share``，不许自己摸文件。
+
+    这条钉的是"阅览室只有一个例外"这个前提：那个例外之所以成立，
+    是因为它和 agent 写记忆走同一条路（队列 + 校验 + 权限）。
+    哪天有人图省事在这里直接 ``vault.put``，这条测试会红。
+    """
+    src = (Path(__file__).resolve().parent.parent / "src" / "shared_memory"
+           / "dashboard.py").read_text(encoding="utf-8")
+    assert 'Route("/api/share/set", share_set, methods=["POST"])' in src
+    assert "hub.set_share(" in src
+    # 该 handler 里不许出现直接落盘的口子
+    seg = src[src.index("async def share_set"):src.index("# ────────── 主密钥与 PIN")]
+    assert "vault" not in seg and ".write_text" not in seg

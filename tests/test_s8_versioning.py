@@ -446,3 +446,87 @@ async def test_versioned_history_survives_a_snapshot_restore(hub: TenantHub) -> 
     assert any(n.startswith(f"{VERSIONED_DIRNAME}/files/group-研发/") for n in names), (
         "版本库没进备份：恢复后 versioned 条目的历史全丢"
     )
+
+
+# ══════════════════════ S-7.8 面板的「版本历史」接口 ══════════════════════
+
+
+def _client(hub: TenantHub, as_user: str):
+    """造一个"已登录某个身份"的面板 app（绕过中间件，直接注入身份）。"""
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    from shared_memory.dashboard import make_routes
+    from shared_memory.request_ctx import set_identity
+
+    class InjectUser:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            set_identity(as_user, "readwrite", "test")
+            await self.app(scope, receive, send)
+
+    app = Starlette(routes=make_routes(hub, auth=None))
+    app.add_middleware(InjectUser)
+    return TestClient(app)
+
+
+@pytest.mark.asyncio
+async def test_api_versions_lists_git_history_for_versioned(hub: TenantHub) -> None:
+    """versioned 条目：面板能拿到**这一条**的提交序列（不是整库日志）。"""
+    await hub.write("alice", title="口径长文", body="v1", lib_id="group-研发",
+                    author="alice", extra={"versioned": True})
+    await hub.write("alice", title="口径长文", body="v2", lib_id="group-研发",
+                    author="alice", extra={"versioned": True})
+
+    d = _client(hub, "alice").get("/api/versions", params={"ident": "口径长文"}).json()
+    assert d["ok"] is True and d["versioned"] is True
+    assert len(d["versions"]) >= 2, f"版本序列只有 {len(d.get('versions') or [])} 条"
+    assert all(v.get("short") and v.get("when") for v in d["versions"]), (
+        "面板要的字段（短 sha + 时间）后端没给全"
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_versions_for_plain_note_returns_snapshots(hub: TenantHub) -> None:
+    """普通条目（没标 versioned）：不给 git 序列，但给改前快照 ——
+    面板那句"没有历史"不能说成"什么都没留下"（S-8.3 同一个口径）。"""
+    await hub.write("alice", title="普通记忆", body="v1", lib_id="group-研发",
+                    author="alice")
+    await hub.write("alice", title="普通记忆", body="v2", lib_id="group-研发",
+                    author="alice")
+
+    d = _client(hub, "alice").get("/api/versions", params={"ident": "普通记忆"}).json()
+    assert d["ok"] is True and d["versioned"] is False
+    assert d["versions"] == []
+    assert d["snapshots"], "覆盖过一次却没有改前快照"
+    assert d.get("message"), "没给「为什么没有版本序列」的话术，界面只能显示空白"
+
+
+@pytest.mark.asyncio
+async def test_api_versions_does_not_leak_existence(hub: TenantHub) -> None:
+    """⚠️ 被档位藏起来的条目，错误码与提示必须与"库里根本没有"**完全一致**。
+
+    （message 里唯一能不同的，只有调用方自己填进去的那个 ident ——
+    那个值他已经知道了，不构成泄露。）
+
+    新读接口最容易被忽略的就是这条：`versions()` 里如果自己拼
+    "找库 + 判可见性"，两句不同的文案就成了存在性探针
+    （S-10.5 在 get 上踩过，这里换成 /api/versions 再踩一次）。
+    """
+    await hub.write("alice", title="alice 的私密", body="x", lib_id="group-研发",
+                    author="alice", extra={"share": "mine"})
+    c = _client(hub, "bob")
+    hidden = c.get("/api/versions", params={"ident": "alice 的私密"})
+    absent = c.get("/api/versions", params={"ident": "压根没有的标题"})
+
+    assert hidden.status_code == absent.status_code == 404
+    hc, ac = hidden.json(), absent.json()
+    assert hc["code"] == ac["code"] and hc["hint"] == ac["hint"], (
+        f"错误体不一样 = 能探出「这条存在但对你隐藏」：\n"
+        f"  hidden={hc}\n  absent={ac}"
+    )
+    # message 里唯一可变的成分 = 调用方自己填的那个 ident，不是"它在不在"
+    assert hc["message"] == f"在你可读的库里找不到：alice 的私密"
+    assert ac["message"] == "在你可读的库里找不到：压根没有的标题"
