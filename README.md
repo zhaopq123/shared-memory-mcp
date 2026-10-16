@@ -131,10 +131,10 @@ export SHARED_MEMORY_HOME=$PWD/home
 
 ```bash
 # 只接当前项目（写 <项目>/.mcp.json）—— 推荐，凭据随项目走
-npx shared-memory-connect "sm://192.168.3.35:8200?k=xxx" --project-dir .
+npx shared-memory-connect "sm://192.168.x.x:8200?k=xxx" --project-dir .
 
 # 全局接入（写 ~/.workbuddy/mcp.json）
-npx shared-memory-connect "sm://192.168.3.35:8200?k=xxx"
+npx shared-memory-connect "sm://192.168.x.x:8200?k=xxx"
 
 # 先看要写什么（不落盘）
 npx shared-memory-connect "sm://..." --project-dir . --dry-run

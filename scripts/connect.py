@@ -3,16 +3,16 @@
 """共享记忆 · 一条命令接入（v2 · S-5.2）。
 
     # 全局接入（写 ~/.workbuddy/mcp.json）
-    python scripts/connect.py "sm://192.168.3.35:8200?k=你的密钥"
+    python scripts/connect.py "sm://192.168.x.x:8200?k=你的密钥"
 
     # 只接某个项目（写 <项目>/.mcp.json）
-    python scripts/connect.py "sm://192.168.3.35:8200?k=密钥" --project-dir .
+    python scripts/connect.py "sm://192.168.x.x:8200?k=密钥" --project-dir .
 
     # 先看一眼要写什么（不落盘）
-    python scripts/connect.py "sm://192.168.3.35:8200?k=密钥" --dry-run
+    python scripts/connect.py "sm://192.168.x.x:8200?k=密钥" --dry-run
 
     # 不用接入码，直接给地址与 token
-    python scripts/connect.py --url http://192.168.3.35:8200 --token XXX
+    python scripts/connect.py --url http://192.168.x.x:8200 --token XXX
 
 ━━━ 三条设计约束 ━━━
 

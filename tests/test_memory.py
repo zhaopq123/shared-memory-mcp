@@ -1148,10 +1148,10 @@ def test_migrate_respects_disabled(tmp_path: Path) -> None:
 def test_parse_connect_uri_standard() -> None:
     from shared_memory.config import parse_connect_uri
 
-    d = parse_connect_uri("sm://192.168.3.35:8200?k=abc123")
-    assert d["host"] == "192.168.3.35" and d["port"] == 8200
+    d = parse_connect_uri("sm://192.168.x.x:8200?k=abc123")
+    assert d["host"] == "192.168.x.x" and d["port"] == 8200
     assert d["token"] == "abc123"
-    assert d["mcp_url"] == "http://192.168.3.35:8200/mcp"
+    assert d["mcp_url"] == "http://192.168.x.x:8200/mcp"
 
 
 def test_parse_connect_uri_port_optional_and_key_aliases() -> None:

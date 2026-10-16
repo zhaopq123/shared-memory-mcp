@@ -337,8 +337,8 @@ def parse_connect_uri(uri: str) -> dict[str, Any]:
 
     格式：``sm://<host>:<port>?k=<密钥>``
 
-      · ``sm://192.168.3.35:8200?k=abc123``  标准
-      · 端口可省（默认 8200）：``sm://192.168.3.35?k=abc123``
+      · ``sm://192.168.x.x:8200?k=abc123``  标准
+      · 端口可省（默认 8200）：``sm://192.168.x.x?k=abc123``
       · 密钥键名兼容 ``k`` / ``key`` / ``token``
 
     ━━━ 为什么是自定义 scheme 而不是一条 JSON ━━━
@@ -360,13 +360,13 @@ def parse_connect_uri(uri: str) -> dict[str, Any]:
         raise ToolError(
             ErrorCode.INVALID_ARGUMENT,
             "接入码为空",
-            hint="形如 sm://192.168.3.35:8200?k=你的密钥（端口可省）",
+            hint="形如 sm://192.168.x.x:8200?k=你的密钥（端口可省）",
         )
     if "://" not in raw:
         raise ToolError(
             ErrorCode.INVALID_ARGUMENT,
             f"接入码缺少协议头：{raw[:40]}",
-            hint="应以 sm:// 开头，例如 sm://192.168.3.35:8200?k=密钥",
+            hint="应以 sm:// 开头，例如 sm://192.168.x.x:8200?k=密钥",
         )
     scheme = raw.split("://", 1)[0].strip().lower()
     if scheme != "sm":
@@ -381,7 +381,7 @@ def parse_connect_uri(uri: str) -> dict[str, Any]:
         raise ToolError(
             ErrorCode.INVALID_ARGUMENT,
             "接入码里没有主机地址",
-            hint="sm:// 后面要跟 IP 或域名，例如 sm://192.168.3.35:8200?k=密钥",
+            hint="sm:// 后面要跟 IP 或域名，例如 sm://192.168.x.x:8200?k=密钥",
         )
     try:
         port = u.port or DEFAULT_PORT
