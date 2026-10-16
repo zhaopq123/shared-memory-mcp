@@ -75,3 +75,6 @@ scripts/accept.py
 scripts/guard.sh
 # i18n 扫描临时产物
 i18nmap.json
+
+# ── pytest 临时数据目录（tmp_path 产物，绝不入库）──
+pytest-of-*/
