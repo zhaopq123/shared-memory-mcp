@@ -281,6 +281,34 @@ def test_settings_page_states_honest_boundary() -> None:
     assert "docs/client-hooks.md" in i18n, "设置页没指向 hook 规范"
 
 
+# ══════════════════════ S-12.5 两段式读取 token 对比 ══════════════════════
+
+
+def test_two_stage_read_cost_under_half() -> None:
+    """⚠️ 判据：**跑一次测一次**，不是读一份份现成报告。
+
+    D-8 说"两段式省 token"；S-12.5 把它落成"比值 <50%"。这条测试
+    直接调测量脚本里的 ``measure()``（不走文件），既测口径也测断言：
+      · 脚本改了但比例没守住 → 这里红；
+      · 比例守住了但报告没落盘 → 下一条红。
+    语料与报告同一份 —— 避免"报告是 41%，实际是 60%"这种两面皮。
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from measure_two_stage import _load_corpus, measure  # noqa: E402
+
+    notes = _load_corpus(ROOT / "demo-vault")
+    assert notes, "语料为空（demo-vault 被动过？）"
+    r = measure(notes, fetch=2)
+    assert r["ratio"] < 0.5, f"两段式比值 {r['ratio']:.1%} ≥ 50%"
+
+
+def test_two_stage_report_is_persisted() -> None:
+    """报告文件必须存在，且结论文本与测量结果一致（派生视图≠手写）。"""
+    doc = (ROOT / "docs" / "two-stage-read-cost.md").read_text(encoding="utf-8")
+    assert "两段式 / 全文直进" in doc and "PASS" in doc, "报告缺失或口径漂移"
+    assert "阈值 50%" in doc and "计量口径" in doc, "报告不写阈值与口径 = 不可回放"
+
+
 # ══════════════════════ 小工具 ══════════════════════
 
 
