@@ -704,6 +704,21 @@ def test_expiry_states() -> None:
     assert expiry_state({"superseded-by": "新条"})["state"] == "superseded"
 
 
+def test_expiry_state_tolerates_naive_now() -> None:
+    """naive 的 now 也要能用 —— 带时区的时效字段与它比较不能 TypeError。"""
+    from datetime import datetime
+
+    from shared_memory.knowledge import expiry_state
+
+    # 真实数据里时效字段带偏移量；naive now 曾直接抛 TypeError（线上 500）
+    assert expiry_state(
+        {"review-after": "2020-01-01T00:00:00+08:00"}, now=datetime(2026, 1, 1)
+    )["state"] == "review"
+    assert expiry_state(
+        {"valid-until": "2020-01-01T00:00:00Z"}, now=datetime(2026, 1, 1)
+    )["state"] == "expired"
+
+
 def test_superseded_beats_expired() -> None:
     """被取代优先级最高 —— 即使日期也没过期，它也不该再当现行口径。"""
     from shared_memory.knowledge import expiry_state

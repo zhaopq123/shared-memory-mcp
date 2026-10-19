@@ -78,6 +78,31 @@ def test_capacity_report_counts_duplicates() -> None:
     assert "不自动删除" in r["note"], "报告必须自带「只建议」的声明"
 
 
+def test_capacity_report_handles_aware_expiry_fields() -> None:
+    """时效字段带时区时不得抛 —— 线上 /api/governance 500 的回归钉。
+
+    真实数据里 valid-until / review-after 常写成 ``2026-10-20T00:00:00+08:00``，
+    而 ``capacity_report`` 曾用 naive 的 ``datetime.now()`` 去比 → TypeError。
+    """
+    notes = [
+        _n(1, "甲", ["x"], **{"valid-until": "2020-01-01T00:00:00+08:00"}),
+        _n(2, "乙", ["x"], **{"review-after": "2020-01-01T00:00:00+08:00"}),
+        _n(3, "丙", ["x"], **{"valid-until": "2999-01-01T00:00:00+08:00"}),
+    ]
+    r = capacity_report(notes, {})
+    assert r["total"] == 3
+    assert r["expired_count"] == 1, "只有 2020 那条算过期"
+
+
+def test_capacity_report_accepts_naive_now() -> None:
+    """调用方传 naive datetime 也不能炸（防御面，不是只修一个调用点）。"""
+    from datetime import datetime
+
+    notes = [_n(1, "甲", ["x"], **{"review-after": "2020-01-01T00:00:00+08:00"})]
+    r = capacity_report(notes, {}, now=datetime(2026, 1, 1))
+    assert r["total"] == 1
+
+
 # ══════════════════════ 引用计数 ══════════════════════
 
 
