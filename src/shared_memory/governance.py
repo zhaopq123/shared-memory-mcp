@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .knowledge import expiry_state
+from .knowledge import CST, expiry_state
 
 #: 标题相似度阈值（0~1）。0.82 是实测出来的：
 #: 再高会漏掉"同一件事换个说法"，再低会把"XX 与 YY 的对比"这类
@@ -144,7 +144,9 @@ def capacity_report(
     notes: list[Any], refs: dict[str, int], *, now: datetime | None = None
 ) -> dict[str, Any]:
     """容量仪表（口径见模块头注释 —— 指标必须可复现）。"""
-    now = now or datetime.now()
+    # 必须带时区：expiry_state 里的 valid-until / review-after 解析出来都是 aware，
+    # naive 的 datetime.now() 一比就 TypeError（线上 /api/governance 500 的根因）。
+    now = now or datetime.now(CST)
     total = len(notes)
     recent = [n for n in notes if _age_days(n) <= 30]
 

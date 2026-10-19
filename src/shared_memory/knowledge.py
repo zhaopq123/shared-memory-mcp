@@ -92,6 +92,11 @@ def expiry_state(meta: dict[str, Any], *, now: datetime | None = None) -> dict[s
         · ``active`` —— 正常
     """
     now = now or datetime.now(CST)
+    # 调用方可能传 naive datetime（governance.capacity_report 曾经就是），
+    # 而 valid-until / review-after 解析出来**恒带时区**（CST 或 +00:00）。
+    # naive 与 aware 比较会直接 TypeError —— 这里统一补齐，别让调用方踩。
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CST)
 
     superseded_by = str(meta.get("superseded-by", "") or "").strip()
     if superseded_by:
