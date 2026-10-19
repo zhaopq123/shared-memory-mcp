@@ -316,6 +316,31 @@ def bundle_stats(bundle: Path) -> tuple[int | None, float]:
     return count, round(size / 1024, 1)
 
 
+def _envelope(fn: Any) -> Any:
+    """把异常转成结构化 JSON（不吐堆栈给浏览器）。
+
+    ⚠️ ``ToolError`` 必须**按错误码映射状态**，不能一律 500。
+    实测：``/api/note?ident=<不存在>`` 原来回 500 —— 面板把"这条没了"
+    渲染成"服务器炸了"，用户只会来问"服务是不是坏了"。
+    业务错误（找不到 / 无权限 / 冲突）本来就是 404 / 403 / 409 的语义。
+    """
+    from starlette.responses import JSONResponse
+
+    try:
+        return JSONResponse(fn())
+    except ToolError as exc:
+        return JSONResponse(
+            exc.to_dict(),
+            status_code=_HTTP_BY_CODE.get(exc.code, 400),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("面板接口失败")
+        return JSONResponse(
+            {"ok": False, "message": f"{type(exc).__name__}: {exc}"[:300]},
+            status_code=500,
+        )
+
+
 def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
     """返回面板用的 Starlette 路由。
 
@@ -387,17 +412,6 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
         if not p.exists():
             return JSONResponse({"error": "i18n.js missing"}, status_code=500)
         return FileResponse(p, media_type="application/javascript")
-
-    def _envelope(fn: Any) -> Any:
-        """把异常转成结构化 JSON（不吐堆栈给浏览器）。"""
-        try:
-            return JSONResponse(fn())
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("面板接口失败")
-            return JSONResponse(
-                {"ok": False, "message": f"{type(exc).__name__}: {exc}"[:300]},
-                status_code=500,
-            )
 
     # ────────── 数据 ──────────
 
