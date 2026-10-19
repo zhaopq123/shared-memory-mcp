@@ -38,6 +38,11 @@ PREFIX = "E2E自检·"
 #: 专用自检沙箱库（admin 自有可写）—— 不往个人库里灌测试数据。
 SANDBOX = "ws-e2e自检"
 
+#: e2e 导出包落**临时目录**，不要落生产 ``<home>/exports/``。
+#: 那个目录是面板「备份与恢复」列表的数据源：测试包混进去，用户会看到
+#: 一堆"自己没做过的备份"（实测躺了 10 个只含沙箱库的包）。
+EXPORT_DIR = os.environ.get("SHARED_MEMORY_E2E_EXPORT_DIR", "/tmp/shm-e2e-exports")
+
 #: 期望的工具面：9 个新名 + 7 个旧名别名（过渡期）。
 CANON = {
     "memory_session_start", "memory_session_end",
@@ -203,7 +208,9 @@ async def main() -> int:
 
         # ── 9. 备份：导出 → 导入（幂等）──
         print("9. 备份（导出 / 导入合一）")
-        ex = await call(c, "memory_backup", {"action": "export", "lib": SANDBOX})
+        ex = await call(c, "memory_backup", {
+            "action": "export", "lib": SANDBOX, "out_dir": EXPORT_DIR,
+        })
         check("导出成功", ex.get("ok") is True)
         if ex.get("ok"):
             # 返回里 bundle 是**导出目录**（键名就是 bundle，不是 out_dir）

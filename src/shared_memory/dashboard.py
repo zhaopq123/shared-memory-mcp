@@ -274,6 +274,48 @@ def _filter_by_scope(notes: list[dict], scope: str) -> list[dict]:
     return [n for n in notes if str(n.get("scope", "") or "long-term") == "long-term"]
 
 
+def bundle_stats(bundle: Path) -> tuple[int | None, float]:
+    """备份包摘要：**条目数**与**实际字节大小**。
+
+    ⚠️ 这两项都踩过，别按直觉写：
+
+      · 条目数要读 manifest 的 ``entries``（``TenantHub.export`` 写的键）。
+        读成 ``notes`` 的表现是列表**永远显示「0 条」**，而包其实是好的 ——
+        用户会以为备份失败，再点一次，堆一堆包。
+      · 大小不能用 ``Path.stat().st_size``：目录的 st_size 是 inode 大小
+        （Linux 上恒为 4096），于是每个包都显示「4.0 KB」。要累加包内文件。
+
+    Returns:
+        ``(count, size_kb)``；manifest 缺失或坏掉时 count 为 ``None``
+        （界面显示 "?"，不显示假的 0）。
+    """
+    count: int | None = None
+    manifest = bundle / "manifest.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            entries = data.get("entries")
+            if entries is None:          # 兼容早期只写 notes 的包
+                entries = data.get("notes")
+            if isinstance(entries, list):
+                count = len(entries)
+        except (OSError, ValueError):
+            count = None
+
+    size = 0
+    try:
+        for f in bundle.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                size += f.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return count, round(size / 1024, 1)
+
+
 def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
     """返回面板用的 Starlette 路由。
 
@@ -660,19 +702,12 @@ def make_routes(hub: Any, *, auth: Any = None) -> list[Any]:
             ):
                 if not p.is_dir():
                     continue
-                count = None
-                manifest = p / "manifest.json"
-                if manifest.exists():
-                    try:
-                        data = json.loads(manifest.read_text(encoding="utf-8"))
-                        count = len(data.get("notes") or [])
-                    except (OSError, ValueError):
-                        count = None
+                count, size_kb = bundle_stats(p)
                 st = p.stat()
                 items.append({
                     "name": p.name,
                     "count": count,
-                    "size_kb": round(st.st_size / 1024, 1),
+                    "size_kb": size_kb,
                     "when": _t.strftime("%Y-%m-%d %H:%M", _t.localtime(st.st_mtime)),
                 })
         return JSONResponse({"ok": True, "items": items[:30]})
