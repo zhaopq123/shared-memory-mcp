@@ -35,8 +35,12 @@ sys.path.insert(0, str(_HERE / "src") if (_HERE / "src").is_dir() else "/opt/sha
 
 URL = os.environ.get("SHARED_MEMORY_E2E_URL", "http://127.0.0.1:8200/mcp")
 PREFIX = "E2E自检·"
-#: 专用自检沙箱库（admin 自有可写）—— 不往个人库里灌测试数据。
-SANDBOX = "ws-e2e自检"
+#: 专用自检沙箱库 —— **不往个人库/生产库灌测试数据**。
+#: 2026-10-19 挂账清理把 `ws-e2e自检` 取消了登记（文件保留、库不可见），
+#: 所以改用同样只作测试夹具的 `ws-个人工作中枢`（0 条空库，
+#: `ops_isolation_verify.py` 也拿它当隔离验证的 B 库）。
+#: 换库用环境变量 `SHARED_MEMORY_E2E_LIB`，别改这里的分支逻辑。
+SANDBOX = os.environ.get("SHARED_MEMORY_E2E_LIB", "ws-个人工作中枢")
 
 #: e2e 导出包落**临时目录**，不要落生产 ``<home>/exports/``。
 #: 那个目录是面板「备份与恢复」列表的数据源：测试包混进去，用户会看到
