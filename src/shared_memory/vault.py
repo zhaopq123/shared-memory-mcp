@@ -625,6 +625,8 @@ class VersionRepo:
         与 :meth:`Vault.commit` 同一套"两次 fork"的省法，
         也共用同一份"无改动/不是仓库"的文案判定。
         """
+        # 调用方（save/remove）已先过 ensure_repo()：这里只处理确实自己的
+        # 仓库（根下就有 .git），不存在"向上找到外层仓库"的问题。
         self._git("add", "-A")
         args: tuple[str, ...] = ("commit", "-m", reason)
         if author:
@@ -908,6 +910,10 @@ class Vault:
         Returns:
             ``{"committed": bool, "message": str, "commit": str?, "author": str?}``
         """
+        # 先确认这个目录自己是仓库 —— GIT_CEILING_DIRECTORIES 不可靠（见
+        # _commit 里的说明），否则会把外层仓库的改动一起提交。
+        if not self.is_repo():
+            return {"committed": False, "message": "不是 git 仓库"}
         # 先 add（含新增文件），再一次 commit —— 合并掉原来的 diff 探测
         self._git("add", "-A")
 

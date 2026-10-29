@@ -687,10 +687,19 @@ class TenantHub:
         import tarfile
         import time as _time
 
+        # 文件名必须**唯一**：restore 会先给当前状态打一份快照再解包，
+        # 两次快照极易落在同一秒。原先只精确到秒 → 恢复前的快照直接覆盖
+        # 掉正在恢复的那个包，解出来的东西半新半旧，函数还一路返回 ok。
+        # 加微秒 + 存在即递增，**永不覆盖已有备份**。
         stamp = _time.strftime("%Y%m%d-%H%M%S")
         base = Path(out_dir).expanduser() if out_dir else (self.home / "exports")
         base.mkdir(parents=True, exist_ok=True)
-        out = base / f"shm-snapshot-{stamp}.tar.gz"
+        name = f"shm-snapshot-{stamp}-{_time.time_ns() % 1_000_000:06d}"
+        out = base / f"{name}.tar.gz"
+        seq = 1
+        while out.exists():
+            out = base / f"{name}-{seq}.tar.gz"
+            seq += 1
 
         warnings: list[str] = []
         if with_state:
@@ -789,22 +798,7 @@ class TenantHub:
                 "hint": "先看 preview 确认要覆盖的是哪台机器的哪个目录",
             }
 
-        with tarfile.open(src, "r:gz") as tf:
-            members = [m for m in tf.getmembers() if m.isfile()]
-            bad: list[str] = []
-            for m in members:
-                name = m.name
-                if name.startswith("/") or ".." in Path(name).parts:
-                    bad.append(name)
-            if bad:
-                raise ToolError(
-                    ErrorCode.INVALID_ARGUMENT,
-                    f"快照里有越界路径，整包拒绝：{bad[:3]}",
-                    hint="这个包可能被手工改过或损坏 —— 换一个包，别强行恢复",
-                )
-            counted = len(members)
-
-        # 恢复前自动快照当前状态
+        # 恢复前自动快照当前状态（必须先做：这一步同样往 exports/ 写包）
         pre = self.snapshot_home(with_state=True)
         if not pre.get("ok"):
             raise ToolError(
@@ -826,9 +820,26 @@ class TenantHub:
         staging.mkdir(parents=True, exist_ok=True)
         try:
             with tarfile.open(src, "r:gz") as tf:
-                # 上面已逐成员验过名字（拒绝 / 开头与 .. 段），这里再要一层
-                # 解释器自己的防护：filter="data" 会拒硬链接/符号链接/特殊文件。
-                # 版本没有这个参数时（<3.11.4）退回只用我们自己那道校验。
+                # ⚠️ members 必须**在真正解包的这个句柄里现取现用**。
+                # 复用上一次 open 留下的成员对象是按旧文件偏移读的：包在这
+                # 期间被覆盖（同秒快照曾经重名）就会把别的成员内容写进目标
+                # 文件 —— tenants.json 变成一段 zlib 压缩的 git object，而
+                # 恢复过程一路报 ok。2026-10-29 实测踩到。
+                members = [m for m in tf.getmembers() if m.isfile()]
+                bad: list[str] = []
+                for m in members:
+                    name = m.name
+                    if name.startswith("/") or ".." in Path(name).parts:
+                        bad.append(name)
+                if bad:
+                    raise ToolError(
+                        ErrorCode.INVALID_ARGUMENT,
+                        f"快照里有越界路径，整包拒绝：{bad[:3]}",
+                        hint="这个包可能被手工改过或损坏 —— 换一个包，别强行恢复",
+                    )
+                counted = len(members)
+                # 解释器自己的第二道防护：filter="data" 会拒硬链接/符号链接/
+                # 特殊文件；版本没有这个参数时（<3.11.4）退回只用上面那道校验。
                 try:
                     tf.extractall(staging, members=members, filter="data")
                 except TypeError:  # pragma: no cover - 老版本 Python

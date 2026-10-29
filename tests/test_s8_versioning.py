@@ -343,6 +343,24 @@ async def test_snapshot_read_back_matches_member_count(hub: TenantHub) -> None:
 
 
 @pytest.mark.asyncio
+async def test_snapshot_filenames_are_unique_within_same_second(hub: TenantHub) -> None:
+    """同秒连打两份快照不能重名。
+
+    重名的后果不是"少一个备份"：``memory_restore`` 会先自动打一份快照，
+    若它跟正在恢复的包同名，就会**覆盖掉待恢复的包**，解出来的内容
+    半新半旧、函数却报 ok（2026-10-29 实测：tenants.json 变成 git object）。
+    """
+    await hub.write("alice", title="一条", body="x", lib_id="group-研发")
+    tools = TenantTools(hub)
+    first = await tools.memory_snapshot("alice")
+    second = await tools.memory_snapshot("alice")
+    assert first["ok"] is True and second["ok"] is True
+    assert Path(first["path"]) != Path(second["path"]), "同秒快照重名了"
+    assert Path(first["path"]).is_file()
+    assert Path(second["path"]).is_file()
+
+
+@pytest.mark.asyncio
 async def test_snapshot_excludes_credentials_by_default(hub: TenantHub) -> None:
     """⚠️ 默认**不含** state/ —— 那里是令牌与主密钥。
 
